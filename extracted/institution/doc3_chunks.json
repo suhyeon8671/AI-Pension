@@ -1,0 +1,26 @@
+[
+  {
+    "chunk_id": "doc3.pdf_0001",
+    "source_doc": "doc3.pdf",
+    "page": 1,
+    "text": "1\n2\n3\n1\n2\n3\n4\n5\n6",
+    "doc_id": "doc3",
+    "doc_type": "institution"
+  },
+  {
+    "chunk_id": "doc3.pdf_0002",
+    "source_doc": "doc3.pdf",
+    "page": 2,
+    "text": "1\n2\n1\n2",
+    "doc_id": "doc3",
+    "doc_type": "institution"
+  },
+  {
+    "chunk_id": "doc3.pdf_0003",
+    "source_doc": "doc3.pdf",
+    "page": 3,
+    "text": "3",
+    "doc_id": "doc3",
+    "doc_type": "institution"
+  }
+]

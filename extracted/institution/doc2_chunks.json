@@ -1,0 +1,26 @@
+[
+  {
+    "chunk_id": "doc2.pdf_0001",
+    "source_doc": "doc2.pdf",
+    "page": 1,
+    "text": "*",
+    "doc_id": "doc2",
+    "doc_type": "institution"
+  },
+  {
+    "chunk_id": "doc2.pdf_0002",
+    "source_doc": "doc2.pdf",
+    "page": 2,
+    "text": "“ ”",
+    "doc_id": "doc2",
+    "doc_type": "institution"
+  },
+  {
+    "chunk_id": "doc2.pdf_0003",
+    "source_doc": "doc2.pdf",
+    "page": 3,
+    "text": "‘ ’",
+    "doc_id": "doc2",
+    "doc_type": "institution"
+  }
+]

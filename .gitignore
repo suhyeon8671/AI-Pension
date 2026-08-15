@@ -2,3 +2,9 @@ __pycache__/
 *.pyc
 .env
 .venv/
+
+# 빌드 산출물 (extract_all.py / build_vector_store.py / build_structured_store.py로
+# 재생성 가능하고, 특히 vector_store의 임베딩 프로바이더 pickle이 GitHub 단일 파일
+# 100MB 제한을 넘어서 git에 커밋하지 않는다)
+vector_store/
+structured_store.db

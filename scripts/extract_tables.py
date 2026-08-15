@@ -18,61 +18,9 @@
 
 import argparse
 import json
-import pdfplumber
 
-
-def extract_tables_from_pdf(pdf_path, page_range=None):
-    """PDF에서 페이지별 표를 추출한다.
-
-    Args:
-        pdf_path: PDF 파일 경로
-        page_range: (시작페이지, 끝페이지) 1-indexed, None이면 전체
-
-    Returns:
-        표 정보 dict의 리스트. 각 표는 source page, index, 행/열 수, raw data 포함.
-    """
-    results = []
-    with pdfplumber.open(pdf_path) as pdf:
-        pages = pdf.pages
-        start = 1
-        if page_range:
-            start = page_range[0]
-            pages = pdf.pages[page_range[0] - 1: page_range[1]]
-
-        for i, page in enumerate(pages):
-            page_num = start + i
-            tables = page.extract_tables()
-            for t_idx, table in enumerate(tables):
-                cleaned = [
-                    [cell.strip() if cell else "" for cell in row]
-                    for row in table
-                ]
-                results.append({
-                    "page": page_num,
-                    "table_index": t_idx,
-                    "rows": len(cleaned),
-                    "cols": len(cleaned[0]) if cleaned else 0,
-                    "data": cleaned,
-                })
-    return results
-
-
-def extract_text_by_page(pdf_path, page_range=None):
-    """서술형 텍스트를 페이지 단위로 추출한다. (RAG 청크용 원본)"""
-    documents = []
-    with pdfplumber.open(pdf_path) as pdf:
-        pages = pdf.pages
-        start = 1
-        if page_range:
-            start = page_range[0]
-            pages = pdf.pages[page_range[0] - 1: page_range[1]]
-
-        for i, page in enumerate(pages):
-            page_num = start + i
-            text = page.extract_text()
-            if text:
-                documents.append({"page": page_num, "text": text})
-    return documents
+from extractors import extract_pdf_tables as extract_tables_from_pdf
+from extractors import extract_pdf_text as extract_text_by_page
 
 
 def main():

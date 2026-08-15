@@ -1,0 +1,332 @@
+[
+  {
+    "page": 1,
+    "table_index": 0,
+    "rows": 3,
+    "cols": 1,
+    "data": [
+      [
+        ""
+      ],
+      [
+        ""
+      ],
+      [
+        ""
+      ]
+    ],
+    "doc_id": "doc9",
+    "doc_type": "institution",
+    "source_doc": "doc9.pdf"
+  },
+  {
+    "page": 2,
+    "table_index": 0,
+    "rows": 3,
+    "cols": 1,
+    "data": [
+      [
+        ""
+      ],
+      [
+        ""
+      ],
+      [
+        ""
+      ]
+    ],
+    "doc_id": "doc9",
+    "doc_type": "institution",
+    "source_doc": "doc9.pdf"
+  },
+  {
+    "page": 3,
+    "table_index": 0,
+    "rows": 3,
+    "cols": 1,
+    "data": [
+      [
+        ""
+      ],
+      [
+        ""
+      ],
+      [
+        "–\n–\n–"
+      ]
+    ],
+    "doc_id": "doc9",
+    "doc_type": "institution",
+    "source_doc": "doc9.pdf"
+  },
+  {
+    "page": 3,
+    "table_index": 1,
+    "rows": 9,
+    "cols": 2,
+    "data": [
+      [
+        "",
+        ""
+      ],
+      [
+        "",
+        ""
+      ],
+      [
+        "",
+        ""
+      ],
+      [
+        "",
+        ""
+      ],
+      [
+        "",
+        ""
+      ],
+      [
+        "",
+        "–\n–\n–"
+      ],
+      [
+        "",
+        ""
+      ],
+      [
+        "",
+        ""
+      ],
+      [
+        "",
+        ""
+      ]
+    ],
+    "doc_id": "doc9",
+    "doc_type": "institution",
+    "source_doc": "doc9.pdf"
+  },
+  {
+    "page": 4,
+    "table_index": 0,
+    "rows": 2,
+    "cols": 1,
+    "data": [
+      [
+        ""
+      ],
+      [
+        ""
+      ]
+    ],
+    "doc_id": "doc9",
+    "doc_type": "institution",
+    "source_doc": "doc9.pdf"
+  },
+  {
+    "page": 5,
+    "table_index": 0,
+    "rows": 2,
+    "cols": 1,
+    "data": [
+      [
+        ""
+      ],
+      [
+        ""
+      ]
+    ],
+    "doc_id": "doc9",
+    "doc_type": "institution",
+    "source_doc": "doc9.pdf"
+  },
+  {
+    "page": 5,
+    "table_index": 1,
+    "rows": 2,
+    "cols": 1,
+    "data": [
+      [
+        ""
+      ],
+      [
+        ""
+      ]
+    ],
+    "doc_id": "doc9",
+    "doc_type": "institution",
+    "source_doc": "doc9.pdf"
+  },
+  {
+    "page": 5,
+    "table_index": 2,
+    "rows": 2,
+    "cols": 1,
+    "data": [
+      [
+        ""
+      ],
+      [
+        ""
+      ]
+    ],
+    "doc_id": "doc9",
+    "doc_type": "institution",
+    "source_doc": "doc9.pdf"
+  },
+  {
+    "page": 6,
+    "table_index": 0,
+    "rows": 2,
+    "cols": 1,
+    "data": [
+      [
+        ""
+      ],
+      [
+        ""
+      ]
+    ],
+    "doc_id": "doc9",
+    "doc_type": "institution",
+    "source_doc": "doc9.pdf"
+  },
+  {
+    "page": 6,
+    "table_index": 1,
+    "rows": 2,
+    "cols": 1,
+    "data": [
+      [
+        ""
+      ],
+      [
+        ""
+      ]
+    ],
+    "doc_id": "doc9",
+    "doc_type": "institution",
+    "source_doc": "doc9.pdf"
+  },
+  {
+    "page": 7,
+    "table_index": 0,
+    "rows": 2,
+    "cols": 1,
+    "data": [
+      [
+        ""
+      ],
+      [
+        ""
+      ]
+    ],
+    "doc_id": "doc9",
+    "doc_type": "institution",
+    "source_doc": "doc9.pdf"
+  },
+  {
+    "page": 7,
+    "table_index": 1,
+    "rows": 2,
+    "cols": 1,
+    "data": [
+      [
+        ""
+      ],
+      [
+        ""
+      ]
+    ],
+    "doc_id": "doc9",
+    "doc_type": "institution",
+    "source_doc": "doc9.pdf"
+  },
+  {
+    "page": 7,
+    "table_index": 2,
+    "rows": 2,
+    "cols": 1,
+    "data": [
+      [
+        ""
+      ],
+      [
+        ""
+      ]
+    ],
+    "doc_id": "doc9",
+    "doc_type": "institution",
+    "source_doc": "doc9.pdf"
+  },
+  {
+    "page": 8,
+    "table_index": 0,
+    "rows": 2,
+    "cols": 1,
+    "data": [
+      [
+        ""
+      ],
+      [
+        ""
+      ]
+    ],
+    "doc_id": "doc9",
+    "doc_type": "institution",
+    "source_doc": "doc9.pdf"
+  },
+  {
+    "page": 8,
+    "table_index": 1,
+    "rows": 2,
+    "cols": 1,
+    "data": [
+      [
+        ""
+      ],
+      [
+        ""
+      ]
+    ],
+    "doc_id": "doc9",
+    "doc_type": "institution",
+    "source_doc": "doc9.pdf"
+  },
+  {
+    "page": 8,
+    "table_index": 2,
+    "rows": 5,
+    "cols": 3,
+    "data": [
+      [
+        "",
+        "",
+        ""
+      ],
+      [
+        "",
+        "",
+        ""
+      ],
+      [
+        "",
+        "",
+        ""
+      ],
+      [
+        "",
+        "",
+        ""
+      ],
+      [
+        "",
+        "",
+        ""
+      ]
+    ],
+    "doc_id": "doc9",
+    "doc_type": "institution",
+    "source_doc": "doc9.pdf"
+  }
+]

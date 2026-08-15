@@ -1,0 +1,18 @@
+[
+  {
+    "chunk_id": "doc4.pdf_0001",
+    "source_doc": "doc4.pdf",
+    "page": 1,
+    "text": "①\n–\n“ ”",
+    "doc_id": "doc4",
+    "doc_type": "institution"
+  },
+  {
+    "chunk_id": "doc4.pdf_0002",
+    "source_doc": "doc4.pdf",
+    "page": 2,
+    "text": ",\n–\n–\n※",
+    "doc_id": "doc4",
+    "doc_type": "institution"
+  }
+]

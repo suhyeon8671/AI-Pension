@@ -1,0 +1,18 @@
+[
+  {
+    "chunk_id": "doc54.pdf_0001",
+    "source_doc": "doc54.pdf",
+    "page": 1,
+    "text": "고객용",
+    "doc_id": "doc54",
+    "doc_type": "institution"
+  },
+  {
+    "chunk_id": "doc54.pdf_0002",
+    "source_doc": "doc54.pdf",
+    "page": 2,
+    "text": "•\n•\n•",
+    "doc_id": "doc54",
+    "doc_type": "institution"
+  }
+]

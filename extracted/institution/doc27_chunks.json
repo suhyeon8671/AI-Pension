@@ -1,0 +1,34 @@
+[
+  {
+    "chunk_id": "doc27.pdf_0001",
+    "source_doc": "doc27.pdf",
+    "page": 1,
+    "text": "바로가기\n바로가기\n바로가기\n바로가기\n바로가기",
+    "doc_id": "doc27",
+    "doc_type": "institution"
+  },
+  {
+    "chunk_id": "doc27.pdf_0002",
+    "source_doc": "doc27.pdf",
+    "page": 3,
+    "text": "MP\nMP\nMP\nMP\nMP 바로가기",
+    "doc_id": "doc27",
+    "doc_type": "institution"
+  },
+  {
+    "chunk_id": "doc27.pdf_0003",
+    "source_doc": "doc27.pdf",
+    "page": 5,
+    "text": "·\nMP",
+    "doc_id": "doc27",
+    "doc_type": "institution"
+  },
+  {
+    "chunk_id": "doc27.pdf_0004",
+    "source_doc": "doc27.pdf",
+    "page": 6,
+    "text": "〮\n〮\n〮\n·\n·",
+    "doc_id": "doc27",
+    "doc_type": "institution"
+  }
+]

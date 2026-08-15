@@ -1,1 +1,15 @@
 pdfplumber
+python-docx
+openpyxl
+python-pptx
+scikit-learn
+numpy
+chromadb
+tqdm
+requests
+
+# sentence-transformers는 로컬 임베딩 모델(LocalEmbeddingProvider,
+# EMBEDDING_PROVIDER=sentence_transformers)에서만 필요하다. 개발 환경에서는
+# huggingface.co 접근이 막혀 있어 검증하지 못했으니, 접근 가능한 환경에서만
+# 설치/사용할 것. 기본 프로바이더(tfidf)는 이 패키지가 없어도 동작한다.
+# sentence-transformers
