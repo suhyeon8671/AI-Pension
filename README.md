@@ -43,6 +43,30 @@ VLM으로 재추출하는 것을 검토한다.
 모든 청크와 표 레코드는 `source_doc`(원본 파일명)과 `page`(페이지 번호)를
 메타데이터로 포함해서, 최종 답변에 근거 문서를 표시할 수 있게 한다.
 
+### 이미지 기반 페이지 재처리 (VLM)
+
+institution 문서 중 17개(doc1, doc2, doc3, doc4, doc5, doc8, doc9, doc21, doc24,
+doc27, doc28, doc30, doc31, doc32, doc37, doc54, doc56), 총 126페이지는 원본
+PDF의 폰트 인코딩이 깨져 있어 텍스트 레이어 자체가 없다(글자 하나하나가
+이미지로 심어진 형태 — HWP→PDF 변환 시 흔한 케이스). `pdfplumber`뿐 아니라
+`pdftotext`로도 텍스트 추출이 안 되는 걸 확인했고, 반대로 poppler(`pdftoppm`)로
+페이지를 이미지 렌더링하면 시각적으로는 완전히 정상 표시된다 — 즉 텍스트
+추출로는 원천적으로 복구 불가능하고 VLM(이미지를 읽어서 텍스트화)이 필요한
+케이스다.
+
+대회 측 Q&A에서 "전처리·구조화 작업에 사용하는 OCR/VLM은 HyperCLOVA X가 아닌
+다른 모델을 써도 무방하다"고 명시적으로 확인했다(최종 답변 생성만 HyperCLOVA X
+필수). 이번 세션에서는 별도 API 비용 없이 Claude Code 세션 내에서 126페이지를
+직접 읽어 텍스트/표를 옮기는 방식으로 처리했다. 페이지를 poppler로 렌더링한
+뒤 VLM으로 재추출한 텍스트/표 레코드에는 `extraction_method: "vlm"` 필드를
+추가해서, 자동 추출과 구분하고 원본 페이지(`doc_id` + `page`)로 항상 검증할 수
+있게 했다.
+
+향후 유사 문서가 추가되면 같은 패턴(pdftoppm 렌더링 → VLM 판독 → text/tables
+JSON에 병합 → chunk_text로 청크 재생성)을 반복하면 된다. 아직 별도
+스크립트(`render_page_as_image.py`)로 자동화하지는 않았고, 이번엔 수작업으로
+처리했다 — 문서량이 많아지면 스크립트화 또는 Claude API 기반 자동화를 검토할 것.
+
 ## 사용법
 
 ### 단일 파일 처리 (기존 방식)
@@ -109,7 +133,8 @@ HyperCLOVA X 파이프라인, 평가용 API 서버)에서 그대로 import해서
 
 - [x] ~~청크 임베딩 → Vector DB 적재 스크립트~~ (`build_vector_store.py`, 기본 프로바이더는 tfidf/LSA — 실제 HyperCLOVA X 임베딩으로 교체 필요)
 - [x] ~~표 데이터 구조화~~ (`build_structured_store.py`, SQLite FTS5)
-- [ ] 표 추출 실패 페이지용 VLM 재처리 스크립트 (`render_page_as_image.py`)
+- [x] ~~이미지 기반 페이지 VLM 재처리~~ (institution 17개 문서, 126페이지 — 수작업 처리, 자동화 스크립트는 아직 없음)
+- [ ] VLM 재처리 자동화 스크립트 (`render_page_as_image.py` + Claude API 등) — 향후 유사 문서 대비
 - [ ] `hyperclova` 임베딩 프로바이더 실제 키로 검증 (엔드포인트/응답 스키마 확인)
 - [ ] 가능하면 `sentence_transformers` 프로바이더를 huggingface.co 접근 가능한 환경에서 검증하고 tfidf보다 우선 사용 검토
 - [ ] 질의 유형 분류(제도/세제/상품/복합) 라우팅 로직

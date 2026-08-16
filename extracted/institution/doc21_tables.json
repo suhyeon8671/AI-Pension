@@ -2,266 +2,33 @@
   {
     "page": 1,
     "table_index": 0,
-    "rows": 1,
-    "cols": 2,
+    "rows": 4,
+    "cols": 3,
     "data": [
       [
-        "",
-        ""
+        "지급유형",
+        "과세재원: 과세이연퇴직금",
+        "과세재원: 공제혜택 및 운용수익"
+      ],
+      [
+        "연금개시 신청 전",
+        "퇴직소득세 (부득이한 사유: 연금소득세(이연퇴직소득세x70%))",
+        "기타소득세 16.5% (부득이한 사유: 연금소득세 5.5~3.3%)"
+      ],
+      [
+        "연금개시 신청 후 - 연금지급(수령한도 이내)",
+        "연금소득세 (이연퇴직소득세x70%/60%/50%)",
+        "연금소득세 5.5~3.3%"
+      ],
+      [
+        "연금개시 신청 후 - 연금 외 지급",
+        "퇴직소득세 (부득이한 사유: 연금소득세(이연퇴직소득세x70%))",
+        "기타소득세 16.5% (부득이한 사유: 연금소득세 5.5~3.3%)"
       ]
     ],
     "doc_id": "doc21",
     "doc_type": "institution",
-    "source_doc": "doc21.pdf"
-  },
-  {
-    "page": 1,
-    "table_index": 1,
-    "rows": 1,
-    "cols": 2,
-    "data": [
-      [
-        "",
-        ""
-      ]
-    ],
-    "doc_id": "doc21",
-    "doc_type": "institution",
-    "source_doc": "doc21.pdf"
-  },
-  {
-    "page": 1,
-    "table_index": 2,
-    "rows": 5,
-    "cols": 7,
-    "data": [
-      [
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        ""
-      ],
-      [
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        ""
-      ],
-      [
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        ""
-      ],
-      [
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        ""
-      ],
-      [
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        ""
-      ]
-    ],
-    "doc_id": "doc21",
-    "doc_type": "institution",
-    "source_doc": "doc21.pdf"
-  },
-  {
-    "page": 1,
-    "table_index": 3,
-    "rows": 2,
-    "cols": 1,
-    "data": [
-      [
-        ""
-      ],
-      [
-        "☑"
-      ]
-    ],
-    "doc_id": "doc21",
-    "doc_type": "institution",
-    "source_doc": "doc21.pdf"
-  },
-  {
-    "page": 1,
-    "table_index": 4,
-    "rows": 1,
-    "cols": 2,
-    "data": [
-      [
-        "",
-        ""
-      ]
-    ],
-    "doc_id": "doc21",
-    "doc_type": "institution",
-    "source_doc": "doc21.pdf"
-  },
-  {
-    "page": 1,
-    "table_index": 5,
-    "rows": 3,
-    "cols": 1,
-    "data": [
-      [
-        ""
-      ],
-      [
-        ""
-      ],
-      [
-        ""
-      ]
-    ],
-    "doc_id": "doc21",
-    "doc_type": "institution",
-    "source_doc": "doc21.pdf"
-  },
-  {
-    "page": 1,
-    "table_index": 6,
-    "rows": 1,
-    "cols": 2,
-    "data": [
-      [
-        "",
-        ""
-      ]
-    ],
-    "doc_id": "doc21",
-    "doc_type": "institution",
-    "source_doc": "doc21.pdf"
-  },
-  {
-    "page": 1,
-    "table_index": 7,
-    "rows": 2,
-    "cols": 1,
-    "data": [
-      [
-        ""
-      ],
-      [
-        ""
-      ]
-    ],
-    "doc_id": "doc21",
-    "doc_type": "institution",
-    "source_doc": "doc21.pdf"
-  },
-  {
-    "page": 1,
-    "table_index": 8,
-    "rows": 2,
-    "cols": 1,
-    "data": [
-      [
-        ""
-      ],
-      [
-        ""
-      ]
-    ],
-    "doc_id": "doc21",
-    "doc_type": "institution",
-    "source_doc": "doc21.pdf"
-  },
-  {
-    "page": 1,
-    "table_index": 9,
-    "rows": 2,
-    "cols": 2,
-    "data": [
-      [
-        "",
-        ""
-      ],
-      [
-        "",
-        ""
-      ]
-    ],
-    "doc_id": "doc21",
-    "doc_type": "institution",
-    "source_doc": "doc21.pdf"
-  },
-  {
-    "page": 1,
-    "table_index": 10,
-    "rows": 2,
-    "cols": 1,
-    "data": [
-      [
-        ""
-      ],
-      [
-        ""
-      ]
-    ],
-    "doc_id": "doc21",
-    "doc_type": "institution",
-    "source_doc": "doc21.pdf"
-  },
-  {
-    "page": 1,
-    "table_index": 11,
-    "rows": 2,
-    "cols": 2,
-    "data": [
-      [
-        "",
-        ""
-      ],
-      [
-        "",
-        ""
-      ]
-    ],
-    "doc_id": "doc21",
-    "doc_type": "institution",
-    "source_doc": "doc21.pdf"
-  },
-  {
-    "page": 1,
-    "table_index": 12,
-    "rows": 3,
-    "cols": 2,
-    "data": [
-      [
-        "",
-        ""
-      ],
-      [
-        "",
-        ""
-      ],
-      [
-        "",
-        ""
-      ]
-    ],
-    "doc_id": "doc21",
-    "doc_type": "institution",
-    "source_doc": "doc21.pdf"
+    "source_doc": "doc21.pdf",
+    "extraction_method": "vlm"
   }
 ]

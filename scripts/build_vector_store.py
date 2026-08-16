@@ -50,7 +50,7 @@ def load_chunks():
 def sanitize_metadata(chunk):
     """Chroma 메타데이터는 str/int/float/bool만 허용 → None 필드 제거."""
     meta = {}
-    for key in ("doc_type", "doc_id", "source_doc", "product_code", "page", "chunk_id"):
+    for key in ("doc_type", "doc_id", "source_doc", "product_code", "page", "chunk_id", "extraction_method"):
         v = chunk.get(key)
         if v is not None:
             meta[key] = v
