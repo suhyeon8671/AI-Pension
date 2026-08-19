@@ -22,7 +22,10 @@ AI-Pension/
 │   ├── build_structured_store.py # 표 JSON → SQLite(FTS5) 구조화 저장소
 │   ├── embeddings.py            # 임베딩 프로바이더 (tfidf 기본 / sentence_transformers / hyperclova)
 │   ├── build_vector_store.py    # 청크 JSON → 임베딩 → Chroma 적재
-│   └── search.py                # 검색 인터페이스 (semantic_search / table_search) + CLI
+│   ├── search.py                # 검색 인터페이스 (semantic_search / table_search) + CLI
+│   └── router.py                # 질의 분류(제도/세제/상품/복합) + 검색 라우팅 + CLI
+├── api/
+│   └── server.py                # 평가용 API 서버 (FastAPI, GET /answer)
 └── requirements.txt
 ```
 
@@ -129,6 +132,53 @@ HyperCLOVA X 파이프라인, 평가용 API 서버)에서 그대로 import해서
 불러와 같은 벡터 공간에 질의를 투영한다. `build_vector_store.py`를 다시
 돌리면(특히 `--reset`) 이 상태도 다시 fit되므로, 문서가 추가되면 재적재가 필요하다.
 
+### 질의 라우팅
+
+`scripts/router.py`가 자연어 질의를 institution(제도/세제) / products(상품) /
+복합으로 분류하고, `search.py`의 `semantic_search` / `table_search`를 알맞게
+호출해서 근거 후보를 모은다. HyperCLOVA X 키가 아직 없어서 지금은 키워드
+규칙 기반 분류(`classify()`)이고, 키가 생기면 이 함수만 HCX 의도분류로
+교체하면 된다(`route_search()`의 반환 스키마는 그대로 유지).
+
+```bash
+python scripts/router.py --query "연금저축이랑 IRP에 넣으면 세액공제 얼마까지 되나요?"
+```
+
+## 평가용 API 서버
+
+대회 스펙(요청/응답 규격)에 맞춘 API 서버가 `api/server.py`에 있다.
+
+```
+GET {endpoint}/answer?question_id={id}&question={질의}
+-> 200 application/json
+{
+  "question_id": "...", "question": "...",
+  "retrieved_context": "...", "think_trace": "...", "answer": "..."
+}
+```
+
+로컬 실행/테스트:
+
+```bash
+uvicorn api.server:app --host 0.0.0.0 --port 8000
+
+curl -G "http://127.0.0.1:8000/answer" \
+    --data-urlencode "question_id=Q-001" \
+    --data-urlencode "question=DC와 DB, 운용 주체가 어떻게 다른가요?"
+```
+
+**현재 상태**: 라우팅 + 검색(`retrieved_context`, `think_trace`)까지는 실제로
+동작한다. `answer` 필드는 아직 HyperCLOVA X API 키가 없어서 진짜 LLM 생성이
+아니라 검색된 근거를 발췌해서 보여주는 임시 스텁이다(`api/server.py`의
+`generate_answer()`에 `TODO` 표시). 키가 발급되면 이 함수만 HCX Chat
+Completions 호출로 교체하면 나머지(라우팅, 검색, 응답 스키마)는 그대로 쓸 수
+있다.
+
+**제출용 API End-point**: `[TODO — 네이버클라우드 또는 개인 서버에 배포 후
+실제 접속 가능한 URL로 채울 것. 대회 규정상 README에 명시 필수]`
+표준 포트(HTTP 80 / HTTPS 443, self-signed 인증서 허용) 사용, 별도 인증
+헤더 없음, `/answer` 경로 고정, GET만 지원.
+
 ## TODO
 
 - [x] ~~청크 임베딩 → Vector DB 적재 스크립트~~ (`build_vector_store.py`, 기본 프로바이더는 tfidf/LSA — 실제 HyperCLOVA X 임베딩으로 교체 필요)
@@ -137,6 +187,9 @@ HyperCLOVA X 파이프라인, 평가용 API 서버)에서 그대로 import해서
 - [ ] VLM 재처리 자동화 스크립트 (`render_page_as_image.py` + Claude API 등) — 향후 유사 문서 대비
 - [ ] `hyperclova` 임베딩 프로바이더 실제 키로 검증 (엔드포인트/응답 스키마 확인)
 - [ ] 가능하면 `sentence_transformers` 프로바이더를 huggingface.co 접근 가능한 환경에서 검증하고 tfidf보다 우선 사용 검토
-- [ ] 질의 유형 분류(제도/세제/상품/복합) 라우팅 로직
-- [ ] HyperCLOVA X API 연동 (질문 → 검색 → 답변 생성 파이프라인)
-- [ ] 평가용 API 서버 (question_id, question → answer, retrieved_context, think_trace)
+- [x] ~~질의 유형 분류(제도/세제/상품/복합) 라우팅 로직~~ (`router.py`, 지금은 키워드 규칙 기반 — HCX 키 발급 후 의도분류로 교체 검토)
+- [ ] HyperCLOVA X API 연동 (질문 → 검색 → 답변 생성 파이프라인) — 키 발급 대기 중
+- [x] ~~평가용 API 서버~~ (`api/server.py`, `/answer` 엔드포인트 스펙대로 동작 — `answer` 필드는 HCX 연동 전까지 발췌형 스텁)
+- [ ] 서버를 네이버클라우드/개인 서버에 실제 배포하고 README에 End-point URL 명시 (제출 필수 항목)
+- [ ] 역질문/정보한계 대응 로직 (평가 비중 가장 높은 항목) — HCX 연동과 함께 진행
+- [ ] 종합소득세/연금수령한도 등 복잡한 계산이 필요한 질의에 대한 규칙 기반 계산 로직 검토
