@@ -8,3 +8,4 @@ __pycache__/
 # 100MB 제한을 넘어서 git에 커밋하지 않는다)
 vector_store/
 structured_store.db
+product_master.json
