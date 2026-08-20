@@ -44,6 +44,11 @@ NUM_RE = re.compile(r"^\d[\d,]*\.?\d*$")
 DECIMAL_RE = re.compile(r"^\d+\.\d+$")
 DECIMAL_FINDALL_RE = re.compile(r"\d+\.\d+")  # 앵커 없이 텍스트 뭉치 안에서 찾을 때
 CLASS_CODE_RE = re.compile(r"\(([A-Za-z0-9\-]{1,8})\)")
+# 판매수수료 칸은 숫자가 아니라 정형화된 문구("없음" 또는 "납입금액의 N%[ ]이내")인데,
+# "납입금액의"와 "N%이내"가 셀 줄바꿈 때문에 서로 다른 줄(그 사이에 다른 칸 텍스트가
+# 끼어든 상태)로 떨어져 있는 경우가 많아 하나의 정규식으로는 못 잡는다. 두 조각을
+# 각각 찾아서 조합한다.
+SALES_COMMISSION_PCT_RE = re.compile(r"([\d.]+)\s*%\s*이내")
 
 
 def cluster_lines(words, tol=2.5):
@@ -70,31 +75,53 @@ def find_fee_rows_on_page(page, page_num):
         if len(decimals) < 3 or len(int_like) < 4:
             continue
 
-        pre_text_words = [w for w in line if w["x0"] < decimals[0]["x0"]]
+        # 열 순서: [클래스종류] [판매수수료] 총보수 판매보수 동종유형총보수 총보수·비용
+        #          1년 2년 3년 5년 10년  (동종유형총보수는 '-'로 빠질 수 있어 소수 3개까지 허용)
+        has_peer_avg = len(decimals) >= 4
+        total_fee, distribution_fee = decimals[0], decimals[1]
+        peer_avg_fee = decimals[2] if has_peer_avg else None
+        total_fee_and_cost = decimals[3] if has_peer_avg else decimals[2]
+        cost_years = ["1y", "2y", "3y", "5y", "10y"]
+        cost_projection = {
+            y: int_like[idx]["text"] for idx, y in enumerate(cost_years) if idx < len(int_like)
+        }
+
+        pre_text_words = [w for w in line if w["x0"] < total_fee["x0"]]
         class_part1 = " ".join(w["text"] for w in pre_text_words)
+
+        # 클래스 코드와 판매수수료 문구는 이 줄 또는 인접한 줄(줄바꿈으로 나뉜 셀)에
+        # 걸쳐 있을 수 있어서, 이 줄 기준 앞뒤 한 줄까지 창을 넓혀서 찾는다.
+        window_lines = [lines[j] for j in (i - 1, i, i + 1) if 0 <= j < len(lines)]
+        window_text = " ".join(" ".join(w["text"] for w in wl) for wl in window_lines)
+
         class_code = None
         m = CLASS_CODE_RE.search(class_part1)
         if m:
             class_code = m.group(1)
         else:
-            for offset in (1, -1):
-                j = i + offset
-                if 0 <= j < len(lines):
-                    text = " ".join(w["text"] for w in lines[j])
-                    m2 = CLASS_CODE_RE.search(text)
-                    if m2:
-                        class_code = m2.group(1)
-                        break
+            m2 = CLASS_CODE_RE.search(window_text)
+            if m2:
+                class_code = m2.group(1)
+
+        sales_commission_desc = None
+        pct_m = SALES_COMMISSION_PCT_RE.search(window_text)
+        if "납입금액의" in window_text and pct_m:
+            sales_commission_desc = f"납입금액의 {pct_m.group(1)}%이내"
+        elif "없음" in window_text:
+            sales_commission_desc = "없음"
 
         rows.append({
             "class_code": class_code,
-            "total_fee": {
-                "value": decimals[0]["text"],
-                "page": page_num,
-                "evidence": " ".join(w["text"] for w in line),
-                "method": "coordinate_reconstruction",
-                "confidence": 1.0 if class_code else 0.5,
-            },
+            "sales_commission_desc": sales_commission_desc,
+            "total_fee": total_fee["text"],
+            "distribution_fee": distribution_fee["text"],
+            "peer_avg_fee": peer_avg_fee["text"] if peer_avg_fee else None,
+            "total_fee_and_cost": total_fee_and_cost["text"],
+            "cost_projection_per_10m": cost_projection,
+            "page": page_num,
+            "evidence": " ".join(w["text"] for w in line),
+            "method": "coordinate_reconstruction",
+            "confidence": 1.0 if class_code else 0.5,
         })
     return rows
 
@@ -159,7 +186,7 @@ def main():
         rows = process_doc(doc_id)
         if rows:
             docs_with_hits += 1
-            if any(r["total_fee"]["confidence"] < 0.7 for r in rows):
+            if any(r["confidence"] < 0.7 for r in rows):
                 docs_with_missing_class_code += 1
         all_rows.extend(rows)
 
