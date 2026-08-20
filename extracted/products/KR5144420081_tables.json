@@ -8269,5 +8269,35 @@
     "doc_type": "products",
     "source_doc": "R2_KR5144420081.pdf",
     "product_code": "KR5144420081"
+  },
+  {
+    "page": 1,
+    "table_index": 6,
+    "rows": 2,
+    "cols": 6,
+    "data": [
+      [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6"
+      ],
+      [
+        "매우높은위험",
+        "높은위험",
+        "다소높은위험",
+        "보통위험",
+        "낮은위험",
+        "매우낮은위험"
+      ]
+    ],
+    "doc_id": "KR5144420081",
+    "doc_type": "products",
+    "source_doc": "R2_KR5144420081.pdf",
+    "product_code": "KR5144420081",
+    "extraction_method": "canonical_fix",
+    "note": "금융투자협회 표준 투자위험등급 6단계 라벨(원본 표에서 배경색 박스 셀 인식 실패로 라벨이 소실/분산됨을 보정한 합성 표, 원본 표는 유지됨)"
   }
 ]
