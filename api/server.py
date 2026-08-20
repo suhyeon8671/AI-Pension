@@ -43,14 +43,34 @@ app = FastAPI(title="연금 Agent 평가용 API")
 
 MAX_CONTEXT_CHUNKS = 6
 MAX_TABLE_ROWS_SHOWN = 3
+# 청크당 컨텍스트에 넣는 최대 글자 수 — 토큰(크레딧) 절약을 위해 chunk_text.py의
+# 최대 청크 길이(500자)보다 더 짧게 자른다. LLM에 원문 전체를 통째로 넘기지 않고
+# 필요한 만큼만 파싱해서 전달하는 "Parser" 패턴.
+CONTEXT_CHUNK_CHAR_LIMIT = 350
+
+
+def _dedupe_by_page(hits):
+    """같은 (doc_id, page)에서 나온 청크가 여러 개면 가장 점수 높은 것만 남긴다.
+    한 페이지 안의 인접 청크들이 겹치는 내용을 반복해서 토큰을 낭비하는 걸 막는다."""
+    best = {}
+    for hit in hits:
+        key = (hit.get("doc_id"), hit.get("page"))
+        if key not in best or hit["score"] > best[key]["score"]:
+            best[key] = hit
+    # 원래 점수 순서를 유지
+    return sorted(best.values(), key=lambda h: h["score"], reverse=True)
 
 
 def format_retrieved_context(route_result: dict) -> str:
     """근거 문서를 소스 태그와 함께 하나의 문자열로 합친다 (근거 표시 요구사항)."""
     parts = []
-    for hit in route_result["semantic_hits"][:MAX_CONTEXT_CHUNKS]:
+    deduped = _dedupe_by_page(route_result["semantic_hits"])
+    for hit in deduped[:MAX_CONTEXT_CHUNKS]:
         tag = f"[{hit.get('doc_type')}/{hit.get('doc_id')} p.{hit.get('page')}]"
-        parts.append(f"{tag}\n{hit['text']}")
+        text = hit["text"]
+        if len(text) > CONTEXT_CHUNK_CHAR_LIMIT:
+            text = text[:CONTEXT_CHUNK_CHAR_LIMIT] + "…"
+        parts.append(f"{tag}\n{text}")
     for hit in route_result["table_hits"]:
         tag = f"[{hit.get('doc_type')}/{hit.get('doc_id')} p.{hit.get('page')} 표]"
         rows = hit["data"][:MAX_TABLE_ROWS_SHOWN]
@@ -75,6 +95,10 @@ def format_think_trace(query: str, route_result: dict) -> str:
         lines.append(f"   - 인식된 상품코드: {c['product_codes']}")
     if c["ambiguous"]:
         lines.append("   - 키워드로 분류가 애매해 institution/products 양쪽 다 검색함")
+    if route_result.get("retried"):
+        lines.append(
+            "   - 1차 검색 결과의 유사도가 낮아 검색 범위를 institution+products 양쪽으로 넓혀 재검색함"
+        )
     lines.append(f"2. 의미 검색(semantic_search) 결과 {len(route_result['semantic_hits'])}건")
     for hit in route_result["semantic_hits"][:MAX_CONTEXT_CHUNKS]:
         lines.append(f"   - {hit.get('doc_id')} p.{hit.get('page')} (유사도 {hit.get('score'):.3f})")

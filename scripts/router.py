@@ -99,19 +99,40 @@ def classify(query: str) -> dict:
     }
 
 
+# 이 점수 밑이면 "근거로 쓰기엔 부실하다"고 보고 검색 범위를 넓혀 재시도한다.
+# tfidf/LSA 코사인 유사도 기준 임시값 — 실제 질의로 튜닝된 값은 아니라 조정 여지 있음.
+RELEVANCE_RETRY_THRESHOLD = 0.30
+
+
 def route_search(query: str, k: int = 5) -> dict:
     """분류 결과에 따라 semantic_search / table_search를 호출하고 결과를 합쳐서 반환.
+
+    1차 검색 결과의 최고 유사도가 너무 낮으면(RELEVANCE_RETRY_THRESHOLD 미만),
+    분류가 좁게(institution만 또는 products만) 잡았을 가능성을 의심하고
+    양쪽 다 검색하는 재시도를 한 번 한다 — "검색 결과가 질문과 안 맞으면
+    쿼리 범위를 바꿔서 재시도" 패턴.
 
     반환값:
         {
             "classification": classify()의 결과,
             "semantic_hits": [...],
             "table_hits": [...],
+            "retried": bool,
         }
     """
     classification = classify(query)
-    semantic_hits = []
-    table_hits = []
+
+    def _search(doc_types):
+        hits = []
+        for doc_type in doc_types:
+            product_code = classification["product_codes"][0] if (
+                doc_type == "products" and classification["product_codes"]
+            ) else None
+            hits.extend(
+                semantic_search(query, k=k, doc_type=doc_type, product_code=product_code)
+            )
+        hits.sort(key=lambda h: h["score"], reverse=True)
+        return hits
 
     doc_types = []
     if classification["use_institution"]:
@@ -119,16 +140,20 @@ def route_search(query: str, k: int = 5) -> dict:
     if classification["use_products"]:
         doc_types.append("products")
 
-    for doc_type in doc_types:
-        product_code = classification["product_codes"][0] if (
-            doc_type == "products" and classification["product_codes"]
-        ) else None
-        semantic_hits.extend(
-            semantic_search(query, k=k, doc_type=doc_type, product_code=product_code)
-        )
+    semantic_hits = _search(doc_types)
 
-    semantic_hits.sort(key=lambda h: h["score"], reverse=True)
+    retried = False
+    both_types = {"institution", "products"}
+    top_score = semantic_hits[0]["score"] if semantic_hits else 0.0
+    if top_score < RELEVANCE_RETRY_THRESHOLD and set(doc_types) != both_types:
+        retried = True
+        doc_types = ["institution", "products"]
+        retry_hits = _search(doc_types)
+        # 재시도 결과가 원래 결과보다 나을 때만 채택 (더 나쁘면 원래 결과 유지)
+        if retry_hits and (not semantic_hits or retry_hits[0]["score"] > top_score):
+            semantic_hits = retry_hits
 
+    table_hits = []
     if classification["use_table_search"]:
         fts_query = _build_fts_query(classification)
         if fts_query:
@@ -142,6 +167,7 @@ def route_search(query: str, k: int = 5) -> dict:
         "classification": classification,
         "semantic_hits": semantic_hits[: max(k, 5)],
         "table_hits": table_hits[:k],
+        "retried": retried,
     }
 
 
