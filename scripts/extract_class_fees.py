@@ -94,14 +94,18 @@ def find_fee_rows_on_page(page, page_num):
         window_lines = [lines[j] for j in (i - 1, i, i + 1) if 0 <= j < len(lines)]
         window_text = " ".join(" ".join(w["text"] for w in wl) for wl in window_lines)
 
+        # 클래스 코드(괄호 안 텍스트)는 실측 사례들에서 항상 "이 줄" 또는 "다음 줄"에서만
+        # 나타났다 - "이전 줄"은 위쪽 행(다른 클래스)의 이름 꼬리일 수 있어서 잘못
+        # 가져다 쓸 위험이 있다 (KR514X450008에서 확인: 이전 줄의 클래스코드를 엉뚱하게
+        # 가져와서 실제로는 다른 클래스인 행에 잘못 붙인 사례). 그래서 클래스 코드는
+        # "이 줄 + 다음 줄"까지만 보고, 이전 줄은 보지 않는다.
+        next_line_text = " ".join(w["text"] for w in lines[i + 1]) if i + 1 < len(lines) else ""
+        class_code_search_text = class_part1 + " " + next_line_text
+
         class_code = None
-        m = CLASS_CODE_RE.search(class_part1)
+        m = CLASS_CODE_RE.search(class_code_search_text)
         if m:
             class_code = m.group(1)
-        else:
-            m2 = CLASS_CODE_RE.search(window_text)
-            if m2:
-                class_code = m2.group(1)
 
         sales_commission_desc = None
         pct_m = SALES_COMMISSION_PCT_RE.search(window_text)
@@ -126,9 +130,14 @@ def find_fee_rows_on_page(page, page_num):
     return rows
 
 
-def candidate_pages_for_doc(doc_id):
-    """이미 확인한 대로 "블롭"인 페이지만 좌표 기반 재구성 대상으로 삼는다.
-    (정상 추출된 페이지를 다시 좌표로 뽑으면 오히려 불필요한 작업/오류 위험)"""
+def candidate_pages_for_doc(doc_id, max_page):
+    """처음엔 "블롭"(뭉쳐서 깨진) 페이지만 대상으로 삼았는데, 그러면 표가 여러
+    페이지에 걸쳐 있을 때(예: 클래스 일부는 정상 추출된 페이지에, 나머지는 깨진
+    페이지에) 정상 페이지 쪽 클래스를 통째로 놓치는 버그가 있었다(KR514X450008
+    사례로 확인). 좌표 기반 재구성은 이미 정상 추출된 페이지에도 똑같이 정확하게
+    동작한다는 걸 검증했으므로(KR5120420039), "클래스"+"총보수"가 언급된 페이지는
+    깨졌든 안 깨졌든 전부 대상으로 삼고, 표가 다음 페이지로 이어질 수 있으니
+    바로 다음 페이지도 같이 포함한다."""
     fp = os.path.join(EXTRACTED_DIR, f"{doc_id}_tables.json")
     if not os.path.exists(fp):
         return []
@@ -138,13 +147,10 @@ def candidate_pages_for_doc(doc_id):
     pages = set()
     for t in tables:
         flat = " ".join(c for row in t["data"] for c in row if c)
-        if "클래스" not in flat or "총보수" not in flat:
-            continue
-        for row in t["data"]:
-            for c in row:
-                if c and len(c) >= 50 and len(DECIMAL_FINDALL_RE.findall(c)) >= 3:
-                    pages.add(t["page"])
-                    break
+        if "클래스" in flat and "총보수" in flat:
+            pages.add(t["page"])
+            if t["page"] + 1 <= max_page:
+                pages.add(t["page"] + 1)
     return sorted(pages)
 
 
@@ -152,12 +158,12 @@ def process_doc(doc_id):
     pdf_candidates = glob.glob(os.path.join(DATA_DIR, doc_id, "*.pdf"))
     if not pdf_candidates:
         return []
-    pages = candidate_pages_for_doc(doc_id)
-    if not pages:
-        return []
 
     results = []
     with pdfplumber.open(pdf_candidates[0]) as pdf:
+        pages = candidate_pages_for_doc(doc_id, len(pdf.pages))
+        if not pages:
+            return []
         for page_num in pages:
             if page_num < 1 or page_num > len(pdf.pages):
                 continue
@@ -166,7 +172,22 @@ def process_doc(doc_id):
             for r in rows:
                 r["product_code"] = doc_id
                 results.append(r)
-    return results
+
+    # 표가 여러 페이지에 걸쳐 있어서 다음 페이지도 후보로 넣다 보니, 같은
+    # 클래스가 두 페이지 모두에서 뽑힐 수 있다 (예: 클래스 헤더 페이지의
+    # 마지막 줄이 다음 페이지 처음 줄과 겹쳐 인식되는 경우). class_code가
+    # 있는 것끼리는 (product_code, class_code) 기준으로 중복 제거하고,
+    # confidence가 더 높은(=class_code를 더 명확히 찾은) 쪽을 남긴다.
+    dedup = {}
+    unlabeled = []
+    for r in results:
+        if r["class_code"] is None:
+            unlabeled.append(r)
+            continue
+        key = r["class_code"]
+        if key not in dedup or r["confidence"] > dedup[key]["confidence"]:
+            dedup[key] = r
+    return list(dedup.values()) + unlabeled
 
 
 def main():
