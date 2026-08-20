@@ -43,6 +43,13 @@ TAX_KEYWORDS = [
     "세율", "종합과세", "분리과세", "한도",
 ]
 
+# 세제뿐 아니라 "표로 정리된 명확한 사실값"을 묻는 질의는 table_search도 같이
+# 태워야 근거가 잡힌다. 세액공제/한도 같은 세제 키워드에 더해, 위험등급/보수/
+# 수수료/수익률처럼 상품 표에 그대로 나오는 수치성 키워드를 포함한다.
+TABLE_FACT_KEYWORDS = TAX_KEYWORDS + [
+    "위험등급", "보수", "수수료", "수익률", "설정액",
+]
+
 PRODUCT_CODE_RE = re.compile(r"KR[0-9A-Z]{10}", re.IGNORECASE)
 
 
@@ -66,6 +73,7 @@ def classify(query: str) -> dict:
     inst_hits = [kw for kw in INSTITUTION_KEYWORDS if kw in q]
     prod_hits = [kw for kw in PRODUCT_KEYWORDS if kw in q]
     tax_hits = [kw for kw in TAX_KEYWORDS if kw in q]
+    table_fact_hits = [kw for kw in TABLE_FACT_KEYWORDS if kw in q]
     product_codes = PRODUCT_CODE_RE.findall(query)
 
     use_institution = bool(inst_hits) or bool(tax_hits)
@@ -91,7 +99,7 @@ def classify(query: str) -> dict:
         "category": category,
         "use_institution": use_institution,
         "use_products": use_products,
-        "use_table_search": bool(tax_hits),
+        "use_table_search": bool(table_fact_hits),
         "product_codes": product_codes,
         "matched_institution_keywords": inst_hits,
         "matched_product_keywords": prod_hits,
@@ -157,9 +165,18 @@ def route_search(query: str, k: int = 5) -> dict:
     if classification["use_table_search"]:
         fts_query = _build_fts_query(classification)
         if fts_query:
+            product_code = classification["product_codes"][0] if classification["product_codes"] else None
             for doc_type in doc_types:
                 try:
-                    table_hits.extend(table_search(fts_query, k=k, doc_type=doc_type))
+                    # 상품코드가 특정됐으면 그 상품 표만 우선 검색 (다른 상품의
+                    # 변경이력 표 등 무관한 표가 키워드만 겹쳐서 섞여 들어오는 걸 방지)
+                    scoped_hits = table_search(
+                        fts_query, k=k, doc_type=doc_type,
+                        product_code=product_code if doc_type == "products" else None,
+                    )
+                    if product_code and doc_type == "products" and not scoped_hits:
+                        scoped_hits = table_search(fts_query, k=k, doc_type=doc_type)
+                    table_hits.extend(scoped_hits)
                 except ValueError:
                     pass  # FTS5 쿼리 문법에 안 맞으면 표 검색 스킵
 
