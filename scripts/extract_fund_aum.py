@@ -35,7 +35,10 @@ import json
 import os
 import re
 
+import pdfplumber
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(REPO_ROOT, "data", "products")
 EXTRACTED_DIR = os.path.join(REPO_ROOT, "extracted", "products")
 DEFAULT_OUTPUT = os.path.join(REPO_ROOT, "fund_aum.json")
 
@@ -112,6 +115,125 @@ def extract_fund_aum(doc_id):
     }
 
 
+def cluster_lines(words, tol=2.5):
+    words = sorted(words, key=lambda w: w["top"])
+    lines = []
+    for w in words:
+        if lines and abs(w["top"] - lines[-1][0]["top"]) <= tol:
+            lines[-1].append(w)
+        else:
+            lines.append([w])
+    for line in lines:
+        line.sort(key=lambda w: w["x0"])
+    return lines
+
+
+NUM_TOKEN_RE = re.compile(r"^-$|^[\d,]+$")
+
+
+def extract_fund_aum_coordinates(doc_id):
+    """text_regex가 실패한 문서용 - "자산총계"/"부채총계" 라벨이 "자 산 총
+    계"처럼 글자 사이가 벌어진 폰트로 나와(총보수/수익률 표에서 겪은 것과는
+    다른 종류의 문제 - x_tolerance를 올려도 안 붙는 의도적인 자간) 캐시된
+    _text.json의 문자열 매칭이 실패한 경우를 좌표 기반으로 재시도한다.
+    숫자 자체는 글자처럼 벌어지지 않고 한 토큰으로 붙어 나오므로, 줄의
+    텍스트를 공백 제거 후 비교해 라벨을 찾고 숫자 토큰만 따로 뽑는다."""
+    pdf_candidates = glob.glob(os.path.join(DATA_DIR, doc_id, "*.pdf"))
+    fp = os.path.join(EXTRACTED_DIR, f"{doc_id}_text.json")
+    if not pdf_candidates or not os.path.exists(fp):
+        return None
+    with open(fp, "r", encoding="utf-8") as f:
+        pages_text = json.load(f)
+    candidate_pages = [p["page"] for p in pages_text if "재무상태표" in p.get("text", "")]
+    if not candidate_pages:
+        return None
+
+    with pdfplumber.open(pdf_candidates[0]) as pdf:
+        for page_num in candidate_pages:
+            if page_num < 1 or page_num > len(pdf.pages):
+                continue
+            page = pdf.pages[page_num - 1]
+            words = page.extract_words(x_tolerance=5, keep_blank_chars=False)
+            lines = cluster_lines(words)
+
+            full_norm = re.sub(r"\s+", "", " ".join(w["text"] for line in lines for w in line))
+            if "운용자산" not in full_norm:
+                continue
+            if "유동자산" in full_norm or "고정자산" in full_norm:
+                continue
+
+            asset_vals = liab_vals = unit = None
+            seen_balance_sheet_heading = False
+            for line in lines:
+                norm = re.sub(r"\s+", "", " ".join(w["text"] for w in line))
+                if "재무상태표" in norm or "요약재무정보" in norm:
+                    seen_balance_sheet_heading = True
+                    unit = None  # 이전(다른 표의) 단위 표기는 무효화
+                # "(단위:백만원,%)"처럼 재무상태표와 무관한 앞쪽 표의 단위
+                # 표기를 잘못 주워올 수 있어, 재무상태표 제목을 본 뒤부터만
+                # 단위를 채택한다.
+                if seen_balance_sheet_heading and unit is None:
+                    um = UNIT_RE.search(norm)
+                    if um:
+                        unit = um.group(1)
+                if norm.startswith("자산총계") and asset_vals is None:
+                    nums = _merge_number_fragments(line)
+                    if nums:
+                        asset_vals = nums
+                elif norm.startswith("부채총계") and liab_vals is None:
+                    nums = _merge_number_fragments(line)
+                    if nums:
+                        liab_vals = nums
+            if not asset_vals or not liab_vals:
+                continue
+
+            asset_nums = [to_num(v) for v in asset_vals]
+            liab_nums = [to_num(v) for v in liab_vals]
+            n = min(len(asset_nums), len(liab_nums))
+            if n == 0:
+                continue
+            net_vals = [asset_nums[i] - liab_nums[i] for i in range(n)]
+
+            return {
+                "product_code": doc_id,
+                "unit": unit or "원",
+                "asset_total": asset_nums,
+                "liability_total": liab_nums,
+                "net_asset_total": net_vals,
+                "net_asset_latest": net_vals[0],
+                "page": page_num,
+                "evidence": f"자산총계 {' '.join(asset_vals)} / 부채총계 {' '.join(liab_vals)}",
+                "method": "coordinate_reconstruction",
+                "confidence": 0.8,
+            }
+    return None
+
+
+def _merge_number_fragments(line):
+    """일부 문서는 라벨뿐 아니라 숫자까지 글자 단위로 쪼개져 나온다
+    ("1 0 3 ,4 3 2 ,1 1 3 ,0 0 5"). 같은 숫자의 조각들은 토큰 사이 간격이
+    좁고(문자 간격), 서로 다른 열(기수)의 숫자들은 간격이 훨씬 넓다(표
+    컬럼 간격) - 이 간격 차이로 조각을 하나의 숫자로 합칠지 다음 열로
+    넘어갈지 구분한다."""
+    num_tokens = [w for w in line if NUM_TOKEN_RE.match(w["text"])]
+    if not num_tokens:
+        return []
+    num_tokens.sort(key=lambda w: w["x0"])
+    groups = [[num_tokens[0]]]
+    for prev, cur in zip(num_tokens, num_tokens[1:]):
+        gap = cur["x0"] - prev["x1"]
+        # 실측: 같은 숫자가 쪼개진 조각 사이 간격은 ~0.2~0.5pt(거의 붙어
+        # 있음)인데, 서로 다른 열(기수)의 숫자 사이 간격은 50pt 이상이다.
+        # (직전 토큰 너비에 비례한 임계값은 이미 한 토큰으로 잘 뽑힌
+        # 긴 숫자("2,920,496,678,257" 같은 15자)에서 열 간격보다 커져
+        # 버려 다른 열까지 잘못 합치는 문제가 있었다 - 고정값으로 변경)
+        if gap <= 3:
+            groups[-1].append(cur)
+        else:
+            groups.append([cur])
+    return ["".join(w["text"] for w in g) for g in groups]
+
+
 def main():
     parser = argparse.ArgumentParser(description="펀드 자체 재무상태표에서 순자산총계(AUM) 추출")
     parser.add_argument("--output", default=DEFAULT_OUTPUT)
@@ -123,15 +245,20 @@ def main():
     )
 
     results = []
+    fallback_used = 0
     for doc_id in doc_ids:
         r = extract_fund_aum(doc_id)
+        if not r:
+            r = extract_fund_aum_coordinates(doc_id)
+            if r:
+                fallback_used += 1
         if r:
             results.append(r)
 
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
-    print(f"{len(results)}/{len(doc_ids)}개 문서 → {args.output}")
+    print(f"{len(results)}/{len(doc_ids)}개 문서 → {args.output} (좌표 기반 폴백으로 {fallback_used}건 추가 회복)")
 
 
 if __name__ == "__main__":
