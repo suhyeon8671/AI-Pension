@@ -441,6 +441,13 @@ def find_fee_rows_on_page(page, page_num, has_cost_column):
                     commission_words.append(w["text"])
         class_name_full = " ".join(class_name_words) if class_name_words else None
         commission_raw = " ".join(commission_words) if commission_words else None
+        # 클래스명/판매수수료만 남기고 총보수 등 숫자 데이터를 통째로 빼버리면
+        # (원래는 실수로 빠졌었다 - 사용자가 "판매수수료만 보이는거야?"라고
+        # 바로 지적함) total_fee/distribution_fee/peer_avg_fee/
+        # total_fee_and_cost/cost_projection_per_10m을 원본과 대조 확인할
+        # 방법이 없어진다. 이 값들은 전부 이 행 자신의 줄(line)에서 나오므로
+        # 그 줄 원문 그대로 세 번째 칸으로 남긴다.
+        data_text = " ".join(w["text"] for w in line)
 
         # %가 숫자에 바로 붙는 서식(위 DECIMAL_RE 참고)에서는 총보수/판매보수
         # 값 자체도 "0.145%"처럼 "%"를 달고 있어서, 판매수수료 % 탐색에 이
@@ -499,14 +506,18 @@ def find_fee_rows_on_page(page, page_num, has_cost_column):
         else:
             peer_avg_fee_text = None
 
-        # evidence는 "클래스명"/"판매수수료"를 물리적 줄 순서가 아니라 논리적
-        # 칸 이름을 붙여 따로 보여준다(위 class_name_full/commission_raw
-        # 참고) - sales_commission_desc가 이미 정규화됐으면 그걸 쓰고, 못
-        # 찾았으면(null) 원본에서 실제로 걸린 원문 조각(commission_raw)을
-        # 대신 보여줘 왜 못 찾았는지 확인할 수 있게 한다.
+        # evidence는 "클래스명"/"판매수수료"/"총보수 등 숫자"를 물리적 줄
+        # 순서가 아니라 논리적 칸 이름을 붙여 세 칸으로 따로 보여준다(위
+        # class_name_full/commission_raw/data_text 참고) - sales_commission_desc가
+        # 이미 정규화됐으면 그걸 쓰고, 못 찾았으면(null) 원본에서 실제로 걸린
+        # 원문 조각(commission_raw)을 대신 보여줘 왜 못 찾았는지 확인할 수
+        # 있게 한다. "총보수 등" 칸은 total_fee/distribution_fee/peer_avg_fee/
+        # total_fee_and_cost/cost_projection_per_10m을 원본과 대조 확인하는
+        # 용도라 이 행 자신의 줄 원문을 그대로 남긴다.
         evidence = (
             f"클래스명: {class_name_full or '(확인안됨)'} | "
-            f"판매수수료: {sales_commission_desc if sales_commission_desc is not None else (commission_raw or '(확인안됨)')}"
+            f"판매수수료: {sales_commission_desc if sales_commission_desc is not None else (commission_raw or '(확인안됨)')} | "
+            f"총보수 등: {data_text}"
         )
 
         rows.append({
