@@ -115,8 +115,19 @@ def find_fee_rows_on_page(page, page_num):
         #          1년 2년 3년 5년 10년  (동종유형총보수는 '-'로 빠질 수 있어 소수 3개까지 허용)
         has_peer_avg = len(decimals) >= 4
         total_fee, distribution_fee = decimals[0], decimals[1]
-        peer_avg_fee = decimals[2] if has_peer_avg else None
-        total_fee_and_cost = decimals[3] if has_peer_avg else decimals[2]
+        if has_peer_avg:
+            peer_avg_fee = decimals[2]
+            total_fee_and_cost = decimals[3]
+        else:
+            total_fee_and_cost = decimals[2]
+            # 동종유형총보수 칸이 원본에 "-"로 명시돼 있으면(정보가 없다는
+            # 걸 실제로 확인한 것) null이 아니라 "-"로 남긴다 - 못 찾은 것과
+            # 원본이 실제로 "-"라고 밝힌 건 다른 의미다(사용자가 지적함).
+            dash_between = [
+                w for w in line
+                if w["text"] == "-" and distribution_fee["x1"] < w["x0"] < total_fee_and_cost["x0"]
+            ]
+            peer_avg_fee = "-" if dash_between else None
         cost_years = ["1y", "2y", "3y", "5y", "10y"]
         cost_projection = {
             y: int_like[idx]["text"] for idx, y in enumerate(cost_years) if idx < len(int_like)
@@ -176,14 +187,24 @@ def find_fee_rows_on_page(page, page_num):
         if "납입금" in wide_text and pct_m:
             sales_commission_desc = f"납입금액의 {pct_m.group(1)}%이내"
         elif "없음" in window_text or has_standalone_dash:
-            sales_commission_desc = "없음"
+            # 원본이 "없음"이라는 글자를 쓰든 그냥 "-"만 찍든 의미는 같아서
+            # ("판매수수료가 없다"는 확인된 사실), 출력은 원본에 실제로 보이는
+            # 기호인 "-"로 통일한다(사용자 요청).
+            sales_commission_desc = "-"
+
+        if isinstance(peer_avg_fee, str):
+            peer_avg_fee_text = peer_avg_fee
+        elif peer_avg_fee:
+            peer_avg_fee_text = peer_avg_fee["text"].rstrip("%")
+        else:
+            peer_avg_fee_text = None
 
         rows.append({
             "class_code": class_code,
             "sales_commission_desc": sales_commission_desc,
             "total_fee": total_fee["text"].rstrip("%"),
             "distribution_fee": distribution_fee["text"].rstrip("%"),
-            "peer_avg_fee": peer_avg_fee["text"].rstrip("%") if peer_avg_fee else None,
+            "peer_avg_fee": peer_avg_fee_text,
             "total_fee_and_cost": total_fee_and_cost["text"].rstrip("%"),
             "cost_projection_per_10m": cost_projection,
             "page": page_num,
