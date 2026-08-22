@@ -45,6 +45,15 @@ DEFAULT_OUTPUT = os.path.join(REPO_ROOT, "fund_aum.json")
 NUM_OR_DASH = r"(?:-|[\d,]+)"
 ASSET_TOTAL_RE = re.compile(rf"자산총계\s*({NUM_OR_DASH}(?:\s+{NUM_OR_DASH}){{0,2}})")
 LIAB_TOTAL_RE = re.compile(rf"부채총계\s*({NUM_OR_DASH}(?:\s+{NUM_OR_DASH}){{0,2}})")
+# "자본총계"(순자산총액 = 자산총계-부채총계)가 재무상태표에 직접 표기돼
+# 있는 문서가 많다(부채총계 몇 줄 뒤, "원본/수익조정금/이익잉여금" 항목
+# 다음). 자산총계-부채총계로 직접 계산한 값과 비교해보면 ±1(단위 기준)
+# 차이가 나는 경우가 실제로 있다(사용자가 evidence를 원본과 대조하다
+# 발견, KR510902511M 실측: 계산값 9186 vs 원본 표기 9185) - 각 하위 항목이
+# 독립적으로 반올림돼 있어 더해도/빼도 딱 안 맞는 회계상 흔한 반올림
+# 오차다. 우리가 계산한 값보다 원본이 직접 밝힌 값이 더 정확하므로, 있으면
+# 이 값을 우선 채택한다.
+CAP_TOTAL_RE = re.compile(rf"자본총계\s*({NUM_OR_DASH}(?:\s+{NUM_OR_DASH}){{0,2}})")
 UNIT_RE = re.compile(r"단위\s*[:：]\s*(백만원|천원|원)")
 
 
@@ -94,6 +103,17 @@ def extract_fund_aum(doc_id):
         return None
     net_asset_vals = [asset_vals[i] - liab_vals[i] for i in range(n)]
 
+    # "자본총계"가 재무상태표에 직접 표기돼 있으면(위 CAP_TOTAL_RE 주석
+    # 참고) 우리가 계산한 값(자산총계-부채총계)보다 그게 더 정확하다 -
+    # 항목별 반올림 때문에 계산값과 ±1(단위 기준) 차이가 날 수 있다. 개수가
+    # 안 맞으면(다른 표의 "자본총계"를 잘못 집었을 위험) 계산값을 그대로
+    # 쓴다.
+    cap_m = CAP_TOTAL_RE.search(t)
+    if cap_m:
+        cap_vals = [to_num(v) for v in cap_m.group(1).split()]
+        if len(cap_vals) == n:
+            net_asset_vals = cap_vals
+
     unit_idx = t.find("자산총계")
     unit_m = UNIT_RE.search(t[max(0, unit_idx - 600):unit_idx])
     unit = unit_m.group(1) if unit_m else "원"
@@ -120,7 +140,18 @@ def extract_fund_aum(doc_id):
             ),
             max(0, fee_line_idx - 3),
         )
-        end_idx = min(len(lines_t), fee_line_idx + 3)
+        # "자본총계"를 채택한 경우(위 참고) evidence에도 그 줄까지 보여야
+        # 어떤 값을 왜 썼는지 대조할 수 있다 - 부채총계 몇 줄 뒤에 있는
+        # "자본총계" 줄을 찾으면 거기까지, 못 찾으면(그런 표기가 없는
+        # 문서) 기존처럼 자산총계 뒤 몇 줄만 남긴다.
+        cap_line_idx = next(
+            (
+                i for i in range(fee_line_idx + 1, min(len(lines_t), fee_line_idx + 10))
+                if "자본총계" in lines_t[i]
+            ),
+            None,
+        )
+        end_idx = min(len(lines_t), (cap_line_idx + 1) if cap_line_idx is not None else fee_line_idx + 3)
         evidence = " / ".join(lines_t[header_idx:end_idx])
     else:
         evidence = t[max(0, idx - 120):idx + 60].replace("\n", " / ")
