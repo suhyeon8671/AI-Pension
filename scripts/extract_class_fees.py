@@ -445,9 +445,10 @@ def find_fee_rows_on_page(page, page_num, has_cost_column):
         # (원래는 실수로 빠졌었다 - 사용자가 "판매수수료만 보이는거야?"라고
         # 바로 지적함) total_fee/distribution_fee/peer_avg_fee/
         # total_fee_and_cost/cost_projection_per_10m을 원본과 대조 확인할
-        # 방법이 없어진다. 이 값들은 전부 이 행 자신의 줄(line)에서 나오므로
-        # 그 줄 원문 그대로 세 번째 칸으로 남긴다.
-        data_text = " ".join(w["text"] for w in line)
+        # 방법이 없어진다. 이 행 자신의 줄(line)에서 "숫자데이터"로 분류된
+        # 토큰만(클래스명/판매수수료 단어는 이미 위에서 따로 보여주므로
+        # 여기서 또 반복하지 않는다) 순서대로 남긴다.
+        data_text = " ".join(w["text"] for w in line if _word_role(w) == "data")
 
         # %가 숫자에 바로 붙는 서식(위 DECIMAL_RE 참고)에서는 총보수/판매보수
         # 값 자체도 "0.145%"처럼 "%"를 달고 있어서, 판매수수료 % 탐색에 이
@@ -506,19 +507,18 @@ def find_fee_rows_on_page(page, page_num, has_cost_column):
         else:
             peer_avg_fee_text = None
 
-        # evidence는 "클래스명"/"판매수수료"/"총보수 등 숫자"를 물리적 줄
-        # 순서가 아니라 논리적 칸 이름을 붙여 세 칸으로 따로 보여준다(위
-        # class_name_full/commission_raw/data_text 참고) - sales_commission_desc가
-        # 이미 정규화됐으면 그걸 쓰고, 못 찾았으면(null) 원본에서 실제로 걸린
-        # 원문 조각(commission_raw)을 대신 보여줘 왜 못 찾았는지 확인할 수
-        # 있게 한다. "총보수 등" 칸은 total_fee/distribution_fee/peer_avg_fee/
-        # total_fee_and_cost/cost_projection_per_10m을 원본과 대조 확인하는
-        # 용도라 이 행 자신의 줄 원문을 그대로 남긴다.
-        evidence = (
-            f"클래스명: {class_name_full or '(확인안됨)'} | "
-            f"판매수수료: {sales_commission_desc if sales_commission_desc is not None else (commission_raw or '(확인안됨)')} | "
-            f"총보수 등: {data_text}"
-        )
+        # evidence는 "클래스명"을 물리적 줄 순서가 아니라 논리적 칸 이름을
+        # 붙여 따로 보여주고, 그 뒤에 판매수수료 문구 + 숫자데이터를 이어
+        # 붙인다(사용자 요청 - "판매수수료" 이름표 자체는 빼고, 클래스명/
+        # 판매수수료 원문("수수료선취-오프라인(A) 액의 1%")이 숫자 앞에
+        # 또 반복되지 않게). sales_commission_desc가 이미 정규화됐으면 그걸
+        # 쓰고, 못 찾았으면(null) 원본에서 실제로 걸린 원문 조각
+        # (commission_raw)을 대신 보여줘 왜 못 찾았는지 확인할 수 있게
+        # 한다. 숫자데이터(data_text)는 total_fee/distribution_fee/
+        # peer_avg_fee/total_fee_and_cost/cost_projection_per_10m을 원본과
+        # 대조 확인하는 용도다.
+        commission_display = sales_commission_desc if sales_commission_desc is not None else (commission_raw or "(확인안됨)")
+        evidence = f"클래스명: {class_name_full or '(확인안됨)'} | {commission_display} {data_text}".rstrip()
 
         rows.append({
             "class_code": class_code,
