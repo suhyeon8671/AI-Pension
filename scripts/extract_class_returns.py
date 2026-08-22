@@ -78,6 +78,33 @@ def cluster_lines(words, tol=2.5):
     return lines
 
 
+# 표 옆 여백에 "투자실적\n추이\n(연평균\n수익률)"이 세로로 회전돼 한 단어씩
+# 별도 줄로 찍히는 문서가 있다(KR5116501001 등). 이게 라벨 이어지는 줄
+# 사이에 끼어들면 "바로 다음/이전 줄"만 보는 class_code 탐색이 진짜
+# 라벨을 건너뛰고 이 캡션 조각을 잘못 집는다 - 데이터(숫자)가 전혀 없고
+# 이 캡션 단어 목록에만 정확히 일치하는 줄은 건너뛰고 그 다음/이전 "진짜"
+# 줄을 찾는다.
+CAPTION_FRAGMENT_RE = re.compile(r"^\(?(투자실적|추이|연평균|연환산|수익률\)?)\)?$")
+
+
+def _skip_caption_lines(lines, start, step):
+    idx = start
+    while 0 <= idx < len(lines):
+        text = re.sub(r"\s+", "", " ".join(w["text"] for w in lines[idx]))
+        if CAPTION_FRAGMENT_RE.match(text):
+            idx += step
+            continue
+        return idx
+    return None
+
+
+def _line_text_skipping_captions(lines, idx, step):
+    real_idx = _skip_caption_lines(lines, idx, step)
+    if real_idx is None:
+        return ""
+    return " ".join(w["text"] for w in lines[real_idx])
+
+
 def row_kind(pre_text, prev_line_text="", next_line_text=""):
     # 폰트 문제로 글자가 한 자씩 떨어져 나오는 문서에서는 "비교지수"가
     # "비 교 지 수"처럼 공백 낀 상태로 들어오기도 해서, 공백을 지우고 비교한다.
@@ -141,9 +168,12 @@ def find_return_rows_on_page(page, page_num, section="가"):
         # 클래스명이 인접 줄로 이어질 수 있어 다음 줄까지 확인 (총보수 표에서
         # 검증된 대로 - "이전 줄"은 다른 행 것일 위험이 있어 보지 않는다.
         # 단, "종류A" 패턴은 라벨이 데이터 줄 "위"에 오는 3줄 구조라 예외적으로
-        # 이전 줄도 함께 본다 - 아래 종류 코드 탐색 참고)
-        prev_line_text = " ".join(w["text"] for w in lines[i - 1]) if i - 1 >= 0 else ""
-        next_line_text = " ".join(w["text"] for w in lines[i + 1]) if i + 1 < len(lines) else ""
+        # 이전 줄도 함께 본다 - 아래 종류 코드 탐색 참고).
+        # 세로로 회전된 옆면 캡션("투자실적"/"추이" 등)이 진짜 라벨 줄
+        # 사이에 끼어들 수 있어(KR5116501001), "바로 다음/이전 줄"이 아니라
+        # 그 캡션 조각들을 건너뛴 "진짜" 다음/이전 줄을 본다.
+        prev_line_text = _line_text_skipping_captions(lines, i - 1, -1)
+        next_line_text = _line_text_skipping_captions(lines, i + 1, 1)
         label_search_text = pre_text + " " + next_line_text
         # 폰트 문제로 글자가 한 자씩 떨어져 나오는 문서(예: "비 교 지 수")에서도
         # 키워드 검사가 되도록, 공백 제거한 버전을 만들어서 모든 문구 검사에 쓴다.
@@ -234,8 +264,15 @@ def find_return_rows_on_page(page, page_num, section="가"):
                 kind = "class_return"
             else:
                 # "수익률\n변동성"라벨이 데이터 줄 위아래로 걸쳐 있는 경우
-                # (KR5113420012/69에서 확인)만 좁혀서 앞뒤 줄을 본다.
-                kind = row_kind(pre_text, prev_line_text, next_line_text)
+                # (KR5113420012/69에서 확인)만 좁혀서 앞뒤 줄을 본다. 이때는
+                # 캡션을 건너뛴 줄이 아니라 "바로" 앞/다음 줄이어야 한다 -
+                # 캡션 건너뛰기로 더 멀리 있는 줄(예: 바로 위의 비교지수 행
+                # 전체)까지 가져오면 그 행 자신의 "비교지수" 텍스트가 섞여
+                # 들어와 "변동성 행인데 비교지수도 같이 검출됨" 오판정이
+                # 생긴다(KR5113420012에서 실제 확인된 회귀).
+                raw_prev_line_text = " ".join(w["text"] for w in lines[i - 1]) if i - 1 >= 0 else ""
+                raw_next_line_text = " ".join(w["text"] for w in lines[i + 1]) if i + 1 < len(lines) else ""
+                kind = row_kind(pre_text, raw_prev_line_text, raw_next_line_text)
 
         date_m = INCEPTION_DATE_RE.search(pre_text)
         inception_date = date_m.group() if date_m else None
