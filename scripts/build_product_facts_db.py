@@ -74,6 +74,25 @@ CREATE TABLE class_returns (
     confidence REAL
 );
 CREATE INDEX idx_class_returns_product ON class_returns(product_code);
+
+-- 참고용: 운용전문인력 표의 "운용규모"는 이 상품 하나의 AUM이 아니라
+-- 해당 운용역/운용사가 운용하는 전체 펀드 합산 규모다(is_product_aum=0
+-- 고정). 6축 정답(product_master/class_fees/class_returns)과 섞이지
+-- 않도록 별도 테이블로 분리한다.
+DROP TABLE IF EXISTS manager_info;
+CREATE TABLE manager_info (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_code TEXT,
+    name TEXT,
+    birth_year INTEGER,
+    manager_fund_count INTEGER,
+    manager_aum_billion_won REAL,
+    is_product_aum INTEGER,
+    career TEXT,
+    page INTEGER,
+    confidence REAL
+);
+CREATE INDEX idx_manager_info_product ON manager_info(product_code);
 """
 
 
@@ -184,12 +203,43 @@ def load_class_returns(conn, path):
     return n
 
 
+def load_manager_info(conn, path):
+    if not os.path.exists(path):
+        return 0
+    with open(path, "r", encoding="utf-8") as f:
+        records = json.load(f)
+    n = 0
+    for r in records:
+        conn.execute(
+            """
+            INSERT INTO manager_info
+                (product_code, name, birth_year, manager_fund_count,
+                 manager_aum_billion_won, is_product_aum, career, page, confidence)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                r["product_code"],
+                r["name"],
+                r["birth_year"],
+                r["manager_fund_count"],
+                to_float(r["manager_aum_billion_won"]),
+                0,
+                r.get("career"),
+                r["page"],
+                r["confidence"],
+            ),
+        )
+        n += 1
+    return n
+
+
 def main():
     parser = argparse.ArgumentParser(description="상품 팩트 3종을 SQLite로 적재")
     parser.add_argument("--db", default=DEFAULT_DB_PATH)
     parser.add_argument("--product-master", default=os.path.join(REPO_ROOT, "product_master.json"))
     parser.add_argument("--class-fees", default=os.path.join(REPO_ROOT, "class_fees.json"))
     parser.add_argument("--class-returns", default=os.path.join(REPO_ROOT, "class_returns.json"))
+    parser.add_argument("--manager-info", default=os.path.join(REPO_ROOT, "manager_info.json"))
     args = parser.parse_args()
 
     conn = sqlite3.connect(args.db)
@@ -198,10 +248,11 @@ def main():
     n1 = load_product_master(conn, args.product_master)
     n2 = load_class_fees(conn, args.class_fees)
     n3 = load_class_returns(conn, args.class_returns)
+    n4 = load_manager_info(conn, args.manager_info)
 
     conn.commit()
     conn.close()
-    print(f"product_master {n1}건, class_fees {n2}건, class_returns {n3}건 → {args.db}")
+    print(f"product_master {n1}건, class_fees {n2}건, class_returns {n3}건, manager_info(참고용) {n4}건 → {args.db}")
 
 
 if __name__ == "__main__":
