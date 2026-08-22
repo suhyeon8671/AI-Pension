@@ -99,7 +99,31 @@ def extract_fund_aum(doc_id):
     unit = unit_m.group(1) if unit_m else "원"
 
     idx = t.find("자산총계")
-    evidence = t[max(0, idx - 120):idx + 60].replace("\n", " / ")
+    # 고정 글자수(앞 120자)로 자르면 글자/줄 경계를 무시하고 잘라서, 표
+    # 헤더의 기수 라벨("12기(22.12.22)")이 ".22)"처럼 중간에서 뚝 끊긴
+    # 파편으로 남는 경우가 있었다(KR510902511M 실측 - 사용자가 evidence에서
+    # 발견). "항목 N기(...)..." 헤더 줄부터 "자산총계" 몇 줄 뒤(부채총계
+    # 포함)까지, 줄 경계 기준으로 온전하게 잘라서 헤더 라벨이 안 잘리게
+    # 한다.
+    lines_t = t.split("\n")
+    fee_line_idx = next((i for i, l in enumerate(lines_t) if "자산총계" in l), None)
+    if fee_line_idx is not None:
+        # 표 헤더 표기가 문서마다 다르다 - "항목"/"항 목"(글자 간격 벌어짐,
+        # KR5111420047), "제 10 기"류 기수 표기(KR5156450026), "14기(24.12.22)"
+        # 류 기수+날짜 표기(KR510902511M) 등. 이 중 하나라도 있는 줄을
+        # 헤더로 본다.
+        HEADER_ANCHOR_RE = re.compile(r"항\s*목|제\s*\d+\s*기|\d+기\(")
+        header_idx = next(
+            (
+                i for i in range(fee_line_idx - 1, max(-1, fee_line_idx - 15), -1)
+                if HEADER_ANCHOR_RE.search(lines_t[i])
+            ),
+            max(0, fee_line_idx - 3),
+        )
+        end_idx = min(len(lines_t), fee_line_idx + 3)
+        evidence = " / ".join(lines_t[header_idx:end_idx])
+    else:
+        evidence = t[max(0, idx - 120):idx + 60].replace("\n", " / ")
 
     return {
         "product_code": doc_id,
