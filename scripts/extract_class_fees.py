@@ -46,9 +46,11 @@ DECIMAL_FINDALL_RE = re.compile(r"\d+\.\d+")  # 앵커 없이 텍스트 뭉치 �
 CLASS_CODE_RE = re.compile(r"\(([A-Za-z0-9\-]{1,8})\)")
 # 판매수수료 칸은 숫자가 아니라 정형화된 문구("없음" 또는 "납입금액의 N%[ ]이내")인데,
 # "납입금액의"와 "N%이내"가 셀 줄바꿈 때문에 서로 다른 줄(그 사이에 다른 칸 텍스트가
-# 끼어든 상태)로 떨어져 있는 경우가 많아 하나의 정규식으로는 못 잡는다. 두 조각을
-# 각각 찾아서 조합한다.
-SALES_COMMISSION_PCT_RE = re.compile(r"([\d.]+)\s*%\s*이내")
+# 끼어든 상태)로 떨어져 있는 경우가 많아 하나의 정규식으로는 못 잡는다. "이내"까지
+#3줄로 쪼개지는 경우도 있어("납입금" / "액의 N%" / "이내") 퍼센트 숫자만 여기서
+# 찾고, "이내"가 바로 붙어 있을 필요는 없다고 본다 (이 좁은 윈도우 안의 "%"는
+# 사실상 판매수수료율 말고는 나올 데가 없다).
+SALES_COMMISSION_PCT_RE = re.compile(r"([\d.]+)\s*%")
 
 
 def cluster_lines(words, tol=2.5):
@@ -94,6 +96,22 @@ def find_fee_rows_on_page(page, page_num):
         window_lines = [lines[j] for j in (i - 1, i, i + 1) if 0 <= j < len(lines)]
         window_text = " ".join(" ".join(w["text"] for w in wl) for wl in window_lines)
 
+        # 판매수수료 문구가 "납입금"/"액의 N%"/"이내" 3줄로 나뉘어 데이터 줄
+        # 앞뒤로 2줄까지 걸치는 경우가 있었다(KR510902511M) - 그렇다고 무작정
+        # ±2로 넓히면 바로 옆 클래스 행의 판매수수료를 잘못 가져오는 더 나쁜
+        # 문제가 생긴다(실측: C 클래스가 A 클래스의 "0.10%이내"를 잘못 가져옴).
+        # "틀린 값 < 없는 값"이므로 안전한 ±1만 쓰고, 이 케이스는 놓치는 쪽을
+        # 택한다(sales_commission_desc는 null로 남음, total_fee 등 핵심 값은
+        # 영향 없음).
+        wide_text = window_text
+        # "-"는 판매수수료가 "없음"이라는 뜻으로 쓰이기도 하는데, 클래스명 자체에
+        # 하이픈("수수료선취-오프라인")이 들어있어 그냥 문자열에 "-"가 있는지만
+        # 보면 항상 참이 된다. 그래서 "-"가 단독 토큰(그 칸에 딱 "-"만 있는 경우)
+        # 으로 존재하는지를 봐야 한다.
+        has_standalone_dash = any(
+            w["text"] == "-" for wl in window_lines for w in wl
+        )
+
         # 클래스 코드(괄호 안 텍스트)는 실측 사례들에서 항상 "이 줄" 또는 "다음 줄"에서만
         # 나타났다 - "이전 줄"은 위쪽 행(다른 클래스)의 이름 꼬리일 수 있어서 잘못
         # 가져다 쓸 위험이 있다 (KR514X450008에서 확인: 이전 줄의 클래스코드를 엉뚱하게
@@ -107,11 +125,15 @@ def find_fee_rows_on_page(page, page_num):
         if m:
             class_code = m.group(1)
 
+        # "납입금액의"가 3줄로 쪼개지는 경우도 있다("납입금" / 데이터 줄에 낀
+        # "액의 1%" / "이내" - 사이에 클래스명 등 다른 텍스트가 끼어 있어서
+        # "납입금액의"를 하나의 이어붙은 문자열로 찾으면 놓친다). "납입금"이라는
+        # 조각만으로도 판매수수료 문구라는 걸 충분히 특정할 수 있어 그걸로 판별한다.
         sales_commission_desc = None
-        pct_m = SALES_COMMISSION_PCT_RE.search(window_text)
-        if "납입금액의" in window_text and pct_m:
+        pct_m = SALES_COMMISSION_PCT_RE.search(wide_text)
+        if "납입금" in wide_text and pct_m:
             sales_commission_desc = f"납입금액의 {pct_m.group(1)}%이내"
-        elif "없음" in window_text:
+        elif "없음" in window_text or has_standalone_dash:
             sales_commission_desc = "없음"
 
         rows.append({
