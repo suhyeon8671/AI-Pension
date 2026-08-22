@@ -38,6 +38,7 @@ from fastapi.responses import JSONResponse
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
 
 from router import route_search  # noqa: E402
+from compare_products import extract_product_codes, is_comparison_query, compare_products  # noqa: E402
 
 app = FastAPI(title="연금 Agent 평가용 API")
 
@@ -134,6 +135,30 @@ def generate_answer(query: str, route_result: dict) -> str:
 
 @app.get("/answer")
 def answer(question_id: str, question: str):
+    # 상품 2개 이상을 비교하는 질의는 semantic_search로 텍스트 청크를 여러 개
+    # 긁어오는 대신, 이미 정확히 뽑아둔 구조화 DB(product_master/class_fees/
+    # class_returns)에서 숫자만 직접 조회한다 - 토큰을 훨씬 적게 쓰면서도
+    # 텍스트 검색보다 정확하다 (scripts/compare_products.py 참고).
+    product_codes = extract_product_codes(question)
+    if is_comparison_query(question, product_codes) and len(product_codes) >= 2:
+        summary, evidence = compare_products(product_codes)
+        body = {
+            "question_id": question_id,
+            "question": question,
+            "retrieved_context": summary,
+            "think_trace": (
+                "1. 질의 분류: 상품 비교 (상품코드 2개 이상 인식)\n"
+                f"   - 인식된 상품코드: {product_codes}\n"
+                "2. semantic_search 대신 구조화 DB(product_master/class_fees/"
+                "class_returns) 직접 조회로 처리 (토큰 절약)\n"
+                f"   - 조회 근거: {evidence}\n"
+                "3. [주의] 답변 생성 단계는 아직 HyperCLOVA X API 키가 없어 "
+                "실제 LLM 호출이 아니라 조회 결과를 그대로 보여주는 임시 로직임"
+            ),
+            "answer": f"[임시 답변 — HyperCLOVA X 연동 전 조회 결과]\n{summary}",
+        }
+        return JSONResponse(content=body)
+
     route_result = route_search(question, k=5)
     body = {
         "question_id": question_id,
