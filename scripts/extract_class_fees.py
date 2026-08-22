@@ -41,7 +41,10 @@ EXTRACTED_DIR = os.path.join(REPO_ROOT, "extracted", "products")
 DEFAULT_OUTPUT = os.path.join(REPO_ROOT, "class_fees.json")
 
 NUM_RE = re.compile(r"^\d[\d,]*\.?\d*$")
-DECIMAL_RE = re.compile(r"^\d+\.\d+$")
+# 일부 운용사 서식(신영자산운용 등)은 총보수 % 값을 "1.18%"처럼 %가 붙은 한
+# 토큰으로 낸다(공백 없이 붙어 있어 pdfplumber가 한 단어로 묶음). %가 없는
+# 문서와 똑같이 처리하기 위해 optional %를 허용하고, 저장할 때는 벗겨낸다.
+DECIMAL_RE = re.compile(r"^\d+\.\d+%?$")
 DECIMAL_FINDALL_RE = re.compile(r"\d+\.\d+")  # 앵커 없이 텍스트 뭉치 안에서 찾을 때
 CLASS_CODE_RE = re.compile(r"\(([A-Za-z0-9\-]{1,8})\)")
 # 판매수수료 칸은 숫자가 아니라 정형화된 문구("없음" 또는 "납입금액의 N%[ ]이내")인데,
@@ -71,9 +74,11 @@ def find_fee_rows_on_page(page, page_num):
     lines = cluster_lines(words)
     rows = []
     for i, line in enumerate(lines):
-        all_nums = [w for w in line if NUM_RE.match(w["text"])]
-        decimals = [w for w in all_nums if DECIMAL_RE.match(w["text"])]
-        int_like = [w for w in all_nums if w not in decimals]
+        # decimals를 NUM_RE로 거른 뒤 다시 추리면 "1.18%"처럼 %가 붙은 토큰이
+        # NUM_RE(퍼센트 미허용)에 애초에 안 걸려 통째로 빠진다 - line에서 직접
+        # 따로 찾는다.
+        decimals = [w for w in line if DECIMAL_RE.match(w["text"])]
+        int_like = [w for w in line if NUM_RE.match(w["text"]) and w not in decimals]
         if len(decimals) < 3 or len(int_like) < 4:
             continue
 
@@ -103,7 +108,15 @@ def find_fee_rows_on_page(page, page_num):
         # "틀린 값 < 없는 값"이므로 안전한 ±1만 쓰고, 이 케이스는 놓치는 쪽을
         # 택한다(sales_commission_desc는 null로 남음, total_fee 등 핵심 값은
         # 영향 없음).
-        wide_text = window_text
+        # %가 숫자에 바로 붙는 서식(위 DECIMAL_RE 참고)에서는 총보수/판매보수
+        # 값 자체도 "0.145%"처럼 "%"를 달고 있어서, 판매수수료 % 탐색에 이
+        # 값들이 같이 걸려 있으면(예: 진짜 판매수수료 "0.1%"보다 총보수
+        # "0.145%"가 텍스트상 먼저 나옴) 엉뚱한 숫자를 판매수수료로 오인한다.
+        # 이 행 자신의 총보수류 값 토큰은 검색 대상에서 제외한다.
+        decimal_ids = {id(w) for w in decimals}
+        wide_text = " ".join(
+            w["text"] for wl in window_lines for w in wl if id(w) not in decimal_ids
+        )
         # "-"는 판매수수료가 "없음"이라는 뜻으로 쓰이기도 하는데, 클래스명 자체에
         # 하이픈("수수료선취-오프라인")이 들어있어 그냥 문자열에 "-"가 있는지만
         # 보면 항상 참이 된다. 그래서 "-"가 단독 토큰(그 칸에 딱 "-"만 있는 경우)
@@ -139,10 +152,10 @@ def find_fee_rows_on_page(page, page_num):
         rows.append({
             "class_code": class_code,
             "sales_commission_desc": sales_commission_desc,
-            "total_fee": total_fee["text"],
-            "distribution_fee": distribution_fee["text"],
-            "peer_avg_fee": peer_avg_fee["text"] if peer_avg_fee else None,
-            "total_fee_and_cost": total_fee_and_cost["text"],
+            "total_fee": total_fee["text"].rstrip("%"),
+            "distribution_fee": distribution_fee["text"].rstrip("%"),
+            "peer_avg_fee": peer_avg_fee["text"].rstrip("%") if peer_avg_fee else None,
+            "total_fee_and_cost": total_fee_and_cost["text"].rstrip("%"),
             "cost_projection_per_10m": cost_projection,
             "page": page_num,
             "evidence": " ".join(w["text"] for w in line),
