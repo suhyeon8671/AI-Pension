@@ -93,6 +93,19 @@ CREATE TABLE manager_info (
     confidence REAL
 );
 CREATE INDEX idx_manager_info_product ON manager_info(product_code);
+
+-- 6축 중 AUM(시장잔고): 펀드 자체 재무상태표의 자산총계-부채총계 =
+-- 순자산총계를 이 상품의 실제 AUM으로 취급한다(manager_info와 달리
+-- is_product_aum 플래그 없음 - 이건 진짜 이 상품의 값).
+DROP TABLE IF EXISTS fund_aum;
+CREATE TABLE fund_aum (
+    product_code TEXT PRIMARY KEY,
+    unit TEXT,
+    net_asset_latest REAL,
+    net_asset_won REAL,
+    page INTEGER,
+    confidence REAL
+);
 """
 
 
@@ -233,6 +246,34 @@ def load_manager_info(conn, path):
     return n
 
 
+def load_fund_aum(conn, path):
+    if not os.path.exists(path):
+        return 0
+    with open(path, "r", encoding="utf-8") as f:
+        records = json.load(f)
+    unit_multiplier = {"원": 1, "천원": 1_000, "백만원": 1_000_000}
+    n = 0
+    for r in records:
+        won = r["net_asset_latest"] * unit_multiplier.get(r["unit"], 1)
+        conn.execute(
+            """
+            INSERT INTO fund_aum
+                (product_code, unit, net_asset_latest, net_asset_won, page, confidence)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                r["product_code"],
+                r["unit"],
+                r["net_asset_latest"],
+                won,
+                r["page"],
+                r["confidence"],
+            ),
+        )
+        n += 1
+    return n
+
+
 def main():
     parser = argparse.ArgumentParser(description="상품 팩트 3종을 SQLite로 적재")
     parser.add_argument("--db", default=DEFAULT_DB_PATH)
@@ -240,6 +281,7 @@ def main():
     parser.add_argument("--class-fees", default=os.path.join(REPO_ROOT, "class_fees.json"))
     parser.add_argument("--class-returns", default=os.path.join(REPO_ROOT, "class_returns.json"))
     parser.add_argument("--manager-info", default=os.path.join(REPO_ROOT, "manager_info.json"))
+    parser.add_argument("--fund-aum", default=os.path.join(REPO_ROOT, "fund_aum.json"))
     args = parser.parse_args()
 
     conn = sqlite3.connect(args.db)
@@ -249,10 +291,14 @@ def main():
     n2 = load_class_fees(conn, args.class_fees)
     n3 = load_class_returns(conn, args.class_returns)
     n4 = load_manager_info(conn, args.manager_info)
+    n5 = load_fund_aum(conn, args.fund_aum)
 
     conn.commit()
     conn.close()
-    print(f"product_master {n1}건, class_fees {n2}건, class_returns {n3}건, manager_info(참고용) {n4}건 → {args.db}")
+    print(
+        f"product_master {n1}건, class_fees {n2}건, class_returns {n3}건, "
+        f"manager_info(참고용) {n4}건, fund_aum {n5}건 → {args.db}"
+    )
 
 
 if __name__ == "__main__":
