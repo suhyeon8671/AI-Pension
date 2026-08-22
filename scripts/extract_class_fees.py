@@ -158,7 +158,16 @@ def find_fee_rows_on_page(page, page_num):
             "total_fee_and_cost": total_fee_and_cost["text"].rstrip("%"),
             "cost_projection_per_10m": cost_projection,
             "page": page_num,
+            # 이 행 자신의 줄만 담는다 - total_fee 등 숫자 필드들의 근거로는
+            # 이걸로 충분하다("납입금액의 1%이내"처럼 데이터 줄 앞뒤로 라벨이
+            # 쪼개진 경우, 이 줄만 보면 "액의 1%"처럼 일부만 보이는 게
+            # 정상이다 - 실제 판정에 쓴 범위는 sales_commission_evidence 참고).
             "evidence": " ".join(w["text"] for w in line),
+            # sales_commission_desc는 이 행 자신의 줄이 아니라 앞뒤 1줄까지
+            # 포함한 window_text로 판정한다 - 그 판정 근거를 그대로 남겨서
+            # "액의 1%"만 보고 "납입금액의 1%이내"가 어디서 나왔는지 못
+            # 알아보는 문제(사용자가 직접 대조하다 발견)를 없앤다.
+            "sales_commission_evidence": window_text,
             "method": "coordinate_reconstruction",
             "confidence": 1.0 if class_code else 0.5,
         })
