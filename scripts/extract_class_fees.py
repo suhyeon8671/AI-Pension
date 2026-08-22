@@ -54,6 +54,8 @@ CLASS_CODE_RE = re.compile(r"\(([A-Za-z0-9\-]{1,8})\)")
 # 찾고, "이내"가 바로 붙어 있을 필요는 없다고 본다 (이 좁은 윈도우 안의 "%"는
 # 사실상 판매수수료율 말고는 나올 데가 없다).
 SALES_COMMISSION_PCT_RE = re.compile(r"([\d.]+)\s*%")
+# "N%" 대신 "100분의 N"(=N/100, 같은 뜻)으로 표기하는 문서가 있다(KR5114420027).
+BUNUI_RE = re.compile(r"100\s*분의\s*([\d.]+)")
 
 
 def cluster_lines(words, tol=2.5):
@@ -146,6 +148,18 @@ def find_fee_rows_on_page(page, page_num, has_cost_column):
             if (prev_w and prev_w["text"].endswith("의")) or (next_w and next_w["text"] == "이내"):
                 decimals = decimals[1:]
 
+        # 판매수수료 문구가 "%" 대신 "100분의 N"(=N/100, 같은 뜻)으로 나오는
+        # 문서가 있다(KR5114420027 실측: "납입금액의 100분의 0.3 이내" - 이
+        # "0.3"엔 "%"가 안 붙어서 위의 % 기반 판별에 안 걸리고, 총보수 등
+        # 진짜 4개 컬럼 앞에 끼어들어 전부 한 칸씩 밀리는 같은 종류의 문제를
+        # 일으켰다). 맨 왼쪽 소수 바로 앞 토큰이 "...분의"로 끝나면(그
+        # 사이에 낀 판매수수료 숫자라는 뜻) 마찬가지로 드롭한다.
+        if len(decimals) >= 4:
+            idx0 = next((idx for idx, w in enumerate(line) if w is decimals[0]), -1)
+            prev_w = line[idx0 - 1] if idx0 > 0 else None
+            if prev_w and prev_w["text"].endswith("분의"):
+                decimals = decimals[1:]
+
         # 일부 문서(KR5169950018 등)는 네 번째 소수(총보수·비용)의 소수점이
         # 쉼표로 잘못 찍혀 나온다("1.807"이어야 할 값이 "1,807"로 나와서
         # 정수(비용예시)로 오인됨) - 그러면 소수 3개+정수 6개(정상은 4개+5개)
@@ -228,17 +242,77 @@ def find_fee_rows_on_page(page, page_num, has_cost_column):
         class_part1 = " ".join(w["text"] for w in pre_text_words)
 
         # 클래스 코드와 판매수수료 문구는 이 줄 또는 인접한 줄(줄바꿈으로 나뉜 셀)에
-        # 걸쳐 있을 수 있어서, 이 줄 기준 앞뒤 한 줄까지 창을 넓혀서 찾는다.
-        window_lines = [lines[j] for j in (i - 1, i, i + 1) if 0 <= j < len(lines)]
+        # 걸쳐 있을 수 있어서, 이 줄 기준 앞뒤로 창을 넓혀서 찾는다.
+        #
+        # 판매수수료 문구가 "납입금"/"액의 N%"/"이내" 3줄로 나뉘어 데이터 줄
+        # 앞뒤로 2줄 넘게 걸치는 경우가 실측으로 확인됐다(KR510902511M A-e:
+        # "납입금"(2줄 위)/"액의"(1줄 위)/[데이터]/"0.5%"(1줄 아래)/"이내"
+        # (2줄 아래) - 총 5줄). 그렇다고 무작정 고정폭(±2 등)으로 넓히면
+        # 바로 옆 클래스 행의 판매수수료를 잘못 가져오는 더 나쁜 문제가
+        # 생긴다 - 실측으로 두 가지 경로를 확인했다: (a) 옛날에 확인한 "C
+        # 클래스가 A 클래스의 0.10%이내를 잘못 가져옴", (b) 이번에 새로
+        # 확인한 KR5114420027 - 이 문서는 클래스 한 줄에 줄바꿈 없이 값이
+        # 다 붙어 나오는 서식인데, 그래도 바로 위/아래 줄이 "다른 클래스의
+        # 완전한 데이터 행 그 자체"라서(줄바꿈이 아예 없으니 인접 줄=다른
+        # 클래스 전체), 그걸 무조건 한 줄까지는 포함하던 기존 로직이 그
+        # 다른 클래스의 %값을 그대로 판매수수료로 잘못 집어왔다(A가 C의
+        # "0.4500%"를, C가 A의 "0.3000%"를 서로 잘못 가져옴).
+        #
+        # 그래서 "다른 클래스의 완전한 데이터 행(소수 3개 이상)"은 바로
+        # 인접한 한 줄이라도 절대 포함하지 않는다(포함 여부 자체를 먼저
+        # 판단) - 그 다음에야, 포함하기로 한 범위 안에서 "납입금"/"이내"을
+        # 찾을 때까지, 역시 그런 완전한 데이터 행이나 클래스 코드 괄호
+        # "(...)"가 있는 줄(다른 클래스명의 마지막 조각)을 만나기 전까지만
+        # 늘려간다.
+        def _is_full_data_row(l):
+            return sum(1 for w in l if DECIMAL_RE.match(w["text"])) >= 3
+
+        def _has_class_paren(l):
+            text = " ".join(w["text"] for w in l)
+            if CLASS_CODE_RE.search(text):
+                return True
+            # 일부 문서(KR5125450023)는 클래스 코드가 "A(수수료선취-...오프
+            # 라인)"처럼 여는 괄호가 클래스 행 자체에, 닫는 괄호만 다음 줄에
+            # 따로 떨어져 나온다("오프라인)") - 이 경우 CLASS_CODE_RE(여닫는
+            # 괄호가 한 줄에 다 있어야 매치)는 못 잡아서, 여는 괄호 없이
+            # 닫는 괄호만 있는 줄도 "다른 클래스명의 마지막 조각"으로 본다.
+            return ")" in text and "(" not in text
+
+        MAX_EXTRA_LINES = 3
+
+        up_lines = []
+        if i - 1 >= 0 and not _is_full_data_row(lines[i - 1]) and not _has_class_paren(lines[i - 1]):
+            up_lines = [lines[i - 1]]
+        found_napipgeum = any(w["text"] == "납입금" for wl in up_lines for w in wl)
+        j = i - 2
+        extra = 0
+        while up_lines and j >= 0 and extra < MAX_EXTRA_LINES and not found_napipgeum:
+            if _is_full_data_row(lines[j]) or _has_class_paren(lines[j]):
+                break
+            up_lines.insert(0, lines[j])
+            found_napipgeum = any(w["text"] == "납입금" for w in lines[j])
+            extra += 1
+            j -= 1
+
+        down_lines = []
+        if i + 1 < len(lines) and not _is_full_data_row(lines[i + 1]):
+            down_lines = [lines[i + 1]]
+        found_ianae = any(w["text"] == "이내" for wl in down_lines for w in wl)
+        stop_down = down_lines and _has_class_paren(down_lines[0])
+        j = i + 2
+        extra = 0
+        while down_lines and j < len(lines) and extra < MAX_EXTRA_LINES and not found_ianae and not stop_down:
+            if _is_full_data_row(lines[j]):
+                break
+            down_lines.append(lines[j])
+            found_ianae = any(w["text"] == "이내" for w in lines[j])
+            stop_down = _has_class_paren(lines[j])
+            extra += 1
+            j += 1
+
+        window_lines = up_lines + [line] + down_lines
         window_text = " ".join(" ".join(w["text"] for w in wl) for wl in window_lines)
 
-        # 판매수수료 문구가 "납입금"/"액의 N%"/"이내" 3줄로 나뉘어 데이터 줄
-        # 앞뒤로 2줄까지 걸치는 경우가 있었다(KR510902511M) - 그렇다고 무작정
-        # ±2로 넓히면 바로 옆 클래스 행의 판매수수료를 잘못 가져오는 더 나쁜
-        # 문제가 생긴다(실측: C 클래스가 A 클래스의 "0.10%이내"를 잘못 가져옴).
-        # "틀린 값 < 없는 값"이므로 안전한 ±1만 쓰고, 이 케이스는 놓치는 쪽을
-        # 택한다(sales_commission_desc는 null로 남음, total_fee 등 핵심 값은
-        # 영향 없음).
         # %가 숫자에 바로 붙는 서식(위 DECIMAL_RE 참고)에서는 총보수/판매보수
         # 값 자체도 "0.145%"처럼 "%"를 달고 있어서, 판매수수료 % 탐색에 이
         # 값들이 같이 걸려 있으면(예: 진짜 판매수수료 "0.1%"보다 총보수
@@ -275,8 +349,14 @@ def find_fee_rows_on_page(page, page_num, has_cost_column):
         # 조각만으로도 판매수수료 문구라는 걸 충분히 특정할 수 있어 그걸로 판별한다.
         sales_commission_desc = None
         pct_m = SALES_COMMISSION_PCT_RE.search(wide_text)
+        bunui_m = BUNUI_RE.search(wide_text)
         if "납입금" in wide_text and pct_m:
             sales_commission_desc = f"납입금액의 {pct_m.group(1)}%이내"
+        elif "납입금" in wide_text and bunui_m:
+            # "N%" 대신 "100분의 N"(=N/100, 같은 뜻)으로 쓰는 문서가 있다
+            # (KR5114420027). 위에서 이 값을 이미 총보수 등 실제 컬럼과
+            # 분리해뒀으니, 여기서는 같은 뜻인 "%" 표기로 통일해서 남긴다.
+            sales_commission_desc = f"납입금액의 {bunui_m.group(1)}%이내"
         elif "없음" in window_text or has_standalone_dash:
             # 원본이 "없음"이라는 글자를 쓰든 그냥 "-"만 찍든 의미는 같아서
             # ("판매수수료가 없다"는 확인된 사실), 출력은 원본에 실제로 보이는
