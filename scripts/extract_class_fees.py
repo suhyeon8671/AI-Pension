@@ -79,7 +79,36 @@ def find_fee_rows_on_page(page, page_num):
         # 따로 찾는다.
         decimals = [w for w in line if DECIMAL_RE.match(w["text"])]
         int_like = [w for w in line if NUM_RE.match(w["text"]) and w not in decimals]
+
+        # 일부 문서(KR5169950018 등)는 네 번째 소수(총보수·비용)의 소수점이
+        # 쉼표로 잘못 찍혀 나온다("1.807"이어야 할 값이 "1,807"로 나와서
+        # 정수(비용예시)로 오인됨) - 그러면 소수 3개+정수 6개(정상은 4개+5개)
+        # 라는 특이한 개수 조합이 되는데, 이때만 좁게 판별해서 정수 목록의
+        # 첫 값을 다시 소수로 되돌린다. 총보수(decimals[0])보다 약간 큰
+        # 값이어야 한다는 조건까지 걸어(총보수·비용은 총보수+기타비용이라
+        # 항상 총보수 이상) 진짜 큰 비용예시 정수(예: "1,937")를 잘못
+        # 건드리지 않게 한다.
+        if len(decimals) == 3 and len(int_like) == 6:
+            m = re.match(r"^(\d),(\d{3})$", int_like[0]["text"])
+            if m:
+                candidate = float(f"{m.group(1)}.{m.group(2)}")
+                if candidate >= float(decimals[0]["text"].rstrip("%")):
+                    fixed_word = dict(int_like[0])
+                    fixed_word["text"] = f"{m.group(1)}.{m.group(2)}"
+                    decimals = decimals + [fixed_word]
+                    int_like = int_like[1:]
+
         if len(decimals) < 3 or len(int_like) < 4:
+            continue
+
+        # 운용전문인력(운용역) 표 행이 같은 블록에 섞여 있을 수 있다 - 생년
+        # (19xx/20xx, 단독 숫자)이나 콤마 있는 큰 수(운용규모)가 라벨 자리에
+        # 있으면 그 표로 보고 제외한다(수익률 표에서 실제로 겪은 문제와 동일 -
+        # "김혜용 1980 8개 55.78% ..."이 총보수 55.78%인 것처럼 잘못 뽑힘).
+        pre_text_words_check = [w for w in line if w["x0"] < decimals[0]["x0"]]
+        if any(re.fullmatch(r"(19|20)\d{2}", w["text"]) for w in pre_text_words_check):
+            continue
+        if any(re.fullmatch(r"\d{1,3},\d{3}", w["text"]) for w in pre_text_words_check):
             continue
 
         # 열 순서: [클래스종류] [판매수수료] 총보수 판매보수 동종유형총보수 총보수·비용
