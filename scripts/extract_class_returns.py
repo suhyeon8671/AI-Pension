@@ -46,6 +46,19 @@ CLASS_CODE_RE = re.compile(r"\(([A-Za-z0-9\-]{1,8})\)")
 # 일부 문서는 클래스명을 "(A2)"처럼 괄호로 안 감싸고 "ClassA2"처럼 그대로 붙여 쓴다
 # (예: KR5120420039). 괄호 형식이 안 잡히면 이 패턴으로 한 번 더 시도한다.
 CLASS_CODE_NOPAREN_RE = re.compile(r"Class[- ]?([A-Za-z0-9\-]{1,6})", re.IGNORECASE)
+# 괄호도 "Class"도 없이 그냥 "종류A", "종류C4"처럼 쓰는 문서도 있다(제3부
+# "3.집합투자기구의 운용실적" 섹션에서 확인 - KR510902511M 46페이지). 이
+# 라벨은 데이터 줄 "위"에 오는 경우가 많아(3줄 구조: 종류코드 / 데이터 /
+# 상세설명) 예외적으로 이전 줄까지 같이 본다 - "종류"라는 키워드로 앵커링돼
+# 있어서 일반 괄호 패턴과 달리 다른 행의 것을 잘못 가져올 위험이 낮다.
+CLASS_CODE_JONGRYU_RE = re.compile(r"종류\s*([A-Za-z0-9\-]{1,6})")
+# "가.연평균수익률"(누적 1/2/3/5년+설정후, 우리 스키마와 동일)과 "나.연도별
+# 수익률 추이"(1~5년차별 단년도 수익률, 컬럼 의미가 다름)는 둘 다 숫자
+# 5개짜리 줄이라 구분 안 하면 "나" 표 값을 "가" 표 컬럼에 잘못 매핑하게
+# 된다. 섹션 제목으로 구간을 나눠 "나" 섹션은 아예 스킵한다.
+# (공백 다 지운 텍스트에 대해 매칭하므로 \s* 불필요)
+SECTION_GA_RE = re.compile(r"가[\.．]연평균수익률")
+SECTION_NA_RE = re.compile(r"나[\.．]연도별수익률")
 # 클래스 행의 설정일("2016-04-18", "2001.01.31" 등) - 표 데이터가 아니라 각 행에
 # 딸린 값이라 구조화 필드로 남겨둘 만하다.
 INCEPTION_DATE_RE = re.compile(r"\d{4}[.\-]\d{1,2}[.\-]\d{1,2}")
@@ -89,7 +102,12 @@ def row_kind(pre_text, prev_line_text="", next_line_text=""):
     return "class_return"
 
 
-def find_return_rows_on_page(page, page_num):
+def find_return_rows_on_page(page, page_num, section="가"):
+    """section: 이 페이지 시작 시점의 "가/나" 섹션 상태(문서 내 이전 페이지에서
+    이어받음). "나.연도별 수익률 추이" 섹션에 들어간 뒤로는 다음 "가" 제목을
+    다시 만나기 전까지 데이터 행을 전부 스킵한다 - 컬럼 의미가 다른 표라
+    "가" 표 스키마(1y/2y/3y/5y/since_inception)에 잘못 매핑하면 안 되기 때문.
+    반환값은 (rows, 이 페이지가 끝난 시점의 section)."""
     # x_tolerance=2(기본)로는 일부 문서에서 폰트 문제로 글자가 한 자씩 떨어져
     # 나오는 케이스(예: "4 .2 1")가 있어 숫자 인식이 아예 안 된다. 5로 올리면
     # 그 문제가 해결되면서도(검증 완료) 다른 문서의 값이 잘못 합쳐지진 않았다.
@@ -97,6 +115,15 @@ def find_return_rows_on_page(page, page_num):
     lines = cluster_lines(words)
     rows = []
     for i, line in enumerate(lines):
+        line_text_for_section = re.sub(r"\s+", "", " ".join(w["text"] for w in line))
+        if SECTION_NA_RE.search(line_text_for_section):
+            section = "나"
+        elif SECTION_GA_RE.search(line_text_for_section):
+            section = "가"
+
+        if section == "나":
+            continue
+
         decimals = [w for w in line if DECIMAL_RE.match(w["text"])]
         dashes = [w for w in line if DASH_RE.match(w["text"])]
         value_tokens = sorted(decimals + dashes, key=lambda w: w["x0"])
@@ -112,7 +139,10 @@ def find_return_rows_on_page(page, page_num):
         pre_text = " ".join(w["text"] for w in pre_text_words)
 
         # 클래스명이 인접 줄로 이어질 수 있어 다음 줄까지 확인 (총보수 표에서
-        # 검증된 대로 - "이전 줄"은 다른 행 것일 위험이 있어 보지 않는다)
+        # 검증된 대로 - "이전 줄"은 다른 행 것일 위험이 있어 보지 않는다.
+        # 단, "종류A" 패턴은 라벨이 데이터 줄 "위"에 오는 3줄 구조라 예외적으로
+        # 이전 줄도 함께 본다 - 아래 종류 코드 탐색 참고)
+        prev_line_text = " ".join(w["text"] for w in lines[i - 1]) if i - 1 >= 0 else ""
         next_line_text = " ".join(w["text"] for w in lines[i + 1]) if i + 1 < len(lines) else ""
         label_search_text = pre_text + " " + next_line_text
         # 폰트 문제로 글자가 한 자씩 떨어져 나오는 문서(예: "비 교 지 수")에서도
@@ -184,6 +214,16 @@ def find_return_rows_on_page(page, page_num):
                 m2 = CLASS_CODE_NOPAREN_RE.search(label_search_text)
                 if m2:
                     class_code = m2.group(1)
+                else:
+                    # "종류A"는 라벨이 데이터 줄 "위"에 오는 3줄 구조(종류코드
+                    # 줄 / 데이터 줄 / 상세설명 줄)라 이전 줄도 함께 본다 -
+                    # "종류"라는 명시적 키워드로 앵커링돼 있어 일반 괄호
+                    # 패턴과 달리 다른 행 것을 잘못 가져올 위험이 낮다.
+                    m3 = CLASS_CODE_JONGRYU_RE.search(
+                        prev_line_text + " " + label_search_text
+                    )
+                    if m3:
+                        class_code = m3.group(1)
 
             if class_code:
                 # 클래스 코드가 확실히 잡혔으면 그 자체로 "클래스 행"이라는
@@ -195,7 +235,6 @@ def find_return_rows_on_page(page, page_num):
             else:
                 # "수익률\n변동성"라벨이 데이터 줄 위아래로 걸쳐 있는 경우
                 # (KR5113420012/69에서 확인)만 좁혀서 앞뒤 줄을 본다.
-                prev_line_text = " ".join(w["text"] for w in lines[i - 1]) if i - 1 >= 0 else ""
                 kind = row_kind(pre_text, prev_line_text, next_line_text)
 
         date_m = INCEPTION_DATE_RE.search(pre_text)
@@ -223,7 +262,7 @@ def find_return_rows_on_page(page, page_num):
     _apply_merged_cell_dates(page, words, rows)
     for r in rows:
         del r["_top"]
-    return rows
+    return rows, section
 
 
 def _apply_merged_cell_dates(page, words, rows):
@@ -299,11 +338,12 @@ def process_doc(doc_id):
         pages = candidate_pages_for_doc(doc_id, len(pdf.pages))
         if not pages:
             return []
+        section = "가"
         for page_num in pages:
             if page_num < 1 or page_num > len(pdf.pages):
                 continue
             page = pdf.pages[page_num - 1]
-            rows = find_return_rows_on_page(page, page_num)
+            rows, section = find_return_rows_on_page(page, page_num, section=section)
             for r in rows:
                 r["product_code"] = doc_id
                 results.append(r)
