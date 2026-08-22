@@ -69,9 +69,47 @@ def cluster_lines(words, tol=2.5):
     return lines
 
 
-def find_fee_rows_on_page(page, page_num):
+# "총보수·비용" 칸의 가운뎃점 연결자가 문서마다 다른 글자로 나온다
+# (ㆍ/▪/･/· 뿐 아니라, KR5111450067처럼 임베딩 폰트가 유니코드 사용자
+# 영역(PUA) 글자 ""로 대체해 나오는 경우도 실측으로 확인함) - "한글도
+# 공백도 아닌 글자 하나 + 비용"으로 넓게 잡되, 단순히 본문 어딘가에 홀로
+# 나오는 "비용"이라는 단어(예: 표 위 설명문 "총보수 및 비용")까지 걸리면
+# 안 되므로 그 연결자 글자가 반드시 붙어 있어야 한다("비용" 단독 토큰은
+# 이 글자 수 요건에 안 걸림).
+HAS_COST_COLUMN_RE = re.compile(r"^(?:총보수)?[^가-힣\sA-Za-z0-9]비용$")
+
+
+def page_has_cost_column_header(words, lines):
+    """표에 "총보수ㆍ비용"(총보수+판매보수+동종유형총보수를 더한 결과) 칸이
+    아예 없는 문서가 있다(KR5194450018 실측: 헤더가 총보수/판매보수/
+    동종유형총보수 3개뿐, "총보수ㆍ비용" 헤더 자체가 없음). 이 경우 데이터
+    행도 소수 3개(총보수/판매보수/동종유형총보수)만 나오는데, 기존 로직은
+    "소수 3개=총보수/판매보수/총보수ㆍ비용(동종유형총보수 없음)"으로 가정해
+    왔던 것과 똑같은 개수라 구분이 안 되고, 세 번째 소수(동종유형총보수)를
+    총보수ㆍ비용으로 잘못 읽어 "총보수ㆍ비용 < 총보수" 같은 앞뒤가 안 맞는
+    값이 나왔다. 헤더에 "ㆍ비용"류 표기(가운뎃점+비용, "총비용예시"의
+    "총비용"과는 다름 - 그쪽은 가운뎃점이 없음)가 있는지로 이 칸의 존재
+    여부를 확인한다.
+
+    주의: 페이지 전체에서 찾으면 오탐이 난다 - KR5194450018은 표 헤더엔
+    "총보수ㆍ비용"이 없는데도, 표 한참 아래(주석 "(주3)/(주4)" 문단, top
+    ~380~450)에서 "총보수·비용비율은"/"총보수·비용" 같은 설명 문구로
+    우연히 다시 등장해 실측으로 오탐을 확인했다. 표 헤더는 항상 데이터
+    행(소수 3개 이상 있는 첫 줄)보다 위에 있고 주석은 항상 그 아래에
+    있으므로, 첫 데이터 행보다 위쪽(top이 더 작은 영역)에서만 찾는다."""
+    first_data_top = None
+    for line in lines:
+        if sum(1 for w in line if DECIMAL_RE.match(w["text"])) >= 3:
+            first_data_top = line[0]["top"]
+            break
+    header_words = words if first_data_top is None else [w for w in words if w["top"] < first_data_top]
+    return any(HAS_COST_COLUMN_RE.search(w["text"]) for w in header_words)
+
+
+def find_fee_rows_on_page(page, page_num, has_cost_column):
     words = page.extract_words(x_tolerance=2, keep_blank_chars=False)
     lines = cluster_lines(words)
+
     rows = []
     for i, line in enumerate(lines):
         # decimals를 NUM_RE로 거른 뒤 다시 추리면 "1.18%"처럼 %가 붙은 토큰이
@@ -79,6 +117,34 @@ def find_fee_rows_on_page(page, page_num):
         # 따로 찾는다.
         decimals = [w for w in line if DECIMAL_RE.match(w["text"])]
         int_like = [w for w in line if NUM_RE.match(w["text"]) and w not in decimals]
+
+        # 판매수수료("납입금액의 N%이내") 문구의 퍼센트 숫자가 데이터 줄
+        # 자체에 얹혀 나오는 서식이 있다(KR5123490013 등: "의 0.8% 0.845
+        # 0.40 0.75 0.868 ..." - "납입금액"은 윗줄, "의 N%"만 이 줄에 걸침).
+        # 이 %값도 DECIMAL_RE에 걸려 decimals 맨 앞에 끼어들면서 실제 4개
+        # 컬럼(총보수/판매보수/동종유형총보수/총보수·비용)이 통째로 한 칸씩
+        # 밀려 읽힌다(총보수 자리에 판매수수료%가, 판매보수 자리에 실제
+        # 총보수가... 실측으로 확인, 마지막 총보수·비용 값은 아예 유실됨).
+        # 실제 컬럼은 최대 4개뿐이므로 소수가 5개면 맨 왼쪽은 무조건 이
+        # 판매수수료% 이다(모호할 수 없음 - 드롭). 소수가 4개인 경우는
+        # 정상적인 "4개 다 실제 컬럼" 케이스와 개수가 같아 구분이 안 되는데,
+        # 실측 사례(KR5114420016)에서 이땐 맨 앞 소수 바로 앞/뒤에 "의"
+        # (납입금액"의") 또는 "이내"가 같은 줄에 붙어 있어 그걸로 가려낸다.
+        # 단, 이 "의"/"이내" 인접 판정만으로는 오탐이 난다(KR5113420069:
+        # "취-오프 액의 0.3910 ..."에서 "액의" 바로 뒤가 하필 진짜 총보수
+        # 값이었음, 진짜 판매수수료%는 다음 줄 "0.02%"였음 - 실측으로 확인).
+        # 판매수수료 스트레이 값은 반드시 "%"가 붙어 있는 반면(퍼센트 값이므로)
+        # 총보수 등 실제 컬럼 값은 이 데이터 줄 자체에서는 "%" 없이 나온다는
+        # 점으로 추가 필터링한다(맨 왼쪽 소수 자신이 "%"로 끝나야만 스트레이
+        # 후보로 본다).
+        if len(decimals) == 5 and decimals[0]["text"].endswith("%"):
+            decimals = decimals[1:]
+        elif len(decimals) == 4 and decimals[0]["text"].endswith("%"):
+            idx0 = next((idx for idx, w in enumerate(line) if w is decimals[0]), -1)
+            prev_w = line[idx0 - 1] if idx0 > 0 else None
+            next_w = line[idx0 + 1] if 0 <= idx0 + 1 < len(line) else None
+            if (prev_w and prev_w["text"].endswith("의")) or (next_w and next_w["text"] == "이내"):
+                decimals = decimals[1:]
 
         # 일부 문서(KR5169950018 등)는 네 번째 소수(총보수·비용)의 소수점이
         # 쉼표로 잘못 찍혀 나온다("1.807"이어야 할 값이 "1,807"로 나와서
@@ -88,6 +154,24 @@ def find_fee_rows_on_page(page, page_num):
         # 값이어야 한다는 조건까지 걸어(총보수·비용은 총보수+기타비용이라
         # 항상 총보수 이상) 진짜 큰 비용예시 정수(예: "1,937")를 잘못
         # 건드리지 않게 한다.
+        # 판매보수(3번째 열)가 소수점 없이 정수 하나로만 나오는 경우가 있다
+        # (KR5153420318/KR5153450785 실측: "1" - 원본 PDF 글자 자체가 그렇게
+        # 찍혀 있음, 추출 오류 아님 - 같은 줄 다른 숫자들과 폰트/크기 동일함을
+        # 확인). 판매보수 칸이 소수 목록에서 통째로 빠지면 그 다음 소수(동종
+        # 유형총보수)를 판매보수로 잘못 읽고, 정수였던 "1"은 1년 비용예시
+        # 자리로 잘못 흘러들어간다. 총보수(decimals[0])와 그 다음 소수
+        # (decimals[1], 정상 문서라면 판매보수 그 자체) 사이 x좌표에 낀 정수
+        # 토큰이 정확히 하나 있으면(비용예시 정수들은 훨씬 오른쪽에 있어
+        # 안 걸림) 그게 판매보수라고 보고 소수 목록 제자리에 되돌린다.
+        if len(decimals) >= 2:
+            between = [
+                w for w in int_like
+                if decimals[0]["x1"] < w["x0"] < decimals[1]["x0"]
+            ]
+            if len(between) == 1:
+                decimals = [decimals[0], between[0]] + decimals[1:]
+                int_like = [w for w in int_like if w is not between[0]]
+
         if len(decimals) == 3 and len(int_like) == 6:
             m = re.match(r"^(\d),(\d{3})$", int_like[0]["text"])
             if m:
@@ -118,6 +202,13 @@ def find_fee_rows_on_page(page, page_num):
         if has_peer_avg:
             peer_avg_fee = decimals[2]
             total_fee_and_cost = decimals[3]
+        elif not has_cost_column:
+            # 이 페이지엔 "총보수ㆍ비용" 칸 자체가 없다(위 has_cost_column
+            # 참고) - 소수 3개는 총보수/판매보수/동종유형총보수이고
+            # 총보수ㆍ비용은 원본에 없는 정보라 null로 둔다(하이픈으로 확인된
+            # 부재가 아니라 애초에 그 칸이 없는 것 - null이 맞다).
+            peer_avg_fee = decimals[2]
+            total_fee_and_cost = None
         else:
             total_fee_and_cost = decimals[2]
             # 동종유형총보수 칸이 원본에 "-"로 명시돼 있으면(정보가 없다는
@@ -205,7 +296,7 @@ def find_fee_rows_on_page(page, page_num):
             "total_fee": total_fee["text"].rstrip("%"),
             "distribution_fee": distribution_fee["text"].rstrip("%"),
             "peer_avg_fee": peer_avg_fee_text,
-            "total_fee_and_cost": total_fee_and_cost["text"].rstrip("%"),
+            "total_fee_and_cost": total_fee_and_cost["text"].rstrip("%") if total_fee_and_cost else None,
             "cost_projection_per_10m": cost_projection,
             "page": page_num,
             # 클래스명("수수료미징구-오프라인-개인연금(C-P)")도 판매수수료
@@ -256,11 +347,28 @@ def process_doc(doc_id):
         pages = candidate_pages_for_doc(doc_id, len(pdf.pages))
         if not pages:
             return []
-        for page_num in pages:
-            if page_num < 1 or page_num > len(pdf.pages):
-                continue
-            page = pdf.pages[page_num - 1]
-            rows = find_fee_rows_on_page(page, page_num)
+
+        valid_pages = [(p, pdf.pages[p - 1]) for p in pages if 1 <= p <= len(pdf.pages)]
+        page_words_lines = {
+            p: (page.extract_words(x_tolerance=2, keep_blank_chars=False), None)
+            for p, page in valid_pages
+        }
+        for p in page_words_lines:
+            w = page_words_lines[p][0]
+            page_words_lines[p] = (w, cluster_lines(w))
+
+        # 표가 여러 페이지에 걸쳐 있을 때, 이어지는 페이지에는 헤더가
+        # 반복되지 않는 경우가 있다(KR5118420006 실측: 4페이지 헤더엔
+        # "총보수ㆍ비용"이 있는데 이어지는 5페이지엔 헤더 없이 데이터 행만
+        # 있음 - 페이지 단위로 다시 판별하면 5페이지 행만 이 칸이 없다고
+        # 잘못 판단함). 같은 표는 모든 페이지에서 구조가 같으므로, 문서
+        # 전체(모든 후보 페이지)에서 한 번이라도 헤더가 보이면 True로 본다.
+        has_cost_column = any(
+            page_has_cost_column_header(w, l) for w, l in page_words_lines.values()
+        )
+
+        for page_num, page in valid_pages:
+            rows = find_fee_rows_on_page(page, page_num, has_cost_column)
             for r in rows:
                 r["product_code"] = doc_id
                 results.append(r)
