@@ -39,6 +39,9 @@ DEFAULT_OUTPUT = os.path.join(REPO_ROOT, "class_returns.json")
 
 NUM_RE = re.compile(r"^-?\d[\d,]*\.?\d*$")
 DECIMAL_RE = re.compile(r"^-?\d+\.\d+$")
+# 아직 수익률이 없는(전액 "-") 클래스 행도 있다 (예: 설정된 지 얼마 안 된 클래스).
+# 값이 없다는 사실 자체와 class_code/설정일은 여전히 의미가 있어 버리지 않는다.
+DASH_RE = re.compile(r"^-+$")
 CLASS_CODE_RE = re.compile(r"\(([A-Za-z0-9\-]{1,8})\)")
 # 일부 문서는 클래스명을 "(A2)"처럼 괄호로 안 감싸고 "ClassA2"처럼 그대로 붙여 쓴다
 # (예: KR5120420039). 괄호 형식이 안 잡히면 이 패턴으로 한 번 더 시도한다.
@@ -95,7 +98,9 @@ def find_return_rows_on_page(page, page_num):
     rows = []
     for i, line in enumerate(lines):
         decimals = [w for w in line if DECIMAL_RE.match(w["text"])]
-        if len(decimals) < 3 or len(decimals) > 5:
+        dashes = [w for w in line if DASH_RE.match(w["text"])]
+        value_tokens = sorted(decimals + dashes, key=lambda w: w["x0"])
+        if len(value_tokens) < 3 or len(value_tokens) > 5:
             continue
         # 운용전문인력 표(성명/생년/직위 등)와 구분: 그 표는 억원 단위 정수(운용규모)나
         # 4자리 연도(생년) 같은 게 섞여 있고, 클래스 수익률 표는 전부 소수 % 값이다.
@@ -103,7 +108,7 @@ def find_return_rows_on_page(page, page_num):
         if any(abs(float(d["text"])) > 100 for d in decimals):
             continue
 
-        pre_text_words = [w for w in line if w["x0"] < decimals[0]["x0"]]
+        pre_text_words = [w for w in line if w["x0"] < value_tokens[0]["x0"]]
         pre_text = " ".join(w["text"] for w in pre_text_words)
 
         # 클래스명이 인접 줄로 이어질 수 있어 다음 줄까지 확인 (총보수 표에서
@@ -124,16 +129,35 @@ def find_return_rows_on_page(page, page_num):
             continue
         trailing_int_like = [
             w for w in line
-            if w["x0"] > decimals[-1]["x0"] and re.match(r"^\d{1,4}$", w["text"])
+            if w["x0"] > value_tokens[-1]["x0"] and re.match(r"^\d{1,4}$", w["text"])
         ]
         if trailing_int_like:
+            continue
+        # "-"를 값으로 인정하면서 새로 생긴 위험: 총보수 표의 비용예시(천원, 정수)
+        # 행이 "- - 240 244 40 40 200 204 -"처럼 대시 사이사이에 정수가 끼어 있는
+        # 경우, 대시만 3~5개 세면 수익률 행으로 오인한다. 값 영역(첫~마지막
+        # value_token 사이) 안에 순수 정수 토큰이 하나라도 끼어 있으면 총보수
+        # 표로 보고 제외한다.
+        value_x0, value_x1 = value_tokens[0]["x0"], value_tokens[-1]["x0"]
+        stray_ints = [
+            w for w in line
+            if value_x0 <= w["x0"] <= value_x1
+            and w not in value_tokens
+            and re.match(r"^\d{1,4}$", w["text"])
+        ]
+        if stray_ints:
             continue
 
         # 운용전문인력(운용역) 표 행도 같은 블록에 섞여 있을 수 있다 - "생년(19xx)"이나
         # "운용규모(1,234억원 - 콤마 있는 큰 수)"가 라벨 자리에 있으면 그 표로 본다.
         # 단, 수익률 표의 설정일("2001.01.31")도 4자리 숫자로 시작하니 뒤에 "."이나
         # "-"가 붙어 날짜로 보이면(생년은 그냥 단독 숫자) 제외 대상에서 뺀다.
-        if re.search(r"\b(19|20)\d{2}\b(?![.\-])", norm_pre) or re.search(r"\d{1,3},\d{3}", norm_pre):
+        # (문자열을 공백 제거 후 정규식 \b로 검사하면 "전준필1996"처럼 한글 뒤에 바로
+        # 붙은 숫자에서 단어 경계가 인식되지 않아(둘 다 유니코드 \w) 놓칠 수 있어,
+        # 토큰 단위로 직접 검사한다.)
+        if any(re.fullmatch(r"(19|20)\d{2}", w["text"]) for w in pre_text_words):
+            continue
+        if any(re.fullmatch(r"\d{1,3},\d{3}", w["text"]) for w in pre_text_words):
             continue
 
         # 이 줄 자체가 비교지수/변동성 행인지 먼저 직접 확인한다(같은 줄
@@ -177,7 +201,12 @@ def find_return_rows_on_page(page, page_num):
         date_m = INCEPTION_DATE_RE.search(pre_text)
         inception_date = date_m.group() if date_m else None
 
-        values = {PERIOD_LABELS[idx]: d["text"] for idx, d in enumerate(decimals)}
+        # 값이 전부 "-"인 행(아직 수익률이 없는 신규 클래스 등)은 값이 없다는
+        # 사실 그대로 None으로 남긴다 - 억지로 숫자를 만들지 않는다.
+        values = {
+            PERIOD_LABELS[idx]: (t["text"] if DECIMAL_RE.match(t["text"]) else None)
+            for idx, t in enumerate(value_tokens)
+        }
 
         rows.append({
             "row_kind": kind,
@@ -188,8 +217,55 @@ def find_return_rows_on_page(page, page_num):
             "evidence": " ".join(w["text"] for w in line),
             "method": "coordinate_reconstruction",
             "confidence": 1.0 if (class_code or kind != "class_return") else 0.5,
+            "_top": line[0]["top"],
         })
+
+    _apply_merged_cell_dates(page, words, rows)
+    for r in rows:
+        del r["_top"]
     return rows
+
+
+def _apply_merged_cell_dates(page, words, rows):
+    """'최초설정일' 칸이 여러 행에 걸쳐 병합된 경우, 날짜 텍스트는 병합된 셀
+    안 어딘가(보통 시각적 중앙에 가까운 한 행) 한 번만 찍히고 나머지 행은
+    비어 보인다. 인접한 줄 순서만 보고 전파하면 실제로는 안 겹치는 행에
+    잘못된 날짜가 번질 위험이 있어(예: 병합 안 된 바로 다음 클래스가 우연히
+    날짜가 없는 경우), 대신 PDF에 실제로 그려진 셀 테두리(page.rects)를 찾아
+    그 테두리 안에 들어오는 행들에만 정확히 전파한다."""
+    if not rows:
+        return
+    tops = [r["_top"] for r in rows]
+    y_lo, y_hi = min(tops) - 15, max(tops) + 15
+
+    # 이 표 범위 안에서 실제로 잡힌 설정일 텍스트의 x좌표로 '최초설정일' 칸의
+    # 위치를 추정한다 (표마다 칸 위치가 조금씩 다를 수 있어 페이지별로 다시 잡음).
+    date_x0 = None
+    for w in words:
+        if y_lo <= w["top"] <= y_hi and INCEPTION_DATE_RE.fullmatch(w["text"]):
+            date_x0 = w["x0"]
+            break
+    if date_x0 is None:
+        return
+
+    col_cells = [
+        rc for rc in page.rects
+        if abs(rc["x0"] - date_x0) < 15
+        and (rc["bottom"] - rc["top"]) > 8
+        and rc["top"] >= y_lo - 5 and rc["bottom"] <= y_hi + 5
+    ]
+    for rc in col_cells:
+        cell_words = [
+            w for w in words
+            if rc["top"] - 1 <= w["top"] <= rc["bottom"] + 1
+            and rc["x0"] - 2 <= w["x0"] <= rc["x1"] + 2
+        ]
+        cell_date = next((w["text"] for w in cell_words if INCEPTION_DATE_RE.fullmatch(w["text"])), None)
+        if not cell_date:
+            continue
+        for r in rows:
+            if rc["top"] - 1 <= r["_top"] <= rc["bottom"] + 1:
+                r["inception_date"] = cell_date
 
 
 def candidate_pages_for_doc(doc_id, max_page):
