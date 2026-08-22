@@ -10,3 +10,4 @@ vector_store/
 structured_store.db
 product_master.json
 class_fees.json
+class_returns.json
