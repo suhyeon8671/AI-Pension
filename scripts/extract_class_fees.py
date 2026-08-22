@@ -281,7 +281,12 @@ def find_fee_rows_on_page(page, page_num, has_cost_column):
         MAX_EXTRA_LINES = 3
 
         def _has_word(l, word):
-            return any(w["text"] == word for w in l)
+            # "납입금"은 "납입금액"(전화번호처럼 붙여 나온 문서도 있음)처럼
+            # 뒤에 다른 글자가 붙는 경우가 있어(KR5127420083 실측), 정확히
+            # 일치할 때만 찾으면 못 잡고 지나쳐 위/아래로 계속 넓혀버린다
+            # (결국 표 헤더까지 evidence에 끼어드는 사고로 이어졌다) - 부분
+            # 일치로 찾는다.
+            return any(word in w["text"] for w in l)
 
         # 바로 위/아래 한 줄은 줄바꿈된 이 행 자신의 클래스명 조각을 담기
         # 위해 일단 넣어본다(경계에 걸리지만 않으면).
@@ -319,8 +324,26 @@ def find_fee_rows_on_page(page, page_num, has_cost_column):
             if base_down and _has_word(base_down[0], "납입금"):
                 base_down = []
 
+        # 이 행 자신의 줄(class_part1)에 이미 괄호 닫힌 클래스 코드가 완전히
+        # 있으면("수수료미징구-온라인(C-e)"처럼 한 줄에 다 있는 경우), 클래스명은
+        # 이미 완성된 것이라 위/아래로 더 이어붙일 필요가 없다. 그런데도 바로
+        # 아래 줄을 무조건 넣다 보니, 그게 사실은 *다음* 클래스의 이름 시작
+        # 부분("수수료미징구-오프라인-개"처럼 아직 괄호가 안 나온 라벨 앞
+        # 조각)인 경우 잘못 이어붙여 버렸다(C-e 실측: "수수료미징구-온라인
+        # (C-e) 수수료미징구-오프라인-개"처럼 다음 클래스 이름이 붙어버림).
+        # 클래스명은 항상 "수수료선취-"/"수수료미징구-"/"수수료후취-"로
+        # 시작하므로, 이미 완성된 행에서 인접 줄이 이 패턴으로 새로 시작하면
+        # 다음 클래스의 것으로 보고 뺀다.
+        own_class_name_complete = bool(CLASS_CODE_RE.search(class_part1))
+        CLASS_NAME_START_RE = re.compile(r"^수수료(선취|미징구|후취)")
+        if own_class_name_complete:
+            if base_down and any(CLASS_NAME_START_RE.match(w["text"]) for w in base_down[0]):
+                base_down = []
+            if base_up and any(")" in w["text"] for w in base_up[0]):
+                base_up = []
+
         up_lines = list(base_up)
-        found_napipgeum = any(w["text"] == "납입금" for wl in up_lines for w in wl)
+        found_napipgeum = any(_has_word(wl, "납입금") for wl in up_lines)
         j = i - 2
         extra = 0
         while (
@@ -330,12 +353,12 @@ def find_fee_rows_on_page(page, page_num, has_cost_column):
             if _is_full_data_row(lines[j]) or _has_class_paren(lines[j]):
                 break
             up_lines.insert(0, lines[j])
-            found_napipgeum = any(w["text"] == "납입금" for w in lines[j])
+            found_napipgeum = _has_word(lines[j], "납입금")
             extra += 1
             j -= 1
 
         down_lines = list(base_down)
-        found_ianae = any(w["text"] == "이내" for wl in down_lines for w in wl)
+        found_ianae = any(_has_word(wl, "이내") for wl in down_lines)
         stop_down = down_lines and _has_class_paren(down_lines[0])
         j = i + 2
         extra = 0
@@ -346,32 +369,78 @@ def find_fee_rows_on_page(page, page_num, has_cost_column):
             if _is_full_data_row(lines[j]):
                 break
             down_lines.append(lines[j])
-            found_ianae = any(w["text"] == "이내" for w in lines[j])
+            found_ianae = _has_word(lines[j], "이내")
             stop_down = _has_class_paren(lines[j])
             extra += 1
             j += 1
 
-        # 표 왼쪽 여백에 세로로 찍힌 구간 캡션("투자비용" 등)이 y좌표가
-        # 데이터 행과 가까워 같은 줄로 묶이는 경우가 있다(KR510902511M A-e
-        # 실측: "투자비용"이 x=27.8로 "0.5%"(x=195.9)와 같은 줄로 묶였다 -
-        # 둘 사이 간격이 132pt나 되어 원래는 무관한 글자였음이 뚜렷하다).
-        # 클래스명 칸 자체는 정상적으로 왼쪽에서 시작하므로(예: 77.6) 그냥
-        # x좌표 기준으로 자르면 이 행 자신의 클래스명까지 잘라내는 부작용이
-        # 있었다(C1 실측으로 확인) - 그래서 "그 줄 안에서 유독 멀리 떨어진
-        # 맨 왼쪽 단어"만 걸러낸다(한 줄에 단어가 하나뿐이면 비교 대상이
-        # 없으니 그대로 둔다 - 클래스명이 단독으로 한 줄인 정상 케이스).
+        # 표 왼쪽 여백(클래스명 칸보다도 왼쪽)에 세로로 찍힌 구간 캡션
+        # ("투자비용" 등, x0≈27.8)이 y좌표가 데이터 행과 가까워 같은 줄로
+        # 묶이는 경우가 있다. 클래스명 칸은 실측 사례들에서 전부 x0≈77.6
+        # 부터 시작해서(수십 개 문서에서 일관됨) 이 캡션과는 확실히 구간이
+        # 갈린다 - 처음엔 "그 줄 안에서 유독 멀리 떨어진 단어만" 걸렀는데,
+        # 캡션이 클래스명 바로 옆(간격 13pt 정도)에 붙어 나오는 문서도 있어
+        # (KR5153420105 실측) 그 조건으로는 놓치는 경우가 있었다. 그렇다고
+        # 이 행 자신의 줄 최솟값을 기준으로 자르면(전에 시도) 그 줄에 클래스
+        # 명이 없는 행(예: 대시만 있는 행)에서 다음 줄의 진짜 클래스명까지
+        # 잘라내는 부작용이 있었다(C1 실측) - 그래서 문서 전체에서 일관되게
+        # 관찰된 절대 좌표 기준(70pt)으로 고정한다.
         def _strip_stray_caption(wl):
-            if len(wl) < 2:
-                return wl
-            sorted_wl = sorted(wl, key=lambda w: w["x0"])
-            first, second = sorted_wl[0], sorted_wl[1]
-            if first["x0"] < 70 and second["x0"] - first["x1"] > 60:
-                return [w for w in wl if w is not first]
-            return wl
+            return [w for w in wl if w["x0"] >= 70]
 
         window_lines = [_strip_stray_caption(wl) for wl in (up_lines + [line] + down_lines)]
         window_lines = [wl for wl in window_lines if wl]
         window_text = " ".join(" ".join(w["text"] for w in wl) for wl in window_lines)
+
+        # evidence를 물리적 줄 순서 그대로 이어 붙이면 "클래스종류"/"판매수수료"가
+        # 실제로는 서로 다른 칸(컬럼)인데도 마치 한 문장인 것처럼 뒤섞여 보인다
+        # (사용자가 원본 표 캡처와 나란히 대조해서 지적함: "납입금 수수료선취-
+        # 오프라인(A) 액의 1%"는 원본에서 "클래스종류" 칸과 "판매수수료" 칸이
+        # 우연히 같은 y좌표 구간에 걸쳐 있어서 생기는 순서일 뿐, 실제로 섞여
+        # 있는 게 아니다 - 그런데 그대로 이어 붙이면 마치 한 칸인 것처럼 보여서
+        # 오해를 산다). 게다가 클래스명이 데이터 줄 앞/뒤로 쪼개지면 그 사이에
+        # 낀 숫자들 때문에 두 조각이 evidence 안에서 뚝 떨어져 보인다. 그래서
+        # 칸(클래스명 vs 판매수수료 vs 숫자데이터)별로 단어를 분리해 각각
+        # 이어붙인 뒤, 칸 이름을 붙여 evidence를 구성한다 - 물리적 줄 순서가
+        # 아니라 "논리적 칸" 순서로 보여준다.
+        COMMISSION_MARKER_WORDS = {"이내", "없음"}
+        COMMISSION_PCT_TOKEN_RE = re.compile(r"^[\d.]+%$")
+
+        def _word_role(w):
+            if w["x0"] >= total_fee["x0"]:
+                return "data"
+            # "납입금"/"납입금액"처럼 뒤에 "액"이 붙거나 안 붙거나 하는
+            # 표기가 문서마다 달라서(KR5123490017 실측: "납입금액"이 한
+            # 토큰) 부분 일치로 잡는다. "액의"/"금액의"처럼 "...의"로 끝나는
+            # 조각도 마찬가지로 "납입금액의"가 쪼개진 조각이라 접미사로 잡는다
+            # (클래스명은 이런 조사로 끝나지 않아 오탐 위험이 낮다).
+            if "납입금" in w["text"] or w["text"].endswith("의"):
+                return "commission"
+            if w["text"] in COMMISSION_MARKER_WORDS or w["text"].endswith("이내"):
+                return "commission"
+            if COMMISSION_PCT_TOKEN_RE.match(w["text"]) or "%" in w["text"]:
+                # "0.30%이내"처럼 %값과 "이내"가 공백 없이 한 토큰으로 붙어
+                # 나오는 문서가 있다(KR5127420083 실측) - 클래스명 글자에는
+                # "%"가 나올 일이 없어 "%"가 있으면 무조건 판매수수료 쪽으로
+                # 본다.
+                return "commission"
+            if w["text"] == "-":
+                return "commission"
+            if w["text"].endswith("분의") or re.fullmatch(r"[\d.]+", w["text"]):
+                return "commission"
+            return "class_name"
+
+        class_name_words = []
+        commission_words = []
+        for wl in window_lines:
+            for w in wl:
+                role = _word_role(w)
+                if role == "class_name":
+                    class_name_words.append(w["text"])
+                elif role == "commission":
+                    commission_words.append(w["text"])
+        class_name_full = " ".join(class_name_words) if class_name_words else None
+        commission_raw = " ".join(commission_words) if commission_words else None
 
         # %가 숫자에 바로 붙는 서식(위 DECIMAL_RE 참고)에서는 총보수/판매보수
         # 값 자체도 "0.145%"처럼 "%"를 달고 있어서, 판매수수료 % 탐색에 이
@@ -430,6 +499,16 @@ def find_fee_rows_on_page(page, page_num, has_cost_column):
         else:
             peer_avg_fee_text = None
 
+        # evidence는 "클래스명"/"판매수수료"를 물리적 줄 순서가 아니라 논리적
+        # 칸 이름을 붙여 따로 보여준다(위 class_name_full/commission_raw
+        # 참고) - sales_commission_desc가 이미 정규화됐으면 그걸 쓰고, 못
+        # 찾았으면(null) 원본에서 실제로 걸린 원문 조각(commission_raw)을
+        # 대신 보여줘 왜 못 찾았는지 확인할 수 있게 한다.
+        evidence = (
+            f"클래스명: {class_name_full or '(확인안됨)'} | "
+            f"판매수수료: {sales_commission_desc if sales_commission_desc is not None else (commission_raw or '(확인안됨)')}"
+        )
+
         rows.append({
             "class_code": class_code,
             "sales_commission_desc": sales_commission_desc,
@@ -439,14 +518,7 @@ def find_fee_rows_on_page(page, page_num, has_cost_column):
             "total_fee_and_cost": total_fee_and_cost["text"].rstrip("%") if total_fee_and_cost else None,
             "cost_projection_per_10m": cost_projection,
             "page": page_num,
-            # 클래스명("수수료미징구-오프라인-개인연금(C-P)")도 판매수수료
-            # 문구("납입금액의 1%이내")도 데이터 줄 앞/뒤로 쪼개져 있는 경우가
-            # 많아서, 이 행 자신의 줄만 담으면 "오프라인- 없음 ..."처럼 반
-            # 토막만 보이고 class_code/sales_commission_desc가 실제로 어디서
-            # 나왔는지 확인할 수 없다(사용자가 직접 원본과 대조하다 발견).
-            # class_code/sales_commission_desc 판정에 실제로 쓰는 범위(앞뒤
-            # 1줄 포함 window_text)를 그대로 evidence로 남긴다.
-            "evidence": window_text,
+            "evidence": evidence,
             "method": "coordinate_reconstruction",
             "confidence": 1.0 if class_code else 0.5,
         })
