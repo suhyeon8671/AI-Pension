@@ -253,6 +253,16 @@ null로 남은 값도 `sales_commission_evidence`를 보면 왜 못 찾았는지
 0 이하/10% 초과인 행 0건으로 재확인. **383개 레코드(97개 문서)** - 스퓨리어스
 행 2개 제거되어 385→383.
 
+**evidence를 클래스명까지 포함한 전체 window로 통일** — sales_commission_desc
+근거만 따로 `sales_commission_evidence`로 뺐었는데, 사용자가 KR5111420047의
+C-P 클래스를 보다가 클래스명("수수료미징구-오프라인-개인연금(C-P)")도
+데이터 줄 앞/뒤로 쪼개져 있어서 `evidence`에 "오프라인- 없음 ..."처럼
+반토막만 보인다는 걸 지적했다 - sales_commission_desc와 똑같은 원인,
+똑같은 문제였다. 필드를 두 개로 나눠 관리할 이유가 없어서, `evidence`
+자체를 class_code/sales_commission_desc 판정에 실제로 쓰는 범위(앞뒤
+1줄 포함 window_text)로 통일하고 `sales_commission_evidence`는 없앴다.
+값 변화 없음(383건 그대로), evidence만 완전한 문맥을 보여주도록 개선.
+
 ### 클래스별 수익률 (`extract_class_returns.py`)
 
 products의 "투자실적추이(연평균수익률)" 표는 총보수 표보다 구조 편차가 더
