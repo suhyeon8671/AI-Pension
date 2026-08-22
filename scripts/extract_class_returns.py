@@ -40,6 +40,12 @@ DEFAULT_OUTPUT = os.path.join(REPO_ROOT, "class_returns.json")
 NUM_RE = re.compile(r"^-?\d[\d,]*\.?\d*$")
 DECIMAL_RE = re.compile(r"^-?\d+\.\d+$")
 CLASS_CODE_RE = re.compile(r"\(([A-Za-z0-9\-]{1,8})\)")
+# 일부 문서는 클래스명을 "(A2)"처럼 괄호로 안 감싸고 "ClassA2"처럼 그대로 붙여 쓴다
+# (예: KR5120420039). 괄호 형식이 안 잡히면 이 패턴으로 한 번 더 시도한다.
+CLASS_CODE_NOPAREN_RE = re.compile(r"Class[- ]?([A-Za-z0-9\-]{1,6})", re.IGNORECASE)
+# 클래스 행의 설정일("2016-04-18", "2001.01.31" 등) - 표 데이터가 아니라 각 행에
+# 딸린 값이라 구조화 필드로 남겨둘 만하다.
+INCEPTION_DATE_RE = re.compile(r"\d{4}[.\-]\d{1,2}[.\-]\d{1,2}")
 PERIOD_LABELS = ["1y", "2y", "3y", "5y", "since_inception"]
 
 
@@ -72,6 +78,11 @@ def row_kind(pre_text, prev_line_text="", next_line_text=""):
     around = re.sub(r"\s+", "", prev_line_text) + re.sub(r"\s+", "", next_line_text)
     if "변동성" in around and "비교지수" not in around:
         return "volatility"
+    # "투자신탁"만 라벨로 있는 행은 특정 클래스가 아니라 펀드 전체 평균(모든
+    # 클래스를 합친 수익률)이다. class_code가 없는 게 아니라 애초에 클래스가
+    # 아니므로 별도 종류로 구분한다.
+    if normalized == "투자신탁":
+        return "fund_aggregate"
     return "class_return"
 
 
@@ -125,21 +136,53 @@ def find_return_rows_on_page(page, page_num):
         if re.search(r"\b(19|20)\d{2}\b(?![.\-])", norm_pre) or re.search(r"\d{1,3},\d{3}", norm_pre):
             continue
 
-        # row_kind는 "다음 줄"까지 보면 안 된다 - 다음 줄은 보통 다음 행(비교지수/
-        # 수익률변동성 등) 자신의 라벨이라, 그걸 지금 행 것으로 잘못 가져오게 된다.
-        # (검증 중 실제로 이 버그로 3행이 전부 "benchmark"로 잘못 나온 걸 확인함)
-        prev_line_text = " ".join(w["text"] for w in lines[i - 1]) if i - 1 >= 0 else ""
-        kind = row_kind(pre_text, prev_line_text, next_line_text)
-        class_code = None
-        m = CLASS_CODE_RE.search(norm_label)
-        if m:
-            class_code = m.group(1)
+        # 이 줄 자체가 비교지수/변동성 행인지 먼저 직접 확인한다(같은 줄
+        # 텍스트만 본다 - 옆 줄을 보지 않으므로 안전). 비교지수/변동성 행은
+        # 애초에 클래스 코드가 없으므로, 여기 해당되면 class_code 검색 자체를
+        # 하지 않는다 - 안 그러면 "다음 줄"(보통 바로 다음에 오는 클래스 행의
+        # 이름)을 이 행 자신의 클래스 코드로 잘못 가져온다(실측: 변동성 행이
+        # 다음 클래스 행 이름을 빌려와 class_code="A"로 잘못 붙는 버그 확인).
+        same_line_kind = row_kind(pre_text)
+
+        if same_line_kind in ("benchmark", "volatility"):
+            kind = same_line_kind
+            class_code = None
+        else:
+            class_code = None
+            m = CLASS_CODE_RE.search(norm_label)
+            if m:
+                class_code = m.group(1)
+            else:
+                # 공백을 지우면 "ClassA 2006-09-05"가 "ClassA2006-09-05"로
+                # 붙어버려서 뒤에 오는 날짜까지 클래스 코드로 삼켜버린다
+                # ("A2006-"). 이 패턴은 원본(공백 유지) 텍스트에서 찾아야
+                # 단어 경계("ClassA" 다음 공백)에서 멈춘다.
+                m2 = CLASS_CODE_NOPAREN_RE.search(label_search_text)
+                if m2:
+                    class_code = m2.group(1)
+
+            if class_code:
+                # 클래스 코드가 확실히 잡혔으면 그 자체로 "클래스 행"이라는
+                # 확실한 증거라 주변 줄의 변동성 언급을 볼 필요가 없다
+                # (KR5120420039처럼 클래스 여러 개가 변동성/비교지수 한 쌍을
+                # 공유하는 표에서, 바로 옆에 다른 그룹의 변동성 행이 우연히
+                # 붙어 있는 걸 이 행 자신의 유형으로 착각하는 버그가 있었다).
+                kind = "class_return"
+            else:
+                # "수익률\n변동성"라벨이 데이터 줄 위아래로 걸쳐 있는 경우
+                # (KR5113420012/69에서 확인)만 좁혀서 앞뒤 줄을 본다.
+                prev_line_text = " ".join(w["text"] for w in lines[i - 1]) if i - 1 >= 0 else ""
+                kind = row_kind(pre_text, prev_line_text, next_line_text)
+
+        date_m = INCEPTION_DATE_RE.search(pre_text)
+        inception_date = date_m.group() if date_m else None
 
         values = {PERIOD_LABELS[idx]: d["text"] for idx, d in enumerate(decimals)}
 
         rows.append({
             "row_kind": kind,
             "class_code": class_code,
+            "inception_date": inception_date,
             "values": values,
             "page": page_num,
             "evidence": " ".join(w["text"] for w in line),
