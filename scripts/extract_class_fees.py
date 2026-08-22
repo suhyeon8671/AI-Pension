@@ -280,13 +280,53 @@ def find_fee_rows_on_page(page, page_num, has_cost_column):
 
         MAX_EXTRA_LINES = 3
 
-        up_lines = []
-        if i - 1 >= 0 and not _is_full_data_row(lines[i - 1]) and not _has_class_paren(lines[i - 1]):
-            up_lines = [lines[i - 1]]
+        def _has_word(l, word):
+            return any(w["text"] == word for w in l)
+
+        # 바로 위/아래 한 줄은 줄바꿈된 이 행 자신의 클래스명 조각을 담기
+        # 위해 일단 넣어본다(경계에 걸리지만 않으면).
+        base_up = (
+            [lines[i - 1]]
+            if i - 1 >= 0 and not _is_full_data_row(lines[i - 1]) and not _has_class_paren(lines[i - 1])
+            else []
+        )
+        base_down = (
+            [lines[i + 1]]
+            if i + 1 < len(lines) and not _is_full_data_row(lines[i + 1])
+            else []
+        )
+
+        # 이 행 자신의 판매수수료가 이미 "없음"/"-"으로 결론 나 있는지는 이
+        # 데이터 줄 자체가 아니라 줄바꿈된 자신의 라벨 줄(방금 넣어본 바로
+        # 위/아래 한 줄)에 있을 수도 있다(KR5152420028 Ce 실측: "없음"이
+        # 데이터 줄이 아니라 바로 위의 라벨 줄 "수수료미징구- 없음"에 있음).
+        # 그래서 데이터 줄 + 바로 위/아래 한 줄까지 합쳐서 확인한다.
+        own_row_no_commission = any(
+            _has_word(wl, "없음") for wl in (base_up + [line] + base_down)
+        ) or any(
+            w["text"] == "-" and w["x0"] < total_fee["x0"] for w in line
+        )
+
+        # "없음"/"-"으로 이미 결론 난 행은 "납입금"을 더 찾아 위/아래로 넓힐
+        # 이유가 없다(넓히면 다른 클래스 문구를 잘못 끌고 오는 사고만 남음 -
+        # KR510902511M C1 실측). 그리고 바로 위/아래 한 줄조차, 데이터도
+        # 없고 괄호도 없어 경계 판정엔 안 걸리지만 사실은 *다른* 클래스의
+        # 판매수수료 문구 잔재("이내"/"납입금" 단독)일 수 있어(C-e 실측)
+        # 그런 경우 아예 빼버린다.
+        if own_row_no_commission:
+            if base_up and _has_word(base_up[0], "이내"):
+                base_up = []
+            if base_down and _has_word(base_down[0], "납입금"):
+                base_down = []
+
+        up_lines = list(base_up)
         found_napipgeum = any(w["text"] == "납입금" for wl in up_lines for w in wl)
         j = i - 2
         extra = 0
-        while up_lines and j >= 0 and extra < MAX_EXTRA_LINES and not found_napipgeum:
+        while (
+            up_lines and not own_row_no_commission
+            and j >= 0 and extra < MAX_EXTRA_LINES and not found_napipgeum
+        ):
             if _is_full_data_row(lines[j]) or _has_class_paren(lines[j]):
                 break
             up_lines.insert(0, lines[j])
@@ -294,14 +334,15 @@ def find_fee_rows_on_page(page, page_num, has_cost_column):
             extra += 1
             j -= 1
 
-        down_lines = []
-        if i + 1 < len(lines) and not _is_full_data_row(lines[i + 1]):
-            down_lines = [lines[i + 1]]
+        down_lines = list(base_down)
         found_ianae = any(w["text"] == "이내" for wl in down_lines for w in wl)
         stop_down = down_lines and _has_class_paren(down_lines[0])
         j = i + 2
         extra = 0
-        while down_lines and j < len(lines) and extra < MAX_EXTRA_LINES and not found_ianae and not stop_down:
+        while (
+            down_lines and not own_row_no_commission
+            and j < len(lines) and extra < MAX_EXTRA_LINES and not found_ianae and not stop_down
+        ):
             if _is_full_data_row(lines[j]):
                 break
             down_lines.append(lines[j])
@@ -310,7 +351,26 @@ def find_fee_rows_on_page(page, page_num, has_cost_column):
             extra += 1
             j += 1
 
-        window_lines = up_lines + [line] + down_lines
+        # 표 왼쪽 여백에 세로로 찍힌 구간 캡션("투자비용" 등)이 y좌표가
+        # 데이터 행과 가까워 같은 줄로 묶이는 경우가 있다(KR510902511M A-e
+        # 실측: "투자비용"이 x=27.8로 "0.5%"(x=195.9)와 같은 줄로 묶였다 -
+        # 둘 사이 간격이 132pt나 되어 원래는 무관한 글자였음이 뚜렷하다).
+        # 클래스명 칸 자체는 정상적으로 왼쪽에서 시작하므로(예: 77.6) 그냥
+        # x좌표 기준으로 자르면 이 행 자신의 클래스명까지 잘라내는 부작용이
+        # 있었다(C1 실측으로 확인) - 그래서 "그 줄 안에서 유독 멀리 떨어진
+        # 맨 왼쪽 단어"만 걸러낸다(한 줄에 단어가 하나뿐이면 비교 대상이
+        # 없으니 그대로 둔다 - 클래스명이 단독으로 한 줄인 정상 케이스).
+        def _strip_stray_caption(wl):
+            if len(wl) < 2:
+                return wl
+            sorted_wl = sorted(wl, key=lambda w: w["x0"])
+            first, second = sorted_wl[0], sorted_wl[1]
+            if first["x0"] < 70 and second["x0"] - first["x1"] > 60:
+                return [w for w in wl if w is not first]
+            return wl
+
+        window_lines = [_strip_stray_caption(wl) for wl in (up_lines + [line] + down_lines)]
+        window_lines = [wl for wl in window_lines if wl]
         window_text = " ".join(" ".join(w["text"] for w in wl) for wl in window_lines)
 
         # %가 숫자에 바로 붙는 서식(위 DECIMAL_RE 참고)에서는 총보수/판매보수
