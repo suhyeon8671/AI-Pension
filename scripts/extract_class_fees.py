@@ -47,6 +47,10 @@ NUM_RE = re.compile(r"^\d[\d,]*\.?\d*$")
 DECIMAL_RE = re.compile(r"^\d+\.\d+%?$")
 DECIMAL_FINDALL_RE = re.compile(r"\d+\.\d+")  # 앵커 없이 텍스트 뭉치 안에서 찾을 때
 CLASS_CODE_RE = re.compile(r"\(([A-Za-z0-9\-]{1,8})\)")
+# "A(수수료선취-오프라인)"처럼 클래스 코드가 괄호 안이 아니라 괄호 바로
+# 앞에 붙어 나오는 문서가 있다(괄호 안은 클래스 코드가 아니라 상품유형
+# 설명 - KR5125450023/KR5125450070 실측).
+CLASS_CODE_PREFIX_RE = re.compile(r"^([A-Za-z]{1,3})\(")
 # 판매수수료 칸은 숫자가 아니라 정형화된 문구("없음" 또는 "납입금액의 N%[ ]이내")인데,
 # "납입금액의"와 "N%이내"가 셀 줄바꿈 때문에 서로 다른 줄(그 사이에 다른 칸 텍스트가
 # 끼어든 상태)로 떨어져 있는 경우가 많아 하나의 정규식으로는 못 잡는다. "이내"까지
@@ -496,29 +500,80 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
             w["text"] == "-" for wl in window_lines for w in wl
         )
 
-        # 클래스 코드(괄호 안 텍스트)는 실측 사례들에서 항상 "이 줄" 또는 "다음 줄"에서만
-        # 나타났다 - "이전 줄"은 위쪽 행(다른 클래스)의 이름 꼬리일 수 있어서 잘못
-        # 가져다 쓸 위험이 있다 (KR514X450008에서 확인: 이전 줄의 클래스코드를 엉뚱하게
-        # 가져와서 실제로는 다른 클래스인 행에 잘못 붙인 사례). 그래서 클래스 코드는
-        # "이 줄 + 다음 줄"까지만 보고, 이전 줄은 보지 않는다.
+        # 클래스 코드(괄호 안 텍스트)는 실측 사례들에서 항상 "이 줄" 또는 "다음 줄들"
+        # 에서만 나타났다 - "이전 줄"은 위쪽 행(다른 클래스)의 이름 꼬리일 수 있어서
+        # 잘못 가져다 쓸 위험이 있다 (KR514X450008에서 확인: 이전 줄의 클래스코드를
+        # 엉뚱하게 가져와서 실제로는 다른 클래스인 행에 잘못 붙인 사례). 그래서
+        # 클래스 코드는 이 줄 기준 아래쪽으로만 찾고, 이전 줄은 보지 않는다.
         #
-        next_line_text = " ".join(w["text"] for w in lines[i + 1]) if i + 1 < len(lines) else ""
-        class_code_search_text = class_part1 + " " + next_line_text
+        # 닫는 괄호가 데이터 줄 바로 다음 줄이 아니라 그보다 더 아래(클래스명이
+        # 3줄 이상으로 나뉘는 경우 - 예: "오프라인- 없음 [데이터]" / "개인연금" /
+        # "(C)", KR5113420012 실측)에 있는 경우가 있어서, 다른 클래스의 완전한
+        # 데이터 행(경계)을 만나기 전까지는 몇 줄 더 내려가며 찾는다. 또한 일부
+        # 문서는 글자 간격이 벌어진 폰트 때문에 괄호 안까지 공백이 끼어 나온다
+        # ("( C- P)") - 정규식이 원래 공백을 허용 안 하므로, 못 찾으면 공백을
+        # 지운 텍스트로 한 번 더 시도한다.
+        def _try_class_code(text):
+            m = CLASS_CODE_RE.search(text)
+            if m:
+                return m.group(1)
+            # 공백을 지운 뒤 다시 찾아보는데, 판매수수료 칸 글자("없음")가
+            # 클래스명 조각과 닫는 괄호 사이에 끼어 있으면 공백만 지웠을 때
+            # 오히려 그 글자와 들러붙어버려 방해가 된다(KR5123420015 실측:
+            # "-온라인(C- 없음 e)"를 그냥 공백만 지우면 "...C-없음e)"가 돼
+            # 안 걸림) - "없음"을 먼저 빼고 공백을 지운다.
+            cleaned = re.sub(r"\s+", "", text.replace("없음", " "))
+            m = CLASS_CODE_RE.search(cleaned)
+            return m.group(1) if m else None
 
+        # 여는 괄호와 닫는 괄호가 서로 다른 줄에 떨어져 있는 경우도 있다
+        # (KR5123420039 실측: "(C-"가 데이터 줄+1, "e)"가 데이터 줄+2) -
+        # 한 줄씩 따로따로만 보면 못 잡으므로, 줄을 누적해가며 본다(줄 하나
+        # 추가할 때마다 매번 다시 시도).
         class_code = None
-        m = CLASS_CODE_RE.search(class_code_search_text)
-        if m:
-            class_code = m.group(1)
-        elif next_page_head_lines:
-            # 이 페이지 안의 "다음 줄"(페이지 하단 "페이지 N/59" 같은 무관한
-            # 푸터일 수 있다)에서 못 찾았으면, 표가 다음 페이지로 이어지면서
+        accumulated = class_part1
+        j = i + 1
+        steps = 0
+        while class_code is None and j < len(lines) and steps < 4:
+            if _is_full_data_row(lines[j]):
+                break
+            accumulated += " " + " ".join(w["text"] for w in lines[j])
+            class_code = _try_class_code(accumulated)
+            j += 1
+            steps += 1
+        if class_code is None:
+            # 데이터 줄 자신에서도(다음 줄이 전혀 없을 때) 시도해둔다.
+            class_code = _try_class_code(class_part1)
+        if class_code is None and next_page_head_lines:
+            # 이 페이지 안에서 못 찾았으면, 표가 다음 페이지로 이어지면서
             # 클래스명의 닫는 괄호 조각이 다음 페이지 맨 앞줄로 넘어간 경우도
             # 확인한다(KR514X450008 실측: "온라인형(Ae)"가 다음 페이지 첫
-            # 줄에 있어서, 이 페이지 안의 다음 줄(푸터)만 보면 놓쳤다).
+            # 줄에 있어서, 이 페이지 안의 다음 줄(무관한 페이지 푸터)만 보면
+            # 놓쳤다).
             next_page_text = " ".join(w["text"] for wl in next_page_head_lines for w in wl)
-            m2 = CLASS_CODE_RE.search(class_part1 + " " + next_page_text)
-            if m2:
-                class_code = m2.group(1)
+            class_code = _try_class_code(class_part1 + " " + next_page_text)
+        if class_code is None:
+            # "A(수수료선취-오프라인)"처럼 클래스 코드가 괄호 안이 아니라
+            # 괄호 바로 앞에 붙는 문서도 있다(KR5125450023/KR5125450070
+            # 실측 - 괄호 안은 클래스 코드가 아니라 상품유형 설명임). 보통은
+            # 이 행 자신의 클래스명 첫 토큰에서 찾는데, 이 행 자신의 줄에는
+            # 숫자와 판매수수료 칸의 "없음"만 있고(클래스명 첫 토큰 자리가
+            # 아님) 클래스명 전체가 바로 윗줄에 있는 문서도 있다(같은 두
+            # 문서에서 판매수수료가 "없음"인 클래스들 실측: 데이터 줄엔
+            # "없음"+숫자뿐, "C(수수료미징구"는 바로 위 줄 전체). "없음"은
+            # 클래스명이 아니므로 pre_text_words 첫 단어가 있어도 그게
+            # "없음"이면 윗줄도 같이 후보로 본다 - 윗줄이 이미 다른
+            # 클래스의 완전한 데이터 행이면(경계) 후보에서 뺀다.
+            prefix_candidates = []
+            if pre_text_words and pre_text_words[0]["text"] != "없음":
+                prefix_candidates.append(pre_text_words[0]["text"])
+            if i - 1 >= 0 and lines[i - 1] and not _is_full_data_row(lines[i - 1]):
+                prefix_candidates.append(lines[i - 1][0]["text"])
+            for cand in prefix_candidates:
+                m3 = CLASS_CODE_PREFIX_RE.match(cand)
+                if m3:
+                    class_code = m3.group(1)
+                    break
 
         # "납입금액의"가 3줄로 쪼개지는 경우도 있다("납입금" / 데이터 줄에 낀
         # "액의 1%" / "이내" - 사이에 클래스명 등 다른 텍스트가 끼어 있어서
@@ -632,7 +687,19 @@ def process_doc(doc_id):
 
         for page_num, page in valid_pages:
             next_page_lines = page_words_lines.get(page_num + 1)
-            next_page_head_lines = next_page_lines[1][:1] if next_page_lines else None
+            if next_page_lines:
+                # 클래스명 닫는 괄호 조각이 다음 페이지 맨 앞 1줄이 아니라
+                # 2줄째에 걸치는 경우도 있다(KR5113470030 실측: "프라인"/
+                # "(C)"가 다음 페이지 첫 두 줄에 나뉘어 있음) - 다른 클래스의
+                # 완전한 데이터 행을 만나기 전까지만 최대 3줄을 후보로 준다.
+                head = []
+                for hl in next_page_lines[1][:3]:
+                    if sum(1 for w in hl if DECIMAL_RE.match(w["text"])) >= 3:
+                        break
+                    head.append(hl)
+                next_page_head_lines = head
+            else:
+                next_page_head_lines = None
             rows = find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines)
             for r in rows:
                 r["product_code"] = doc_id
