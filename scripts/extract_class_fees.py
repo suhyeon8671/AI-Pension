@@ -108,7 +108,7 @@ def page_has_cost_column_header(words, lines):
     return any(HAS_COST_COLUMN_RE.search(w["text"]) for w in header_words)
 
 
-def find_fee_rows_on_page(page, page_num, has_cost_column):
+def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=None):
     words = page.extract_words(x_tolerance=2, keep_blank_chars=False)
     lines = cluster_lines(words)
 
@@ -501,6 +501,7 @@ def find_fee_rows_on_page(page, page_num, has_cost_column):
         # 가져다 쓸 위험이 있다 (KR514X450008에서 확인: 이전 줄의 클래스코드를 엉뚱하게
         # 가져와서 실제로는 다른 클래스인 행에 잘못 붙인 사례). 그래서 클래스 코드는
         # "이 줄 + 다음 줄"까지만 보고, 이전 줄은 보지 않는다.
+        #
         next_line_text = " ".join(w["text"] for w in lines[i + 1]) if i + 1 < len(lines) else ""
         class_code_search_text = class_part1 + " " + next_line_text
 
@@ -508,6 +509,16 @@ def find_fee_rows_on_page(page, page_num, has_cost_column):
         m = CLASS_CODE_RE.search(class_code_search_text)
         if m:
             class_code = m.group(1)
+        elif next_page_head_lines:
+            # 이 페이지 안의 "다음 줄"(페이지 하단 "페이지 N/59" 같은 무관한
+            # 푸터일 수 있다)에서 못 찾았으면, 표가 다음 페이지로 이어지면서
+            # 클래스명의 닫는 괄호 조각이 다음 페이지 맨 앞줄로 넘어간 경우도
+            # 확인한다(KR514X450008 실측: "온라인형(Ae)"가 다음 페이지 첫
+            # 줄에 있어서, 이 페이지 안의 다음 줄(푸터)만 보면 놓쳤다).
+            next_page_text = " ".join(w["text"] for wl in next_page_head_lines for w in wl)
+            m2 = CLASS_CODE_RE.search(class_part1 + " " + next_page_text)
+            if m2:
+                class_code = m2.group(1)
 
         # "납입금액의"가 3줄로 쪼개지는 경우도 있다("납입금" / 데이터 줄에 낀
         # "액의 1%" / "이내" - 사이에 클래스명 등 다른 텍스트가 끼어 있어서
@@ -620,7 +631,9 @@ def process_doc(doc_id):
         )
 
         for page_num, page in valid_pages:
-            rows = find_fee_rows_on_page(page, page_num, has_cost_column)
+            next_page_lines = page_words_lines.get(page_num + 1)
+            next_page_head_lines = next_page_lines[1][:1] if next_page_lines else None
+            rows = find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines)
             for r in rows:
                 r["product_code"] = doc_id
                 results.append(r)
