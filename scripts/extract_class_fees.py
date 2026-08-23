@@ -196,7 +196,25 @@ def find_fee_rows_on_page(page, page_num, has_cost_column):
                     decimals = decimals + [fixed_word]
                     int_like = int_like[1:]
 
-        if len(decimals) < 3 or len(int_like) < 4:
+        # 총보수·비용 칸도 없고(has_cost_column=False) 동종유형총보수까지
+        # "-"인 문서가 있다(KR5116501001 실측: 판매수수료도 "-", 총보수/
+        # 판매보수만 진짜 소수, 동종유형총보수도 "-") - 이러면 소수가 2개
+        # (총보수/판매보수)뿐이라 기존 3개 기준에 걸려 이 문서 전체가
+        # 통째로 빠지고 있었다("데이터 100건 중 97건만 나온다"고 사용자가
+        # 지적해서 발견). 소수 2개까지는 허용하되, 이 행이 진짜 총보수
+        # 표의 데이터 행이라는 걸 더 확실히 하기 위해(엉뚱한 텍스트가
+        # 우연히 소수 2개+정수 4개를 만족하는 오탐 방지) 총보수 앞쪽에
+        # "-"(판매수수료 없음 표시) 단독 토큰이 있을 때만 허용한다 - 이
+        # 문서에서 실측으로 확인된 실제 패턴과 동일.
+        if len(decimals) == 2:
+            has_leading_dash = any(
+                w["text"] == "-" and w["x0"] < decimals[0]["x0"] for w in line
+            )
+            if not has_leading_dash:
+                continue
+        elif len(decimals) < 2:
+            continue
+        if len(int_like) < 4:
             continue
 
         # 운용전문인력(운용역) 표 행이 같은 블록에 섞여 있을 수 있다 - 생년
@@ -216,6 +234,17 @@ def find_fee_rows_on_page(page, page_num, has_cost_column):
         if has_peer_avg:
             peer_avg_fee = decimals[2]
             total_fee_and_cost = decimals[3]
+        elif len(decimals) == 2:
+            # 총보수·비용 칸도 없고 동종유형총보수도 "-"인 문서(위 참고) -
+            # 판매보수 뒤, 비용예시 정수들 앞 구간에 단독 "-"가 있으면
+            # 동종유형총보수가 "-"로 확인된 것으로 본다.
+            total_fee_and_cost = None
+            right_bound = int_like[0]["x0"] if int_like else float("inf")
+            dash_between = [
+                w for w in line
+                if w["text"] == "-" and distribution_fee["x1"] < w["x0"] < right_bound
+            ]
+            peer_avg_fee = "-" if dash_between else None
         elif not has_cost_column:
             # 이 페이지엔 "총보수ㆍ비용" 칸 자체가 없다(위 has_cost_column
             # 참고) - 소수 3개는 총보수/판매보수/동종유형총보수이고
