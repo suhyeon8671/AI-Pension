@@ -130,6 +130,13 @@ def _is_header_row(l):
 # 단어는 전부 "commission" 역할로 묶어서 보여준다(아래 role 분류 참고).
 REDEMPTION_NOTE_RE = re.compile(r"환매")
 CLASS_NAME_START_RE = re.compile(r"^수수료(선취|미징구|후취)")
+# "환매금액의 N%이내"엔 원래 "OO년 미만 환매시:"라는 조건이 붙어 있다(위
+# 실측 - 3년을 채우기 전에 환매하면 벌칙성으로 이 수수료가 붙는다는 뜻).
+# 이 조건 없이 "환매금액의 N%이내"만 남기면 무조건 떼는 수수료처럼 보여서
+# 뜻이 달라진다(사용자 지적: "3년미만 환매시인데 이건 언급이 없는데
+# 있어야하는거 아닌가"). 글자 사이에 공백이 낀 채로도(letter-spacing)
+# 찾도록 각 글자 사이에 \s*를 둔다.
+REDEMPTION_CONDITION_RE = re.compile(r"(\d+)\s*년\s*미\s*만\s*환\s*매\s*시")
 
 
 def _is_note_row(l):
@@ -577,6 +584,31 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
             down_text = "".join(w["text"] for w in base_down[0] if w["x0"] >= 70) if base_down else ""
             if down_text and CLASS_NAME_START_RE.match(down_text):
                 base_down = []
+            # "OO년 미만 환매시: 환매금액의..." 같은 조건문 줄은 항상 그
+            # *다음* 클래스(아직 코드가 안 나온 쪽)의 것이다 - 이 행은
+            # 클래스명+코드가 이미 이 줄에서 끝났으니 판매수수료도 이미
+            # 이 줄에 다 있거나("납입금액의 N%이내"), 아예 "없음"이다.
+            # 그런데도 바로 아래 조건문 줄을 계속 끌고 오면, 다음 클래스
+            # 것인 "환매금액" 기준과 "OO년 미만" 조건이 엉뚱하게 이
+            # 행에 붙어버린다(KR5114420016 R-A 실측: "수수료선취-오프라인
+            # (R-A)"는 원래 "납입금액의 0.3%이내"인데, 바로 아래 S클래스의
+            # "3년 미만 환매시: 환매금액의..." 조건문까지 끌려와서
+            # "환매금액의 0.3%이내"로 잘못 나왔다 - 사용자가 "3년미만
+            # 환매시 언급이 없는데 있어야 하는거 아니냐"고 물어서 고치다가
+            # 발견).
+            # 다만 이 행 자신의 줄에 판매수수료가 아직 안 나와 있으면(예:
+            # KR5114420027 S클래스 - 이름+코드만 한 줄에 있고 "100분의
+            # 0.15 이내"는 바로 아래 줄에 있음) 그 조건문 줄이야말로 이
+            # 행의 진짜 판매수수료이므로 빼면 안 된다. "이 줄에 이미
+            # 납입금/환매금액/% 판매수수료 신호가 있는지"로 구분한다.
+            own_commission_already_on_line = bool(
+                SALES_COMMISSION_PCT_RE.search(class_part1)
+                or BUNUI_RE.search(class_part1)
+                or "납입금" in class_part1
+                or "환매금액" in class_part1
+            )
+            if base_down and _is_note_row(base_down[0]) and own_commission_already_on_line:
+                base_down = []
             if base_up and any(")" in w["text"] for w in base_up[0]):
                 base_up = []
 
@@ -855,13 +887,22 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
             if "환매금액" in wide_text or "환매금액" in wide_text_nospace
             else ("납입금액" if "납입금" in wide_text else None)
         )
+        # "환매금액"을 기준으로 쓰는 후취형은 거의 항상 "OO년 미만 환매시"
+        # 조건이 같이 붙어 있다(위 REDEMPTION_CONDITION_RE 주석 참고) -
+        # 조건 없이 "환매금액의 N%이내"만 남기면 무조건 떼는 수수료처럼
+        # 읽혀서 뜻이 달라지므로, 찾아지면 원본 그대로 앞에 붙인다.
+        condition_prefix = ""
+        if commission_basis == "환매금액":
+            cond_m = REDEMPTION_CONDITION_RE.search(wide_text) or REDEMPTION_CONDITION_RE.search(wide_text_nospace)
+            if cond_m:
+                condition_prefix = f"{cond_m.group(1)}년 미만 환매시: "
         if commission_basis and pct_m:
-            sales_commission_desc = f"{commission_basis}의 {pct_m.group(1)}%이내"
+            sales_commission_desc = f"{condition_prefix}{commission_basis}의 {pct_m.group(1)}%이내"
         elif commission_basis and bunui_m:
             # "N%" 대신 "100분의 N"(=N/100, 같은 뜻)으로 쓰는 문서가 있다
             # (KR5114420027). 위에서 이 값을 이미 총보수 등 실제 컬럼과
             # 분리해뒀으니, 여기서는 같은 뜻인 "%" 표기로 통일해서 남긴다.
-            sales_commission_desc = f"{commission_basis}의 {bunui_m.group(1)}%이내"
+            sales_commission_desc = f"{condition_prefix}{commission_basis}의 {bunui_m.group(1)}%이내"
         elif "없음" in window_text or has_standalone_dash:
             # 원본이 "없음"이라는 글자를 쓰든 그냥 "-"만 찍든 의미는 같아서
             # ("판매수수료가 없다"는 확인된 사실), 출력은 원본에 실제로 보이는
