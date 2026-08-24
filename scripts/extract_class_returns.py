@@ -277,10 +277,20 @@ def find_return_rows_on_page(page, page_num, section="가"):
         date_m = INCEPTION_DATE_RE.search(pre_text)
         inception_date = date_m.group() if date_m else None
 
-        # 값이 전부 "-"인 행(아직 수익률이 없는 신규 클래스 등)은 값이 없다는
-        # 사실 그대로 None으로 남긴다 - 억지로 숫자를 만들지 않는다.
+        # 아직 수익률이 없는 신규 클래스 등은 원본이 그 칸에 "-"를 직접
+        # 찍어서 "값이 없다"는 걸 명시적으로 밝힌다. 이걸 그냥 None으로
+        # 뭉개면 "추출을 못 해서 모른다"와 "원본이 확인해서 없다고
+        # 밝혔다"가 구분이 안 된다(class_fees의 peer_avg_fee/
+        # sales_commission_desc에서 이미 사용자 지적으로 고친 것과 같은
+        # 문제 - 실측: KR510902511M C1 등 56건에서 evidence는 전부
+        # "-"인데 값은 None으로 나오고 있었다). 원본 토큰이 "-"면 "-"를
+        # 그대로 남기고, "-"도 아니고 소수도 아닌(추출 자체가 안 된)
+        # 경우에만 None으로 남긴다.
         values = {
-            PERIOD_LABELS[idx]: (t["text"] if DECIMAL_RE.match(t["text"]) else None)
+            PERIOD_LABELS[idx]: (
+                t["text"] if DECIMAL_RE.match(t["text"])
+                else ("-" if t["text"] == "-" else None)
+            )
             for idx, t in enumerate(value_tokens)
         }
 
