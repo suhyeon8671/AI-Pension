@@ -670,6 +670,30 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
             extra += 1
             j += 1
 
+        # 클래스명/판매수수료 문구가 페이지 경계를 넘어가는 경우도 있다
+        # (KR514X450008 Ae 실측: 데이터 줄 자체가 그 페이지의 마지막
+        # 줄이라 "온라인형(Ae)"와 "0.5%이내"가 통째로 다음 페이지 첫
+        # 줄로 넘어감). class_code 탐색은 이미 next_page_head_lines로
+        # 이런 경우를 봐주고 있었지만(위 참고), evidence/판매수수료
+        # 재구성 쪽은 이 페이지 안(`lines`)에서만 찾다 보니 이 행만
+        # "클래스명: 수수료선취 –"처럼 끊긴 채로 남고 sales_commission_desc
+        # 도 null이 됐다. 이 페이지 끝까지 갔는데도 아직 "이내"를 못
+        # 찾았고(다른 클래스의 완전한 경계도 아직 안 만났다면) 다음
+        # 페이지 머리글 후보를 이어서 본다.
+        if (
+            not found_ianae and not stop_down and not own_row_no_commission
+            and extra < MAX_EXTRA_LINES and j >= len(lines) and next_page_head_lines
+        ):
+            for hl in next_page_head_lines:
+                if extra >= MAX_EXTRA_LINES or _is_full_data_row(hl) or _is_header_row(hl):
+                    break
+                down_lines.append(hl)
+                found_ianae = _has_word(hl, "이내")
+                stop_down = _has_class_paren(hl)
+                extra += 1
+                if found_ianae or stop_down:
+                    break
+
         # 표 왼쪽 여백(클래스명 칸보다도 왼쪽)에 세로로 찍힌 구간 캡션
         # ("투자비용" 등, x0≈27.8)이 y좌표가 데이터 행과 가까워 같은 줄로
         # 묶이는 경우가 있다. 클래스명 칸은 실측 사례들에서 전부 x0≈77.6
