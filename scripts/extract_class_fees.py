@@ -73,6 +73,49 @@ CONVERSION_TRIGGER_RE = re.compile(r"목표기준가격\([^)]*?([\d,]+)\s*원\s*
 # 둔다(KR5147430065 실측) - 숫자 개수·줄 간격만으로 추측하지 않고 이
 # 문구가 실제로 근처에 있는지로 확인한다.
 PERIOD_LABEL_RE = re.compile(r"최초설정일|운용전환일|해지일")
+# 위 "구분" 칸 문구는 클래스명 칸과 같은 x좌표 구간(왼쪽)에 찍히는 경우가
+# 있어("최초설정일부터"가 줄바꿈으로 "최초설정일부"/"터"로 쪼개짐 -
+# KR5147430065 실측), evidence의 클래스명을 만들 때 이 문구를 걸러내지
+# 않으면 "구분 총보수 수수료 최초설정일부 터 운용전환일 수수료선취- 전일까지
+# 오프라인형(A)"처럼 클래스명과 구분 칸 문구가 뒤섞여 보인다(사용자 지적).
+# "터"는 "부터"가 줄바꿈으로 쪼개진 조각이라 단어 자체엔 문맥이 없지만,
+# 실제 클래스명(수수료선취/미징구/후취-오프라인/온라인...)에는 "터" 한
+# 글자짜리 토큰이 나올 일이 없어 안전하게 같이 걸러낸다.
+PERIOD_COLUMN_WORD_RE = re.compile(r"최초설정일|운용전환일|해지일|전일까지")
+PERIOD_COLUMN_LONE_WORDS = {"터"}
+# 클래스명이 줄바꿈될 때, 위/아래로 넓히는 과정에서 표 자체의 칸 이름(헤더)
+# 줄까지 같이 끌려 들어오는 경우가 있다(예: KR518101002M 실측 - 표의 첫
+# 클래스 행은 위로 넓혀도 "납입금"이 안 나오니 MAX_EXTRA_LINES까지 계속
+# 올라가다가 "클래스종류/판매수수료/총보수·비용/1년~10년" 헤더 줄까지
+# 포함해버려 evidence 클래스명이 "판매 총보수 수수료 수수료미징구-..."처럼
+# 헤더 단어가 섞여 나온다 - 사용자가 KR5147430065에서 이 현상을 지적해
+# 다른 문서도 전수 확인해보니 총 26건에서 같은 문제가 있었다). 헤더 줄은
+# 실측 문서들에서 전부 "클래스/종류/구분/판매/수수료/판매보수/총보수/
+# 보수/비용/동종유형/N년" 같은 정해진 칸 이름 단어로만 이루어져 있고 실제
+# 클래스명 글자(수수료선취-오프라인(A) 등)가 섞이는 일이 없어, 그 줄의
+# 모든 단어가 이 칸 이름 집합(+숫자)에 속할 때만 "헤더 줄"로 판단한다 -
+# 클래스명이 조금이라도 섞인 줄은 걸리지 않도록 보수적으로 잡는다.
+HEADER_LABEL_TOKENS = {
+    "클래스", "종류", "(클래스)", "구분",
+    "판매", "수수료", "판매보수", "판매수수료",
+    "총보수", "보수", "비용", "년",
+    "총보수·", "총보수ㆍ", "ㆍ비용", "·비용",
+    "총보수·비용", "총보수ㆍ비용", "동종유형",
+}
+
+
+def _is_header_row(l):
+    non_empty = [w for w in l if w["text"].strip()]
+    if not non_empty:
+        return False
+    for w in non_empty:
+        t = w["text"]
+        if t in HEADER_LABEL_TOKENS or t.isdigit():
+            continue
+        return False
+    return True
+
+
 # 판매수수료 칸은 숫자가 아니라 정형화된 문구("없음" 또는 "납입금액의 N%[ ]이내")인데,
 # "납입금액의"와 "N%이내"가 셀 줄바꿈 때문에 서로 다른 줄(그 사이에 다른 칸 텍스트가
 # 끼어든 상태)로 떨어져 있는 경우가 많아 하나의 정규식으로는 못 잡는다. "이내"까지
@@ -390,6 +433,14 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
             text = " ".join(w["text"] for w in l)
             if CLASS_CODE_RE.search(text):
                 return True
+            # 글자를 한 자씩 따로 찍는 서식(letter-spacing)이 있는 문서는
+            # "(Ce)"가 "(", "Ce", ")"처럼 별도 단어로 쪼개져 나와 join한
+            # 텍스트에 공백이 끼어(예: "( Ce )") 위 정규식이 못 잡는다
+            # (KR5114420022 실측: 이 탓에 닫는 괄호 줄을 경계로 못 보고
+            # 계속 아래로 넓혀가다 다음 각주 문단까지 클래스명에 끌려
+            # 들어왔다). 공백을 다 지운 버전으로도 한 번 더 확인한다.
+            if CLASS_CODE_RE.search(text.replace(" ", "")):
+                return True
             # 일부 문서(KR5125450023)는 클래스 코드가 "A(수수료선취-...오프
             # 라인)"처럼 여는 괄호가 클래스 행 자체에, 닫는 괄호만 다음 줄에
             # 따로 떨어져 나온다("오프라인)") - 이 경우 CLASS_CODE_RE(여닫는
@@ -405,18 +456,31 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
             # 일치할 때만 찾으면 못 잡고 지나쳐 위/아래로 계속 넓혀버린다
             # (결국 표 헤더까지 evidence에 끼어드는 사고로 이어졌다) - 부분
             # 일치로 찾는다.
-            return any(word in w["text"] for w in l)
+            if any(word in w["text"] for w in l):
+                return True
+            # 글자를 한 자씩 따로 찍는 서식(letter-spacing)이 있는 문서는
+            # "이내"조차 "이"/"내"처럼 서로 다른 단어로 쪼개져 나와 단어
+            # 하나씩만 봐서는 못 찾는다(KR5114420016 실측: 환매수수료
+            # 문구의 "이내"가 쪼개져 있어 아래로 넓히는 걸 못 멈추고 다음
+            # 각주 문단까지 끌고 옴). 줄 전체를 이어붙인 텍스트로도 한 번
+            # 더 확인한다.
+            return word in "".join(w["text"] for w in l)
 
         # 바로 위/아래 한 줄은 줄바꿈된 이 행 자신의 클래스명 조각을 담기
         # 위해 일단 넣어본다(경계에 걸리지만 않으면).
         base_up = (
             [lines[i - 1]]
-            if i - 1 >= 0 and not _is_full_data_row(lines[i - 1]) and not _has_class_paren(lines[i - 1])
+            if i - 1 >= 0
+            and not _is_full_data_row(lines[i - 1])
+            and not _has_class_paren(lines[i - 1])
+            and not _is_header_row(lines[i - 1])
             else []
         )
         base_down = (
             [lines[i + 1]]
-            if i + 1 < len(lines) and not _is_full_data_row(lines[i + 1])
+            if i + 1 < len(lines)
+            and not _is_full_data_row(lines[i + 1])
+            and not _is_header_row(lines[i + 1])
             else []
         )
 
@@ -475,7 +539,7 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
         j = i - 2
         extra = 0
         while up_lines and j >= 0 and extra < MAX_EXTRA_LINES and not found_napipgeum:
-            if _is_full_data_row(lines[j]) or _has_class_paren(lines[j]):
+            if _is_full_data_row(lines[j]) or _has_class_paren(lines[j]) or _is_header_row(lines[j]):
                 break
             if own_row_no_commission and _has_word(lines[j], "이내"):
                 break
@@ -493,7 +557,7 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
             down_lines and j < len(lines) and extra < MAX_EXTRA_LINES
             and not found_ianae and not stop_down
         ):
-            if _is_full_data_row(lines[j]):
+            if _is_full_data_row(lines[j]) or _is_header_row(lines[j]):
                 break
             if own_row_no_commission and _has_word(lines[j], "납입금"):
                 break
@@ -538,6 +602,13 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
         def _word_role(w):
             if w["x0"] >= total_fee["x0"]:
                 return "data"
+            # "운용전환일" 전/후로 수수료가 나뉘는 문서는 "구분" 칸(최초설정일부터/
+            # 운용전환일부터/해지일까지 등)이 클래스명 칸과 같은 x좌표 구간에
+            # 찍혀 있어서, 걸러내지 않으면 클래스명에 "최초설정일부 터
+            # 운용전환일"처럼 구분 칸 문구가 섞여 들어간다(KR5147430065 실측,
+            # 사용자 지적).
+            if PERIOD_COLUMN_WORD_RE.search(w["text"]) or w["text"] in PERIOD_COLUMN_LONE_WORDS:
+                return "period"
             # "납입금"/"납입금액"처럼 뒤에 "액"이 붙거나 안 붙거나 하는
             # 표기가 문서마다 달라서(KR5123490017 실측: "납입금액"이 한
             # 토큰) 부분 일치로 잡는다. "액의"/"금액의"처럼 "...의"로 끝나는
