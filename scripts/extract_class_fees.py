@@ -711,14 +711,13 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
             "peer_avg_fee": peer_avg_fee_text,
             "total_fee_and_cost": total_fee_and_cost["text"].rstrip("%") if total_fee_and_cost else None,
             "cost_projection_per_10m": cost_projection,
-            # "운용전환일" 전/후로 수수료가 바뀌는 문서에서만 채워진다(위
-            # 참고, KR5147430065) - 그 외 문서는 항상 null. total_fee 등
-            # 위쪽 필드는 전환 "전"(현재 적용 중인) 값이고, 이 필드들은
-            # 전환 이후 예정된 값이다.
-            "total_fee_after_conversion": None,
-            "distribution_fee_after_conversion": None,
-            "peer_avg_fee_after_conversion": None,
-            "total_fee_and_cost_after_conversion": None,
+            # "운용전환일" 전/후로 수수료가 바뀌는 문서에서만 이 키들이
+            # 붙는다(아래 참고, KR5147430065) - 그 외 문서(대다수)는 애초에
+            # 키 자체가 없다(null로 채운 빈 필드를 모든 행에 다 넣으면
+            # 대부분 안 쓰는 필드로 보기 불편하다는 지적을 받아, 해당되는
+            # 행에만 조건부로 붙이도록 바꿨다). total_fee 등 위쪽 필드는
+            # 전환 "전"(현재 적용 중인) 값이고, *_after_conversion은 전환
+            # 이후 예정된 값이다.
             "page": page_num,
             "evidence": evidence,
             "method": "coordinate_reconstruction",
@@ -852,13 +851,13 @@ def process_doc(doc_id):
         if key not in dedup or r["confidence"] > dedup[key]["confidence"]:
             dedup[key] = r
     final_rows = list(dedup.values()) + unlabeled
-    if any(r.get("total_fee_after_conversion") is not None for r in final_rows):
+    # total_fee_after_conversion이 있는 행에만 conversion_note 키를 붙인다
+    # (없는 행은 키 자체를 안 만듦 - 위 참고).
+    if any("total_fee_after_conversion" in r for r in final_rows):
         note = conversion_trigger_note(doc_id)
         for r in final_rows:
-            r["conversion_note"] = note if r.get("total_fee_after_conversion") is not None else None
-    else:
-        for r in final_rows:
-            r["conversion_note"] = None
+            if "total_fee_after_conversion" in r:
+                r["conversion_note"] = note
     return final_rows
 
 
