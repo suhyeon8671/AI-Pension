@@ -374,9 +374,47 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
             has_leading_dash = any(
                 w["text"] == "-" and w["x0"] < decimals[0]["x0"] for w in line
             )
-            if not has_leading_dash:
+            # 위 리딩 대시 기준은 KR5116501001(판매수수료="-", 동종유형
+            # 총보수="-")에 맞춰 만든 것인데, 소수 2개짜리 행이 이 패턴
+            # 하나만 있는 게 아니었다(KR5194450018 실측: 12개 클래스 중
+            # 7개(W/F/S/RP/RP-e/S-P/CP)가 판매수수료="없음"이거나 빈칸,
+            # 동종유형총보수는 뒤쪽 "-"이거나 아예 빈칸이라 리딩 대시가
+            # 없어서 통째로 빠지고 있었다 - 사용자가 "클래스 없는것들이
+            # 너무 많다"고 지적해서 발견). 리딩 대시가 없어도, 바로
+            # 위/아래(±2줄) 근처에 클래스명 시작 패턴("수수료선취/
+            # 미징구/후취-")이 있으면 진짜 총보수 표의 데이터 행으로
+            # 본다(엉뚱한 문장이 우연히 소수 2개+정수 4개를 만족해도
+            # 그 근처에 클래스명이 있을 리는 없어 오탐 위험이 낮다).
+            nearby_class_name = any(
+                CLASS_NAME_START_RE.match("".join(w["text"] for w in lines[k]))
+                for k in range(max(0, i - 2), min(len(lines), i + 3))
+            )
+            if not has_leading_dash and not nearby_class_name:
                 continue
-        elif len(decimals) < 2:
+        elif len(decimals) == 1:
+            # 총보수만 진짜 소수고 판매보수·동종유형총보수가 둘 다 "-"인
+            # 행도 있다(KR5194450018 W클래스 실측: "0.765 - - 78 161
+            # 247 433 986" - 총보수 뒤에 대시가 두 개 연달아 나옴). 위와
+            # 같은 클래스명 인접 여부로 진짜 데이터 행인지 확인한 뒤,
+            # 총보수 뒤·비용예시 정수 앞 구간의 "-" 토큰들을 순서대로
+            # 판매보수/동종유형총보수 자리로 채운다.
+            nearby_class_name = any(
+                CLASS_NAME_START_RE.match("".join(w["text"] for w in lines[k]))
+                for k in range(max(0, i - 2), min(len(lines), i + 3))
+            )
+            if not nearby_class_name:
+                continue
+            right_bound = int_like[0]["x0"] if int_like else float("inf")
+            dashes_after = sorted(
+                (w for w in line if w["text"] == "-" and decimals[0]["x1"] < w["x0"] < right_bound),
+                key=lambda w: w["x0"],
+            )
+            if not dashes_after:
+                continue
+            # 실제 대시 단어 객체를 그대로 써야(x0/x1 좌표 포함) 아래
+            # 열 배정 로직이 그 좌표를 다시 참조해도 안전하다.
+            decimals = [decimals[0]] + dashes_after[:2]
+        elif len(decimals) < 1:
             continue
         if len(int_like) < min(4, len(cost_years)):
             # "운용전환일" 전/후로 수수료가 바뀌는 문서(위 참고, KR5147430065)는
