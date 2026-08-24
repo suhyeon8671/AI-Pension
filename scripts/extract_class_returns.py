@@ -29,6 +29,7 @@ import glob
 import json
 import os
 import re
+from collections import defaultdict
 
 import pdfplumber
 
@@ -63,6 +64,37 @@ SECTION_NA_RE = re.compile(r"나[\.．]연도별수익률")
 # 딸린 값이라 구조화 필드로 남겨둘 만하다.
 INCEPTION_DATE_RE = re.compile(r"\d{4}[.\-]\d{1,2}[.\-]\d{1,2}")
 PERIOD_LABELS = ["1y", "2y", "3y", "5y", "since_inception"]
+# 최근3년/최근5년 칸이 원본에 아예 빈칸인(설정된 지 얼마 안 된 펀드) 행이
+# 있다(KR5120420091 실측: "최근1년 최근2년 최근3년 최근5년 설정일이후" 5칸
+# 헤더인데 실제 값은 "4.23 4.48 4.48" 3개뿐 - 3번째 값은 3년이 아니라
+# 설정일이후 값인데, 그냥 순서대로 PERIOD_LABELS[0,1,2]에 채우면
+# "3y"라는 잘못된 이름표가 붙는다). 헤더 줄에서 "N년"/"설정일이후" 라벨의
+# x좌표를 찾아두고, 각 값 토큰을 순서가 아니라 x좌표가 가장 가까운 헤더
+# 칸에 매칭한다 - 헤더를 못 찾은 경우에만 기존 순서 방식으로 되돌아간다.
+YEAR_HEADER_RE = re.compile(r"^(\d)년$")
+
+
+def _detect_period_columns(lines):
+    # 페이지 전체에서 "N년" 토큰을 찾으면(먼저 시도했던 방식) 같은 페이지의
+    # "운용전문인력" 표나 각주 문장("설정일로부터 1년이 경과하지 않은...")에
+    # 있는 엉뚱한 "1년"/"2년"까지 걸려서, 실제 수익률 표 헤더가 아닌 좌표를
+    # 앵커로 써버리는 사고가 났다(위 파일 docstring의 "운용전문인력 표
+    # 혼동" 주의사항과 같은 종류의 문제). 진짜 헤더는 "최근 1년 최근 2년
+    # 최근 3년 최근 5년 설정일이후"처럼 여러 개의 "N년"/"설정일이후" 라벨이
+    # 한 줄에 다 같이 나온다 - 그런 줄(3개 이상)만 헤더로 인정한다.
+    for line in lines:
+        anchors = {}
+        for w in line:
+            m = YEAR_HEADER_RE.match(w["text"])
+            if m:
+                label = {"1": "1y", "2": "2y", "3": "3y", "5": "5y"}.get(m.group(1))
+                if label:
+                    anchors[label] = w["x0"]
+            elif "설정일이후" in w["text"]:
+                anchors["since_inception"] = w["x0"]
+        if len(anchors) >= 3:
+            return anchors
+    return None
 
 
 def cluster_lines(words, tol=2.5):
@@ -140,6 +172,7 @@ def find_return_rows_on_page(page, page_num, section="가"):
     # 그 문제가 해결되면서도(검증 완료) 다른 문서의 값이 잘못 합쳐지진 않았다.
     words = page.extract_words(x_tolerance=5, keep_blank_chars=False)
     lines = cluster_lines(words)
+    period_anchors = _detect_period_columns(lines)
     rows = []
     for i, line in enumerate(lines):
         line_text_for_section = re.sub(r"\s+", "", " ".join(w["text"] for w in line))
@@ -286,8 +319,25 @@ def find_return_rows_on_page(page, page_num, section="가"):
         # "-"인데 값은 None으로 나오고 있었다). 원본 토큰이 "-"면 "-"를
         # 그대로 남기고, "-"도 아니고 소수도 아닌(추출 자체가 안 된)
         # 경우에만 None으로 남긴다.
+        # 값이 5개 다 있으면 순서(1y/2y/3y/5y/since_inception)와 x좌표
+        # 매칭이 항상 같은 결과를 주지만, 중간 칸(3년/5년)이 원본에서
+        # 통째로 비어 있으면(위 PERIOD_LABELS 주석 참고) 순서 방식은
+        # 남은 값들을 앞칸부터 밀어 채워서 라벨이 틀어진다 - x좌표가 더
+        # 가까운 헤더 칸으로 매칭한다.
+        if period_anchors:
+            labels = [
+                min(period_anchors, key=lambda lbl: abs(period_anchors[lbl] - t["x0"]))
+                for t in value_tokens
+            ]
+            if len(set(labels)) != len(labels):
+                # 매칭이 겹치면(이례적인 레이아웃) 안전하게 기존 순서
+                # 방식으로 되돌아간다.
+                labels = PERIOD_LABELS[: len(value_tokens)]
+        else:
+            labels = PERIOD_LABELS[: len(value_tokens)]
+
         values = {
-            PERIOD_LABELS[idx]: (
+            labels[idx]: (
                 t["text"] if DECIMAL_RE.match(t["text"])
                 else ("-" if t["text"] == "-" else None)
             )
@@ -307,8 +357,10 @@ def find_return_rows_on_page(page, page_num, section="가"):
         })
 
     _apply_merged_cell_dates(page, words, rows)
-    for r in rows:
-        del r["_top"]
+    # "_top"(줄의 y좌표)은 여기서 바로 지우지 않고 호출자의 중복 제거
+    # 단계까지 들고 간다 - 값만으로 중복을 판정하면(아래 dedup 주석 참고)
+    # 서로 다른 진짜 행을 잘못 지워버리는 사고가 나서, 페이지 안에서의
+    # 실제 위치까지 같이 봐야 한다.
     return rows, section
 
 
@@ -396,16 +448,85 @@ def process_doc(doc_id):
                 results.append(r)
 
     # 페이지 후보를 넓게 잡다 보니(다음 페이지도 포함) 같은 행이 중복될 수 있다.
-    # (row_kind, class_code, page, values의 1y값) 조합으로 단순 중복 제거.
+    # 처음엔 (row_kind, class_code, values의 1y값)으로 판정했는데, 비교지수/
+    # 수익률변동성 행은 class_code가 애초에 없고(None) 같은 상품 안의 여러
+    # 클래스가 값까지 우연히 똑같이 나오는 경우가 실제로 있어서(KR5120420091
+    # 실측: 초단기우량채/Class A/Class Ae/Class Ce의 비교지수가 전부 "3.72
+    # 3.88 3.88"로 동일) 서로 다른 진짜 행 4개 중 1개만 남기고 나머지 3개를
+    # "중복"으로 오인해 지워버리고 있었다(사용자가 "클래스는 있는데 비교지수/
+    # 변동성이 없다"고 지적해서 발견). page 안에서의 실제 세로 위치(_top)까지
+    # 같이 봐야 서로 다른 행을 구분할 수 있다 - 진짜 중복(페이지 후보가
+    # 겹쳐서 같은 물리적 줄을 두 번 읽은 경우)은 같은 페이지의 같은 위치에서
+    # 다시 나오므로 여전히 걸러진다.
     seen = set()
     deduped = []
     for r in results:
-        key = (r["row_kind"], r["class_code"], r["values"].get("1y"))
+        key = (r["row_kind"], r["class_code"], r["page"], round(r["_top"]))
         if key in seen:
             continue
         seen.add(key)
         deduped.append(r)
-    return deduped
+    for r in deduped:
+        del r["_top"]
+
+    # 페이지 위치까지 다르면 서로 다른 진짜 행으로 봐야 하지만(위 참고),
+    # 한 문서 안에 "가.연평균수익률" 표 자체가 통째로 두 번(앞쪽 요약정보 +
+    # 뒤쪽 제2부 상세) 나오면서 같은 클래스의 값까지 완전히 똑같이 반복
+    # 되는 경우가 실제로 있다(KR5153520012 실측 - 사용자가 "C, C-P2e
+    # 없음"이라고 지적해서 다시 살렸는데, 그러면서 같은 클래스가 두 번
+    # 잡히는 부작용이 새로 생겼다). class_fees.json이 "같은 클래스는
+    # 문서당 행 하나"로 통일하는 것과 같은 원칙으로 맞춘다 - class_code가
+    # 있는 행은 (product_code, class_code)로 하나만 남기고, confidence가
+    # 같으면 뒤쪽 페이지(제2부 상세표) 것을 남긴다. 상세표 쪽이 클래스
+    # 개수도 더 많이 나오는 걸 실측으로 확인해서(같은 문서에서 요약표엔
+    # 없던 클래스가 상세표에만 있는 경우 - C-F 등) 상세표를 더 완전한
+    # 쪽으로 본다.
+    best_by_class = {}
+    demoted_pages = set()
+    for r in deduped:
+        if not r["class_code"]:
+            continue
+        key = r["class_code"]
+        cur = best_by_class.get(key)
+        if cur is None:
+            best_by_class[key] = r
+            continue
+        if (r["confidence"], r["page"]) > (cur["confidence"], cur["page"]):
+            demoted_pages.add(cur["page"])
+            best_by_class[key] = r
+        else:
+            demoted_pages.add(r["page"])
+    kept_class_return_ids = {id(r) for r in best_by_class.values()}
+
+    # class_code가 없는 행(비교지수/수익률변동성/투자신탁 합계)은 클래스
+    # 처럼 명확한 키가 없다. 같은 페이지 안에서 값이 우연히 같은 건(위
+    # KR5120420091 케이스처럼) 무조건 서로 다른 진짜 행이라 절대 지우면
+    # 안 되지만, "같은 (row_kind, 값 전부)"인 행이 서로 다른 페이지에
+    # 걸쳐 있으면 그건 표 자체가 문서 안에서 반복된 것(위 참고)이므로
+    # 가장 뒤쪽 페이지 것만 남긴다 - class_code 유무와 무관하게 이
+    # 문서에서 실제로 확인된 반복 패턴(44개 값 그룹, class_return이 한
+    # 쪽에서 안 겹쳐도 비교지수/변동성/투자신탁 합계만 따로 반복되는
+    # 경우도 있었다)을 포괄하도록 class_code 중복 제거와 독립적으로
+    # 처리한다.
+    no_class_groups = defaultdict(list)
+    for r in deduped:
+        if not r["class_code"]:
+            no_class_groups[(r["row_kind"], tuple(sorted(r["values"].items())))].append(r)
+    drop_ids = set()
+    for group in no_class_groups.values():
+        pages_in_group = {r["page"] for r in group}
+        if len(pages_in_group) > 1:
+            latest_page = max(pages_in_group)
+            drop_ids.update(id(r) for r in group if r["page"] != latest_page)
+
+    final = []
+    for r in deduped:
+        if r["class_code"]:
+            if id(r) in kept_class_return_ids:
+                final.append(r)
+        elif id(r) not in drop_ids:
+            final.append(r)
+    return final
 
 
 def main():
