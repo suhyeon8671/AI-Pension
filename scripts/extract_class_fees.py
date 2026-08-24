@@ -116,6 +116,45 @@ def _is_header_row(l):
     return True
 
 
+# "후취"(환매 시점에 떼는) 판매수수료 클래스는 "납입금액의 N%이내"가 아니라
+# "OO시 환매시: 환매금액의 N%이내"처럼 판매수수료율의 기준을 "환매금액"으로
+# 쓴다(KR5114420027 S클래스 실측: "3년 미만 환매시: 환매금액의 100분의 0.15
+# 이내" - 이건 별개의 벌칙성 수수료가 아니라 이 클래스의 판매수수료 문구
+# 자체다). 처음엔 "환매"가 들어간 줄을 별개의 조건문으로 보고 위/아래 확장의
+# 경계로 아예 걷어냈는데, 그러면 정작 판매수수료 문구 자체가 통째로 빠져
+# sales_commission_desc가 null이 돼버렸다(사용자가 evidence 이상하다고
+# 지적해서 재확인 중 발견) - "납입금액"만 판매수수료 신호로 보던 기존 판정을
+# "환매금액"도 같은 뜻으로 인정하도록 넓혀서 고쳤다(아래 사용처 참고).
+# 다만 "3년/미/만/환/매/시" 같은 낱글자는 여전히 클래스명도 판매수수료
+# 숫자도 아니므로, evidence 클래스명에 섞이지 않도록 이 문구가 있는 줄의
+# 단어는 전부 "commission" 역할로 묶어서 보여준다(아래 role 분류 참고).
+REDEMPTION_NOTE_RE = re.compile(r"환매")
+CLASS_NAME_START_RE = re.compile(r"^수수료(선취|미징구|후취)")
+
+
+def _is_note_row(l):
+    non_empty = [w for w in l if w["text"].strip()]
+    if not non_empty:
+        return False
+    text = "".join(w["text"] for w in non_empty)
+    if CLASS_NAME_START_RE.match(text):
+        return False
+    # "100분의 0.15 이내"처럼 "환매"라는 낱말 없이 판매수수료 비율만 나오는
+    # 줄도 있다(위 KR5114420027 S클래스의 같은 문구가 줄바꿈으로 갈라진
+    # 다음 줄 - "10"/"0분"/"의"/"0"/".1"/"5"/"이"/"내"). 이 조각들 하나하나는
+    # _word_role의 어떤 패턴에도 안 걸려("0분"/"이"/"내" 등은 숫자도 "%"도
+    # "이내" 전체 토큰도 아님) 기본값(class_name)으로 새어나간다. "100분의"
+    # 패턴 자체가 이미 판매수수료 신호이므로(BUNUI_RE) 같이 잡는다.
+    if REDEMPTION_NOTE_RE.search(text) or BUNUI_RE.search(text):
+        return True
+    # "이내"가 데이터 행을 사이에 두고 앞뒤로 갈라지면서("...이" / [데이터
+    # 행] / "내") 뒤쪽 "내"만 뚝 떨어진 별도 줄로 남는 경우가 있다
+    # (KR5114420016/KR5114420027 실측 - 클래스명 뒤에 "이 내"가 덧붙어
+    # 보였다). 줄에 "이"/"내" 말고 다른 글자가 없으면 그 "이내" 잔여
+    # 조각으로 본다.
+    return text in ("이", "내", "이내")
+
+
 # 판매수수료 칸은 숫자가 아니라 정형화된 문구("없음" 또는 "납입금액의 N%[ ]이내")인데,
 # "납입금액의"와 "N%이내"가 셀 줄바꿈 때문에 서로 다른 줄(그 사이에 다른 칸 텍스트가
 # 끼어든 상태)로 떨어져 있는 경우가 많아 하나의 정규식으로는 못 잡는다. "이내"까지
@@ -441,6 +480,15 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
             # 들어왔다). 공백을 다 지운 버전으로도 한 번 더 확인한다.
             if CLASS_CODE_RE.search(text.replace(" ", "")):
                 return True
+            # "(Cp(퇴직연금))"처럼 코드 뒤에 괄호가 중첩되는 문서(위
+            # CLASS_CODE_NESTED_RE 참고)는 여는 괄호가 두 번 나오고 닫는
+            # 괄호가 한 번에 다 안 붙어 있어서 위 CLASS_CODE_RE로는(공백을
+            # 지워도) 못 잡는다 - 사이에 낀 한글 설명 때문에 "괄호 안이
+            # 전부 영숫자"라는 전제가 깨짐(KR5114420027 실측: 이 탓에 Cp의
+            # 닫는 괄호 줄을 경계로 못 보고 다음 클래스(Cpe) 이름 시작까지
+            # 서로 끌고 들어왔다). 이런 줄도 중첩 코드 정규식으로 확인한다.
+            if CLASS_CODE_NESTED_RE.search(text) or CLASS_CODE_NESTED_RE.search(text.replace(" ", "")):
+                return True
             # 일부 문서(KR5125450023)는 클래스 코드가 "A(수수료선취-...오프
             # 라인)"처럼 여는 괄호가 클래스 행 자체에, 닫는 괄호만 다음 줄에
             # 따로 떨어져 나온다("오프라인)") - 이 경우 CLASS_CODE_RE(여닫는
@@ -518,9 +566,16 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
         # 시작하므로, 이미 완성된 행에서 인접 줄이 이 패턴으로 새로 시작하면
         # 다음 클래스의 것으로 보고 뺀다.
         own_class_name_complete = bool(CLASS_CODE_RE.search(class_part1))
-        CLASS_NAME_START_RE = re.compile(r"^수수료(선취|미징구|후취)")
         if own_class_name_complete:
-            if base_down and any(CLASS_NAME_START_RE.match(w["text"]) for w in base_down[0]):
+            # 글자를 한 자씩 따로 찍는 서식은 "수수료미징구"조차 "수수료미"/
+            # "징"/"구"처럼 여러 단어로 쪼개져 나와서, 단어 하나하나를 이
+            # 패턴과 비교하면(예전 방식) 매칭되는 단어가 하나도 없어 못
+            # 걸러낸다(KR5114420027 Ce 실측: 다음 클래스(C-P)의 시작
+            # "수수료미 징 구 -오 프 라인-개"가 안 걸러지고 그대로 끌려
+            # 들어왔다). 줄 전체를 이어붙인 텍스트로 비교한다(표 왼쪽 여백
+            # 캡션은 클래스명 칸보다 왼쪽(x0<70)이라 먼저 제외).
+            down_text = "".join(w["text"] for w in base_down[0] if w["x0"] >= 70) if base_down else ""
+            if down_text and CLASS_NAME_START_RE.match(down_text):
                 base_down = []
             if base_up and any(")" in w["text"] for w in base_up[0]):
                 base_up = []
@@ -539,7 +594,11 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
         j = i - 2
         extra = 0
         while up_lines and j >= 0 and extra < MAX_EXTRA_LINES and not found_napipgeum:
-            if _is_full_data_row(lines[j]) or _has_class_paren(lines[j]) or _is_header_row(lines[j]):
+            if (
+                _is_full_data_row(lines[j])
+                or _has_class_paren(lines[j])
+                or _is_header_row(lines[j])
+            ):
                 break
             if own_row_no_commission and _has_word(lines[j], "이내"):
                 break
@@ -618,6 +677,14 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
                 return "commission"
             if w["text"] in COMMISSION_MARKER_WORDS or w["text"].endswith("이내"):
                 return "commission"
+            # 글자를 한 자씩 따로 찍는 서식은 "이내"조차 "이"/"내" 두 단어로
+            # 쪼개져 나온다(KR5114420016 S클래스 실측: "0.15%이내"의 "이"/
+            # "내"가 따로 떨어진 채 x0가 클래스명 칸 쪽이라 기본값(class_name)
+            # 으로 새서 evidence에 "수수료후취-온라인슈퍼(S) 이 내"처럼 붙어
+            # 보였다). 클래스명에 "이"/"내" 한 글자짜리 단독 토큰이 나올 일은
+            # 없어 안전하게 판매수수료 쪽으로 본다.
+            if w["text"] in ("이", "내"):
+                return "commission"
             if COMMISSION_PCT_TOKEN_RE.match(w["text"]) or "%" in w["text"]:
                 # "0.30%이내"처럼 %값과 "이내"가 공백 없이 한 토큰으로 붙어
                 # 나오는 문서가 있다(KR5127420083 실측) - 클래스명 글자에는
@@ -633,8 +700,14 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
         class_name_words = []
         commission_words = []
         for wl in window_lines:
+            # "환매금액의 N%이내"류 문구가 있는 줄은 그 자체가 판매수수료
+            # 문구라 줄 전체를 판매수수료 쪽으로 묶는다 - 그래야 "3년/미/
+            # 만/환/매/시" 같은 낱글자가 기본값(class_name)으로 새서
+            # evidence 클래스명에 섞이는 걸 막는다(위 REDEMPTION_NOTE_RE
+            # 주석 참고).
+            note_line = _is_note_row(wl)
             for w in wl:
-                role = _word_role(w)
+                role = "commission" if note_line else _word_role(w)
                 if role == "class_name":
                     class_name_words.append(w["text"])
                 elif role == "commission":
@@ -764,15 +837,31 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
         # "납입금액의"를 하나의 이어붙은 문자열로 찾으면 놓친다). "납입금"이라는
         # 조각만으로도 판매수수료 문구라는 걸 충분히 특정할 수 있어 그걸로 판별한다.
         sales_commission_desc = None
-        pct_m = SALES_COMMISSION_PCT_RE.search(wide_text)
-        bunui_m = BUNUI_RE.search(wide_text)
-        if "납입금" in wide_text and pct_m:
-            sales_commission_desc = f"납입금액의 {pct_m.group(1)}%이내"
-        elif "납입금" in wide_text and bunui_m:
+        # 글자를 한 자씩 따로 찍는 서식이 있는 문서는 "100분의 0.15"의
+        # "100"조차 "10"/"0분의"처럼 서로 다른 단어로 쪼개져 나와(공백이
+        # 그 사이에 끼어) 위 두 정규식이 이어붙인 텍스트에서도 못 찾는다
+        # (KR5114420027 Ae/S 실측: 판매수수료가 실제로 있는데도
+        # sales_commission_desc가 null로 나왔다). 공백을 다 지운 버전으로
+        # 한 번 더 시도한다.
+        wide_text_nospace = wide_text.replace(" ", "")
+        pct_m = SALES_COMMISSION_PCT_RE.search(wide_text) or SALES_COMMISSION_PCT_RE.search(wide_text_nospace)
+        bunui_m = BUNUI_RE.search(wide_text) or BUNUI_RE.search(wide_text_nospace)
+        # "후취"(환매 시점에 떼는) 클래스는 기준이 "납입금액"이 아니라
+        # "환매금액"이다(위 REDEMPTION_NOTE_RE 주석 참고) - 원본 문구 그대로
+        # "환매금액의 N%이내"로 남기고, 그 외(선취/일반)는 기존대로
+        # "납입금액의 N%이내"로 남긴다.
+        commission_basis = (
+            "환매금액"
+            if "환매금액" in wide_text or "환매금액" in wide_text_nospace
+            else ("납입금액" if "납입금" in wide_text else None)
+        )
+        if commission_basis and pct_m:
+            sales_commission_desc = f"{commission_basis}의 {pct_m.group(1)}%이내"
+        elif commission_basis and bunui_m:
             # "N%" 대신 "100분의 N"(=N/100, 같은 뜻)으로 쓰는 문서가 있다
             # (KR5114420027). 위에서 이 값을 이미 총보수 등 실제 컬럼과
             # 분리해뒀으니, 여기서는 같은 뜻인 "%" 표기로 통일해서 남긴다.
-            sales_commission_desc = f"납입금액의 {bunui_m.group(1)}%이내"
+            sales_commission_desc = f"{commission_basis}의 {bunui_m.group(1)}%이내"
         elif "없음" in window_text or has_standalone_dash:
             # 원본이 "없음"이라는 글자를 쓰든 그냥 "-"만 찍든 의미는 같아서
             # ("판매수수료가 없다"는 확인된 사실), 출력은 원본에 실제로 보이는
