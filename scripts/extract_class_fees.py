@@ -947,6 +947,21 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
             "page": page_num,
             "evidence": evidence,
             "method": "coordinate_reconstruction",
+            # 주의: 이 confidence는 "이 행의 모든 필드가 다 맞다"는 뜻이
+            # 아니다 - "class_code(클래스 이름표)를 다른 클래스와 헷갈릴
+            # 위험 없이 찾았는가"만 본다(class_code를 못 찾으면 어느
+            # 클래스 것인지조차 불확실하니 0.5로, 찾았으면 1.0으로). 사용자
+            # 지적대로 "다 제대로 뽑아야 1이어야 하는 거 아니냐"는 게 맞는
+            # 말이지만, total_fee/판매수수료/클래스명 표기처럼 서로 다른
+            # 이유로 틀릴 수 있는 필드들을 하나의 숫자로 합칠 근거가 없어
+            # (이번 세션에서 고친 버그들 - sales_commission_desc null,
+            # 인접 클래스명 섞임 등 - 이 전부 class_code는 처음부터 1.0
+            # 이었던 행에서 나왔다는 게 그 증거) 이 좁은 의미로 한정해서
+            # 쓴다. "행 전체가 실제로 맞는지"는 confidence가 아니라
+            # extract_class_fees.py 실행 후 매번 돌리는 전수 이상치 검사
+            # (1y>500/1y<10/total_fee>10/distribution_fee>total_fee/
+            # total_fee_and_cost<total_fee, class_code 중복 등 - README
+            # 참고)가 실질적으로 그 역할을 한다.
             "confidence": 1.0 if class_code else 0.5,
             "_row_line_idx": i,
         })

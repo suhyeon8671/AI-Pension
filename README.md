@@ -1151,6 +1151,28 @@ N N N"을 정규식으로 바로 잡아낸, 재구성 단계 없는 깔끔한 �
 confidence는 `text_regex` 83건 → **1.0**, `coordinate_reconstruction`
 13건 → **0.75**로 최종 정리됨.
 
+**"class_code를 깔끔하게 찾았다 = 1.0"이 기준이어도 되는 거냐, 다 제대로
+뽑아야 1이어야 하는 거 아니냐는 근본적인 지적** — 맞는 말이었다. 지금
+confidence는 "이 행의 모든 필드가 다 맞다"가 아니라 **"이 행을 어떤
+클래스/어떤 상품 것인지 헷갈릴 위험이 없는가"**(class_fees는
+class_code, fund_aum은 자산총계·부채총계가 회사 재무제표가 아닌지)만
+본다. 실제로 이번 세션에서 고친 버그 대부분(sales_commission_desc가
+null이었던 것, 인접 클래스명끼리 섞였던 것, 운용전환일 전/후 값을
+놓쳤던 것 등)이 전부 **class_code는 처음부터 confidence 1.0으로 정확히
+찾혀 있던 행**에서 나왔다는 게 이 한계를 실측으로 보여준다.
+
+total_fee/판매수수료 문구/클래스명 표기/unit 판별처럼 서로 다른 이유로
+서로 다른 곳에서 틀릴 수 있는 필드들을, "확실성"이라는 하나의 숫자로
+합칠 원칙적인 근거가 없어서(가중치를 어떻게 매겨도 자의적임) 필드명이나
+값 체계를 새로 만드는 대신, **confidence가 정확히 뭘 보장하는지를
+`build_product_facts_db.py`/`extract_class_fees.py`/`extract_fund_aum.py`
+docstring·주석에 명시**하기로 했다. "행 전체가 실제로 맞는지"를 실질적으로
+담보하는 건 confidence 숫자가 아니라, 이 프로젝트 전체에서 매 수정마다
+돌려온 **전수 이상치 검사**(class_fees: 1y>500/1y<10/total_fee>10/
+distribution_fee>total_fee/total_fee_and_cost<total_fee/class_code
+중복 0건; fund_aum: 자산총계≥부채총계, 원 단위 환산 시 상식적 범위
+등)라는 점도 같이 적어뒀다.
+
 **추가: 운용역 합산 규모를 참고용으로만 저장 (`extract_manager_info.py`)**
 사용자가 위 "운용전문인력" 표를 다시 가리키며 재확인을 요청해서, 같은
 매니저가 여러 상품 문서에 등장하는 경우(KR510902511M/KR5110601022 둘 다

@@ -11,6 +11,18 @@ product_name/asset_type/risk_level/총보수/수익률처럼 "정답이 하나�
 기존 structured_store.db(표 전문검색용 tables/tables_fts)와 같은 DB 파일에
 추가한다 - 근거 문서 표시(page 등)까지 한 곳에서 조회 가능하게.
 
+confidence 필드에 대한 주의: 이 값은 "이 행의 모든 필드가 다 맞다"는
+뜻이 아니다("다 제대로 뽑았어야 1이어야 하는 거 아니냐"는 지적을 받고
+정리함). class_fees는 "class_code(클래스 이름표)를 다른 클래스와 헷갈릴
+위험 없이 찾았는가"만, fund_aum은 "자산총계/부채총계를 운용사 자체
+재무제표가 아니라 이 펀드 것으로 확신할 수 있는가"만 본다 - 그 외
+필드(총보수 숫자, 판매수수료 문구, unit 판별 등)는 서로 다른 이유로
+틀릴 수 있어 하나의 점수로 합칠 근거가 없다(실제로 이번 세션에서 고친
+버그 대부분이 class_code는 처음부터 confidence 1.0이었던 행에서
+나왔다). "행이 실제로 맞는지"는 confidence가 아니라 각 extract_*.py
+실행 후 매번 돌리는 전수 이상치 검사(1y>500/total_fee>10/class_code
+중복 등, class_fees용 - README 참고)가 실질적으로 그 역할을 한다.
+
 사용법:
     python scripts/build_product_master.py     # product_master.json 생성
     python scripts/extract_class_fees.py        # class_fees.json 생성
