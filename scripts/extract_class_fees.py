@@ -1053,6 +1053,41 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
             "confidence": 1.0 if class_code else 0.5,
             "_row_line_idx": i,
         })
+
+    # "판매수수료" 칸이 "없음" 글자 하나를 여러 클래스 행에 걸쳐 세로로
+    # 병합해서 공유하는 문서가 있다(KR5194450018 실측 - 화면 캡처로 직접
+    # 확인: C1/C-e/W/F 4개 클래스, RP/RP-e/S-P/CP/CP-e 5개 클래스가 각각
+    # "없음" 하나씩을 그룹 세로 중앙에 공유). 개별 행 위/아래 몇 줄만
+    # 보는 기존 로직은 그 그룹의 가운데 근처 행(C-e/S-P처럼 "없음"과
+    # 가까운 행)만 우연히 맞고, 그룹 양 끝 행(C1/CP-e, RP)은 놓쳐서
+    # sales_commission_desc가 null로 남았다(사용자가 "제발 제대로
+    # 해줘"라고 지적해서 화면 캡처까지 받아 직접 확인함 - class_returns의
+    # 병합 셀 설정일 처리와 같은 종류의 문제). 아직 못 찾은 행에 대해,
+    # 그 행과 "없음" 토큰 사이에 이미 다른 진짜 문구("납입금액의..."/
+    # "환매금액의..." 등 - "-"로 확정된 행은 같은 그룹일 수 있어 경계로
+    # 안 본다)로 확정된 다른 행이 끼어있지 않은 가장 가까운 "없음"을
+    # 찾아 같은 병합 셀로 보고 채운다.
+    unresolved = [r for r in rows if r.get("sales_commission_desc") is None]
+    if unresolved:
+        none_word_lines = [
+            idx for idx, l in enumerate(lines) if any(w["text"] == "없음" for w in l)
+        ]
+        real_phrase_positions = [
+            r["_row_line_idx"] for r in rows
+            if r.get("sales_commission_desc") not in (None, "-")
+        ]
+        for r in unresolved:
+            ri = r["_row_line_idx"]
+            best = None
+            for ni in none_word_lines:
+                lo, hi = min(ri, ni), max(ri, ni)
+                if any(lo < p < hi for p in real_phrase_positions):
+                    continue
+                if best is None or abs(ni - ri) < abs(best - ri):
+                    best = ni
+            if best is not None:
+                r["sales_commission_desc"] = "-"
+
     for r in rows:
         r.pop("_row_line_idx", None)
     return rows
