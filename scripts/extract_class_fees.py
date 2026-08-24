@@ -60,9 +60,14 @@ CLASS_CODE_NESTED_RE = re.compile(r"\(([A-Za-z0-9\-]{1,8})\(")
 # "운용전환일"이 고정된 캘린더 날짜가 아니라 목표기준가격 도달 같은 조건이
 # 충족돼야 발생하는 문서가 있다(KR5147430065 실측: "목표전환형" 펀드 -
 # "목표기준가격(종류A 누적기준가격 1,060원 이상)에 도달한 이후 운용전환").
-# total_fee_after_conversion 등 필드만 보면 "후"가 언제/왜인지 알 수 없다는
-# 지적을 받아, 그 조건 문구를 찾아 같이 남긴다.
-CONVERSION_TRIGGER_RE = re.compile(r"목표기준가격\(([^)]*)\)")
+# total_fee_after_conversion 등 필드만 보면 "후"가 언제/왜인지 알 수 없다.
+# 처음엔 이 조건을 문장으로 풀어서 conversion_note에 남겼는데, 이 파일의
+# 다른 모든 필드가 원본에서 그대로 뽑은 값(숫자/코드)이지 해석문이 아닌
+# 것과 성격이 달라서("답을 미리 써주는" 꼴이 될 위험 - 사용자 지적)
+# 숫자만 구조화된 필드로 남기기로 바꿨다. 의미(= 목표가격 도달 시 전환)는
+# 필드 이름과 이 주석/README에 문서화해두고, 실제 문장으로 풀어 답하는 건
+# 나중에 에이전트 규칙을 만들 때 다룬다.
+CONVERSION_TRIGGER_RE = re.compile(r"목표기준가격\([^)]*?([\d,]+)\s*원\s*이상\)")
 # 판매수수료 칸은 숫자가 아니라 정형화된 문구("없음" 또는 "납입금액의 N%[ ]이내")인데,
 # "납입금액의"와 "N%이내"가 셀 줄바꿈 때문에 서로 다른 줄(그 사이에 다른 칸 텍스트가
 # 끼어든 상태)로 떨어져 있는 경우가 많아 하나의 정규식으로는 못 잡는다. "이내"까지
@@ -753,10 +758,14 @@ def candidate_pages_for_doc(doc_id, max_page):
     return sorted(pages)
 
 
-def conversion_trigger_note(doc_id):
-    """total_fee_after_conversion 등이 채워진 행에, "운용전환일"이 실제로
-    무엇 때문에 발생하는지(고정 날짜가 아니라 조건부일 수 있음) 원문에서
-    찾아 짧은 설명으로 남긴다. 못 찾으면(고정 날짜인 일반적인 경우) None."""
+def conversion_trigger_nav_price(doc_id):
+    """total_fee_after_conversion 등이 채워진 행이 있는 문서에서, "운용전환일"이
+    고정 날짜가 아니라 이 펀드 자신의 기준가격이 특정 값 이상 오르면 발생하는
+    조건부 전환인 경우(목표전환형 펀드), 그 목표 기준가격(원) 숫자만 뽑는다.
+    문장으로 풀어 쓰지 않는 이유: 이 파일의 다른 모든 필드는 원본에서 그대로
+    뽑은 값이지 해석문이 아니다 - 숫자만 남기고 의미(목표가 도달 시 전환)는
+    필드 이름과 README에 문서화한다. 못 찾으면(고정 날짜인 일반적인 경우
+    - 이 필드 자체가 만들어지는 문서는 지금 KR5147430065 하나뿐) None."""
     fp = os.path.join(EXTRACTED_DIR, f"{doc_id}_text.json")
     if not os.path.exists(fp):
         return None
@@ -766,11 +775,10 @@ def conversion_trigger_note(doc_id):
     m = CONVERSION_TRIGGER_RE.search(full_text)
     if not m:
         return None
-    condition = re.sub(r"\s+", " ", m.group(1)).strip()
-    return (
-        f"운용전환일은 고정된 날짜가 아니라 목표기준가격({condition}) 도달 시 "
-        "발생하는 조건부 전환일 - total_fee_after_conversion 등은 전환 이후 적용 예정인 수수료."
-    )
+    try:
+        return int(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
 
 
 def process_doc(doc_id):
@@ -851,13 +859,15 @@ def process_doc(doc_id):
         if key not in dedup or r["confidence"] > dedup[key]["confidence"]:
             dedup[key] = r
     final_rows = list(dedup.values()) + unlabeled
-    # total_fee_after_conversion이 있는 행에만 conversion_note 키를 붙인다
-    # (없는 행은 키 자체를 안 만듦 - 위 참고).
+    # total_fee_after_conversion이 있는 행에만 conversion_trigger_nav_price
+    # 키를 붙인다(없는 행은 키 자체를 안 만듦 - 위 참고). 이 펀드 자신의
+    # 기준가격이 이 값(원) 이상이 되면 운용전환이 일어난다는 뜻 - 고정
+    # 날짜가 아니다.
     if any("total_fee_after_conversion" in r for r in final_rows):
-        note = conversion_trigger_note(doc_id)
+        nav_price = conversion_trigger_nav_price(doc_id)
         for r in final_rows:
             if "total_fee_after_conversion" in r:
-                r["conversion_note"] = note
+                r["conversion_trigger_nav_price"] = nav_price
     return final_rows
 
 
