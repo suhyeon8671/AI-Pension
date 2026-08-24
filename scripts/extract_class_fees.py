@@ -585,6 +585,18 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
                     class_code = m3.group(1)
                     break
 
+        if class_code is None:
+            # 괄호로 감싼 클래스 코드 자체가 원본에 없는 문서도 있다
+            # (KR5123365001 실측: 클래스가 애초에 하나뿐이라 "(A)" 같은
+            # 코드 없이 "투자신탁"이라는 라벨 하나만 있음). 이럴 땐 코드를
+            # 추측해서 지어내는 대신, 이 행 자신의 줄에 실제로 적힌 라벨
+            # 글자(판매수수료 칸의 "없음"은 제외)를 그대로 클래스 이름으로
+            # 쓴다 - 없는 값을 만들어내는 것보다 원본에 있는 걸 그대로
+            # 옮기는 쪽이 "틀린 값 < 없는 값" 원칙에 맞다.
+            label_words = [w["text"] for w in pre_text_words if w["text"] != "없음"]
+            if label_words:
+                class_code = " ".join(label_words)
+
         # "납입금액의"가 3줄로 쪼개지는 경우도 있다("납입금" / 데이터 줄에 낀
         # "액의 1%" / "이내" - 사이에 클래스명 등 다른 텍스트가 끼어 있어서
         # "납입금액의"를 하나의 이어붙은 문자열로 찾으면 놓친다). "납입금"이라는
