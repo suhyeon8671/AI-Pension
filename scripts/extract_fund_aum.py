@@ -237,6 +237,7 @@ def extract_fund_aum_coordinates(doc_id):
             line_norms = [re.sub(r"\s+", "", " ".join(w["text"] for w in line)) for line in lines]
 
             asset_vals = liab_vals = unit = None
+            operating_asset_line_text = None
             seen_balance_sheet_heading = False
             for i, (line, norm) in enumerate(zip(lines, line_norms)):
                 if "재무상태표" in norm or "요약재무정보" in norm:
@@ -264,7 +265,8 @@ def extract_fund_aum_coordinates(doc_id):
                     # 자본금 어디서 찾은거야"라고 지적해서 발견, text_regex
                     # 경로는 먼저 고쳤는데 이 좌표 폴백 경로엔 같은 문제가
                     # 그대로 남아 있었다).
-                    nearby = "".join(line_norms[max(0, i - 15):min(len(line_norms), i + 15)])
+                    lo, hi = max(0, i - 15), min(len(line_norms), i + 15)
+                    nearby = "".join(line_norms[lo:hi])
                     if not OPERATING_ASSET_RE.search(nearby):
                         continue
                     if "유동자산" in nearby or "고정자산" in nearby:
@@ -272,6 +274,18 @@ def extract_fund_aum_coordinates(doc_id):
                     nums = _merge_number_fragments(line)
                     if nums:
                         asset_vals = nums
+                        # evidence에 "운용자산"이 실제로 근처에 있다는 걸
+                        # 사람이 눈으로도 바로 확인할 수 있게, 그 줄의
+                        # 원문을 같이 남긴다(사용자가 "회사 관련은 다 뺀거지?
+                        # 내가 확인할때 어떤거 봐야 하는지" 물어서 - 이전엔
+                        # "자산총계 .../부채총계 ..."만 보여줘서 운용자산이
+                        # 실제로 걸렸는지 evidence만 보고는 알 수 없었다).
+                        op_idx = next(
+                            (k for k in range(lo, hi) if OPERATING_ASSET_RE.search(line_norms[k])),
+                            None,
+                        )
+                        if op_idx is not None:
+                            operating_asset_line_text = " ".join(w["text"] for w in lines[op_idx])
                 elif norm.startswith("부채총계") and liab_vals is None:
                     nums = _merge_number_fragments(line)
                     if nums:
@@ -286,6 +300,9 @@ def extract_fund_aum_coordinates(doc_id):
                 continue
             net_vals = [asset_nums[i] - liab_nums[i] for i in range(n)]
 
+            evidence_parts = [f"자산총계 {' '.join(asset_vals)}", f"부채총계 {' '.join(liab_vals)}"]
+            if operating_asset_line_text:
+                evidence_parts.insert(0, operating_asset_line_text)
             return {
                 "product_code": doc_id,
                 "unit": unit or "원",
@@ -294,7 +311,7 @@ def extract_fund_aum_coordinates(doc_id):
                 "net_asset_total": net_vals,
                 "net_asset_latest": net_vals[0],
                 "page": page_num,
-                "evidence": f"자산총계 {' '.join(asset_vals)} / 부채총계 {' '.join(liab_vals)}",
+                "evidence": " / ".join(evidence_parts),
                 "method": "coordinate_reconstruction",
                 "confidence": 0.8,
             }
