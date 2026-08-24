@@ -51,6 +51,12 @@ CLASS_CODE_RE = re.compile(r"\(([A-Za-z0-9\-]{1,8})\)")
 # 앞에 붙어 나오는 문서가 있다(괄호 안은 클래스 코드가 아니라 상품유형
 # 설명 - KR5125450023/KR5125450070 실측).
 CLASS_CODE_PREFIX_RE = re.compile(r"^([A-Za-z]{1,3})\(")
+# "(Cp(퇴직연금))"처럼 클래스 코드 뒤에 괄호가 또 하나 중첩돼 부가설명이
+# 따라붙는 문서도 있다(코드 자체는 "Cp"/"Cpe"처럼 하이픈 없는 표기 -
+# KR5114420027 실측, 원본 표를 사용자가 직접 캡처해서 확인함: 글자가
+# 깨진 게 아니라 원래 이렇게 이중 괄호로 표기됨). 여는 괄호 바로 다음에
+# 또 여는 괄호가 오면(닫는 괄호 대신) 그 사이를 코드로 본다.
+CLASS_CODE_NESTED_RE = re.compile(r"\(([A-Za-z0-9\-]{1,8})\(")
 # 판매수수료 칸은 숫자가 아니라 정형화된 문구("없음" 또는 "납입금액의 N%[ ]이내")인데,
 # "납입금액의"와 "N%이내"가 셀 줄바꿈 때문에 서로 다른 줄(그 사이에 다른 칸 텍스트가
 # 끼어든 상태)로 떨어져 있는 경우가 많아 하나의 정규식으로는 못 잡는다. "이내"까지
@@ -534,6 +540,11 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
             # 안 걸림) - "없음"을 먼저 빼고 공백을 지운다.
             cleaned = re.sub(r"\s+", "", text.replace("없음", " "))
             m = CLASS_CODE_RE.search(cleaned)
+            if m:
+                return m.group(1)
+            # "(Cp(퇴직연금))"처럼 코드 뒤에 괄호가 중첩되는 경우(위
+            # CLASS_CODE_NESTED_RE 참고).
+            m = CLASS_CODE_NESTED_RE.search(cleaned)
             return m.group(1) if m else None
 
         # 여는 괄호와 닫는 괄호가 서로 다른 줄에 떨어져 있는 경우도 있다
