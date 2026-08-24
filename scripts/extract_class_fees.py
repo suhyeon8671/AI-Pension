@@ -68,6 +68,11 @@ CLASS_CODE_NESTED_RE = re.compile(r"\(([A-Za-z0-9\-]{1,8})\(")
 # 필드 이름과 이 주석/README에 문서화해두고, 실제 문장으로 풀어 답하는 건
 # 나중에 에이전트 규칙을 만들 때 다룬다.
 CONVERSION_TRIGGER_RE = re.compile(r"목표기준가격\([^)]*?([\d,]+)\s*원\s*이상\)")
+# "운용전환일 전/후로 수수료가 나뉜다"는 표는 "구분" 칸에 "최초설정일부터
+# 운용전환일 전일까지"/"운용전환일부터 해지일까지"라는 문구를 직접 적어
+# 둔다(KR5147430065 실측) - 숫자 개수·줄 간격만으로 추측하지 않고 이
+# 문구가 실제로 근처에 있는지로 확인한다.
+PERIOD_LABEL_RE = re.compile(r"최초설정일|운용전환일|해지일")
 # 판매수수료 칸은 숫자가 아니라 정형화된 문구("없음" 또는 "납입금액의 N%[ ]이내")인데,
 # "납입금액의"와 "N%이내"가 셀 줄바꿈 때문에 서로 다른 줄(그 사이에 다른 칸 텍스트가
 # 끼어든 상태)로 떨어져 있는 경우가 많아 하나의 정규식으로는 못 잡는다. "이내"까지
@@ -153,6 +158,17 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
     lines = cluster_lines(words)
     cost_years = cost_years or ["1y", "2y", "3y", "5y", "10y"]
 
+    def _nearby_has_period_label(center, span=3):
+        # "% 있는데 정수가 근처에 없는 줄"이 정말 "운용전환일 전/후 기간
+        # 구분" 표 때문인지, 그냥 숫자 개수/줄 간격만으로 추측하지 않고
+        # "구분" 칸에 실제로 적히는 문구("최초설정일"/"운용전환일"/
+        # "해지일")가 근처에 있는지로 확인한다(사용자 지적: 표지 없이
+        # 순전히 개수·간격만 보면 다른 문서에서 우연히 오탐할 위험이 있음
+        # - 이 라벨 문구가 있으면 그 위험이 사실상 없어진다).
+        lo, hi = max(0, center - span), min(len(lines), center + span + 1)
+        nearby = "".join(w["text"] for k in range(lo, hi) for w in lines[k])
+        return bool(PERIOD_LABEL_RE.search(nearby))
+
     rows = []
     for i, line in enumerate(lines):
         # decimals를 NUM_RE로 거른 뒤 다시 추리면 "1.18%"처럼 %가 붙은 토큰이
@@ -169,7 +185,7 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
         # 241"). 이 줄 자체엔 정수가 모자라면(소수는 있는데) 바로 아래
         # 몇 줄 안에서 소수 없이 정수만 있는 줄을 찾아 빌려온다 - 그런
         # 줄이 없으면(대부분의 다른 문서) 원래대로 아무 효과 없다.
-        if decimals and len(int_like) < 3:
+        if decimals and len(int_like) < 3 and _nearby_has_period_label(i):
             for k in range(i + 1, min(i + 4, len(lines))):
                 cand_line = lines[k]
                 if any(DECIMAL_RE.match(w["text"]) for w in cand_line):
@@ -281,7 +297,11 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
             # 공유됨). 이 값도 버리지 말고 바로 앞에서 찾은 행(같은 클래스의
             # 전환 전 값)에 "전환 후" 값으로 덧붙인다 - 페이지 안에서 아주
             # 가까운 줄에 있을 때만(다른 클래스와 헷갈릴 위험 방지).
-            if len(decimals) == 4 and rows and (i - rows[-1].get("_row_line_idx", -99)) <= 8:
+            if (
+                len(decimals) == 4 and rows
+                and (i - rows[-1].get("_row_line_idx", -99)) <= 8
+                and _nearby_has_period_label(i)
+            ):
                 rows[-1]["total_fee_after_conversion"] = decimals[0]["text"].rstrip("%")
                 rows[-1]["distribution_fee_after_conversion"] = decimals[1]["text"].rstrip("%")
                 rows[-1]["peer_avg_fee_after_conversion"] = decimals[2]["text"].rstrip("%")
