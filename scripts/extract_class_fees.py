@@ -559,7 +559,7 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
         if own_row_no_commission:
             if base_up and _has_word(base_up[0], "이내"):
                 base_up = []
-            if base_down and _has_word(base_down[0], "납입금"):
+            if base_down and _has_word(base_down[0], "납입"):
                 base_down = []
 
         # 이 행 자신의 줄(class_part1)에 이미 괄호 닫힌 클래스 코드가 완전히
@@ -604,7 +604,7 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
             own_commission_already_on_line = bool(
                 SALES_COMMISSION_PCT_RE.search(class_part1)
                 or BUNUI_RE.search(class_part1)
-                or "납입금" in class_part1
+                or "납입" in class_part1
                 or "환매금액" in class_part1
             )
             if base_down and _is_note_row(base_down[0]) and own_commission_already_on_line:
@@ -622,7 +622,7 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
         # 없다고 이미 확인됐으니 그건 무조건 다른(이웃) 클래스의 판매수수료
         # 문구 잔재다 - 포함하지 않고 그 자리에서 멈춘다.
         up_lines = list(base_up)
-        found_napipgeum = any(_has_word(wl, "납입금") for wl in up_lines)
+        found_napipgeum = any(_has_word(wl, "납입") for wl in up_lines)
         j = i - 2
         extra = 0
         while up_lines and j >= 0 and extra < MAX_EXTRA_LINES and not found_napipgeum:
@@ -635,13 +635,25 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
             if own_row_no_commission and _has_word(lines[j], "이내"):
                 break
             up_lines.insert(0, lines[j])
-            found_napipgeum = _has_word(lines[j], "납입금")
+            found_napipgeum = _has_word(lines[j], "납입")
             extra += 1
             j -= 1
 
         down_lines = list(base_down)
         found_ianae = any(_has_word(wl, "이내") for wl in down_lines)
         stop_down = down_lines and _has_class_paren(down_lines[0])
+        # 닫는 괄호가 있는 줄을 만나면 보통 "클래스명이 끝났다"는 뜻으로
+        # 보고 거기서 멈추는데, 판매수수료 %가 그 닫는 괄호 줄보다도 더
+        # 아래에 떨어져 나오는 문서가 있다(KR5185450009 실측: "...
+        # 오프라인(A1)" 다음 줄에 "1.0%이내"가 옴 - "%"/"이내"가 있는데도
+        # 그 앞줄에 이미 클래스 코드 괄호가 있다는 이유로 못 보고
+        # 지나쳤다). 닫는 괄호를 봤어도 바로 다음 줄이 "이내"나 %값처럼
+        # 보이면 아직 판매수수료 문구가 이어지는 것으로 보고 한 줄은 더
+        # 열어준다.
+        if stop_down and (i + 2) < len(lines):
+            peek_text = "".join(w["text"] for w in lines[i + 2])
+            if "이내" in peek_text or SALES_COMMISSION_PCT_RE.search(peek_text) or BUNUI_RE.search(peek_text):
+                stop_down = False
         j = i + 2
         extra = 0
         while (
@@ -650,7 +662,7 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
         ):
             if _is_full_data_row(lines[j]) or _is_header_row(lines[j]):
                 break
-            if own_row_no_commission and _has_word(lines[j], "납입금"):
+            if own_row_no_commission and _has_word(lines[j], "납입"):
                 break
             down_lines.append(lines[j])
             found_ianae = _has_word(lines[j], "이내")
@@ -669,8 +681,14 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
         # 명이 없는 행(예: 대시만 있는 행)에서 다음 줄의 진짜 클래스명까지
         # 잘라내는 부작용이 있었다(C1 실측) - 그래서 문서 전체에서 일관되게
         # 관찰된 절대 좌표 기준(70pt)으로 고정한다.
+        # 이 캡션의 x0가 문서마다 달라(대부분 27.8 근처인데 KR5185450009는
+        # 74.4로 70pt 기준을 살짝 넘어서 안 걸러졌다 - "수수료선취-
+        # 온라인(A-e) 투자비용"처럼 클래스명 뒤에 캡션이 그대로 붙어
+        # 보였다) 절대좌표만으로는 모든 문서를 다 못 잡는다. "투자비용"은
+        # 이 세로 캡션에서만 쓰는 고정 라벨이라(클래스명엔 나올 일이
+        # 없음) 좌표와 무관하게 글자 자체로도 걸러낸다.
         def _strip_stray_caption(wl):
-            return [w for w in wl if w["x0"] >= 70]
+            return [w for w in wl if w["x0"] >= 70 and w["text"] != "투자비용"]
 
         window_lines = [_strip_stray_caption(wl) for wl in (up_lines + [line] + down_lines)]
         window_lines = [wl for wl in window_lines if wl]
@@ -702,10 +720,15 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
                 return "period"
             # "납입금"/"납입금액"처럼 뒤에 "액"이 붙거나 안 붙거나 하는
             # 표기가 문서마다 달라서(KR5123490017 실측: "납입금액"이 한
-            # 토큰) 부분 일치로 잡는다. "액의"/"금액의"처럼 "...의"로 끝나는
-            # 조각도 마찬가지로 "납입금액의"가 쪼개진 조각이라 접미사로 잡는다
-            # (클래스명은 이런 조사로 끝나지 않아 오탐 위험이 낮다).
-            if "납입금" in w["text"] or w["text"].endswith("의"):
+            # 토큰) 부분 일치로 잡는다. "납입금"조차 "납입"/"금"으로 다시
+            # 쪼개져 나오는 문서도 있어(KR5185450009 실측: "납입"이 데이터
+            # 줄 2줄 위에 단독으로 떨어져 있는데, 이 2글자만으론 "납입금"
+            # 부분일치에도 안 걸려 기본값(class_name)으로 샜다) "납입"까지만
+            # 봐도 충분히 특정된다(클래스명에 이 글자가 나올 일이 없음).
+            # "액의"/"금액의"처럼 "...의"로 끝나는 조각도 마찬가지로
+            # "납입금액의"가 쪼개진 조각이라 접미사로 잡는다(클래스명은 이런
+            # 조사로 끝나지 않아 오탐 위험이 낮다).
+            if "납입" in w["text"] or w["text"].endswith("의"):
                 return "commission"
             if w["text"] in COMMISSION_MARKER_WORDS or w["text"].endswith("이내"):
                 return "commission"
@@ -882,10 +905,13 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
         # "환매금액"이다(위 REDEMPTION_NOTE_RE 주석 참고) - 원본 문구 그대로
         # "환매금액의 N%이내"로 남기고, 그 외(선취/일반)는 기존대로
         # "납입금액의 N%이내"로 남긴다.
+        # "납입금액"이 "납입"/"금액의"로 쪼개져 나오는 문서도 있다(위
+        # _word_role의 "납입" 주석 참고, KR5185450009 실측) - "납입금"
+        # 대신 "납입"까지만 봐야 그런 경우도 잡힌다.
         commission_basis = (
             "환매금액"
             if "환매금액" in wide_text or "환매금액" in wide_text_nospace
-            else ("납입금액" if "납입금" in wide_text else None)
+            else ("납입금액" if "납입" in wide_text else None)
         )
         # "환매금액"을 기준으로 쓰는 후취형은 거의 항상 "OO년 미만 환매시"
         # 조건이 같이 붙어 있다(위 REDEMPTION_CONDITION_RE 주석 참고) -
