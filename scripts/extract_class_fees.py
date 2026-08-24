@@ -263,6 +263,18 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
         elif len(decimals) < 2:
             continue
         if len(int_like) < min(4, len(cost_years)):
+            # "운용전환일" 전/후로 수수료가 바뀌는 문서(위 참고, KR5147430065)는
+            # 전환 후 시기도 소수(%) 4개는 멀쩡히 있는데 비용예시 정수가
+            # 원본 자체에 없다(사용자가 원본 표를 캡처해서 확인 - 전환
+            # 후 줄엔 정말 %만 있고 1/2/3년 비용예시는 전환 전 줄 것 하나만
+            # 공유됨). 이 값도 버리지 말고 바로 앞에서 찾은 행(같은 클래스의
+            # 전환 전 값)에 "전환 후" 값으로 덧붙인다 - 페이지 안에서 아주
+            # 가까운 줄에 있을 때만(다른 클래스와 헷갈릴 위험 방지).
+            if len(decimals) == 4 and rows and (i - rows[-1].get("_row_line_idx", -99)) <= 8:
+                rows[-1]["total_fee_after_conversion"] = decimals[0]["text"].rstrip("%")
+                rows[-1]["distribution_fee_after_conversion"] = decimals[1]["text"].rstrip("%")
+                rows[-1]["peer_avg_fee_after_conversion"] = decimals[2]["text"].rstrip("%")
+                rows[-1]["total_fee_and_cost_after_conversion"] = decimals[3]["text"].rstrip("%")
             continue
 
         # 운용전문인력(운용역) 표 행이 같은 블록에 섞여 있을 수 있다 - 생년
@@ -693,11 +705,22 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
             "peer_avg_fee": peer_avg_fee_text,
             "total_fee_and_cost": total_fee_and_cost["text"].rstrip("%") if total_fee_and_cost else None,
             "cost_projection_per_10m": cost_projection,
+            # "운용전환일" 전/후로 수수료가 바뀌는 문서에서만 채워진다(위
+            # 참고, KR5147430065) - 그 외 문서는 항상 null. total_fee 등
+            # 위쪽 필드는 전환 "전"(현재 적용 중인) 값이고, 이 필드들은
+            # 전환 이후 예정된 값이다.
+            "total_fee_after_conversion": None,
+            "distribution_fee_after_conversion": None,
+            "peer_avg_fee_after_conversion": None,
+            "total_fee_and_cost_after_conversion": None,
             "page": page_num,
             "evidence": evidence,
             "method": "coordinate_reconstruction",
             "confidence": 1.0 if class_code else 0.5,
+            "_row_line_idx": i,
         })
+    for r in rows:
+        r.pop("_row_line_idx", None)
     return rows
 
 
