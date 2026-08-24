@@ -118,9 +118,29 @@ def page_has_cost_column_header(words, lines):
     return any(HAS_COST_COLUMN_RE.search(w["text"]) for w in header_words)
 
 
-def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=None):
+def page_cost_projection_years(words, lines):
+    """비용예시가 보통 5개년(1/2/3/5/10년)인데, 기간별로 수수료율이 바뀌는
+    문서(운용전환일 전/후로 수수료가 달라지는 구조 - KR5147430065 실측)는
+    3개년(1/2/3년)뿐인 경우가 있다. 헤더에서 "5년"이 있는지로 판별한다
+    (위 has_cost_column과 같은 이유로 첫 데이터 행보다 위쪽에서만 찾는다)."""
+    first_data_top = None
+    for line in lines:
+        if sum(1 for w in line if DECIMAL_RE.match(w["text"])) >= 3:
+            first_data_top = line[0]["top"]
+            break
+    header_words = words if first_data_top is None else [w for w in words if w["top"] < first_data_top]
+    header_text = "".join(w["text"] for w in header_words)
+    if "5년" in header_text:
+        return ["1y", "2y", "3y", "5y", "10y"]
+    if "3년" in header_text:
+        return ["1y", "2y", "3y"]
+    return None
+
+
+def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=None, cost_years=None):
     words = page.extract_words(x_tolerance=2, keep_blank_chars=False)
     lines = cluster_lines(words)
+    cost_years = cost_years or ["1y", "2y", "3y", "5y", "10y"]
 
     rows = []
     for i, line in enumerate(lines):
@@ -129,6 +149,24 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
         # 따로 찾는다.
         decimals = [w for w in line if DECIMAL_RE.match(w["text"])]
         int_like = [w for w in line if NUM_RE.match(w["text"]) and w not in decimals]
+
+        # 수수료 %(소수)와 비용예시 정수가 아예 다른 줄(y좌표)에 떨어져
+        # 있는 문서가 있다(KR5147430065 실측: "운용전환일" 전/후로 클래스당
+        # 수수료가 두 번 나오는 구조인데, 첫 번째 시기 줄엔 %만 있고, 그
+        # 2줄 아래 별도 줄에 정수만 있음 - "최초설정일부"/"터 운용전환일
+        # 0.443% ... 0.443%"/"수수료선취- 납입금액의"/"전일까지 145 192
+        # 241"). 이 줄 자체엔 정수가 모자라면(소수는 있는데) 바로 아래
+        # 몇 줄 안에서 소수 없이 정수만 있는 줄을 찾아 빌려온다 - 그런
+        # 줄이 없으면(대부분의 다른 문서) 원래대로 아무 효과 없다.
+        if decimals and len(int_like) < 3:
+            for k in range(i + 1, min(i + 4, len(lines))):
+                cand_line = lines[k]
+                if any(DECIMAL_RE.match(w["text"]) for w in cand_line):
+                    break
+                cand_nums = [w for w in cand_line if NUM_RE.match(w["text"])]
+                if len(cand_nums) >= 3:
+                    int_like = cand_nums
+                    break
 
         # 판매수수료("납입금액의 N%이내") 문구의 퍼센트 숫자가 데이터 줄
         # 자체에 얹혀 나오는 서식이 있다(KR5123490013 등: "의 0.8% 0.845
@@ -224,7 +262,7 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
                 continue
         elif len(decimals) < 2:
             continue
-        if len(int_like) < 4:
+        if len(int_like) < min(4, len(cost_years)):
             continue
 
         # 운용전문인력(운용역) 표 행이 같은 블록에 섞여 있을 수 있다 - 생년
@@ -272,7 +310,6 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
                 if w["text"] == "-" and distribution_fee["x1"] < w["x0"] < total_fee_and_cost["x0"]
             ]
             peer_avg_fee = "-" if dash_between else None
-        cost_years = ["1y", "2y", "3y", "5y", "10y"]
         cost_projection = {
             y: int_like[idx]["text"] for idx, y in enumerate(cost_years) if idx < len(int_like)
         }
@@ -717,6 +754,17 @@ def process_doc(doc_id):
         has_cost_column = any(
             page_has_cost_column_header(w, l) for w, l in page_words_lines.values()
         )
+        # 비용예시가 3개년뿐인 문서(위 page_cost_projection_years 참고)도
+        # 같은 이유로 문서 전체 후보 페이지를 같이 본다. 문서 안에 5개년
+        # 표(정상)와 3개년 표(운용전환일 전/후 등)가 섞여 있을 수 있어,
+        # 5개년이 하나라도 보이면 그쪽을 우선한다(더 안전한 기본값).
+        detected_years = [page_cost_projection_years(w, l) for w, l in page_words_lines.values()]
+        if any(y == ["1y", "2y", "3y", "5y", "10y"] for y in detected_years):
+            doc_cost_years = ["1y", "2y", "3y", "5y", "10y"]
+        elif any(y == ["1y", "2y", "3y"] for y in detected_years):
+            doc_cost_years = ["1y", "2y", "3y"]
+        else:
+            doc_cost_years = None
 
         for page_num, page in valid_pages:
             next_page_lines = page_words_lines.get(page_num + 1)
@@ -733,7 +781,9 @@ def process_doc(doc_id):
                 next_page_head_lines = head
             else:
                 next_page_head_lines = None
-            rows = find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines)
+            rows = find_fee_rows_on_page(
+                page, page_num, has_cost_column, next_page_head_lines, doc_cost_years
+            )
             for r in rows:
                 r["product_code"] = doc_id
                 results.append(r)
