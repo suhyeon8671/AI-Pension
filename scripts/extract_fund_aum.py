@@ -190,7 +190,16 @@ def extract_fund_aum(doc_id):
         "page": page,
         "evidence": evidence,
         "method": "text_regex",
-        "confidence": 0.8,
+        # 캐시된 텍스트에서 "자산총계 N N N"을 정규식으로 바로 잡아낸
+        # 경로라 재구성 단계가 따로 없다 - 아래 좌표 폴백(글자 간격이
+        # 벌어진 라벨을 좌표로 다시 붙이고, 숫자 조각도 간격 임계값으로
+        # 병합하는 휴리스틱을 거침)보다 오차 요인이 적어 confidence를
+        # 더 높게 둔다. 이전엔 두 경로 다 0.8로 고정해뒀는데, 실제
+        # 확실성 차이를 반영 못 하는 값이라는 지적(사용자: "fund에서
+        # confidence가 0.8인거 있는데 그러면 안 되는거 아녀?")을 받고
+        # class_fees/class_returns처럼(찾은 근거의 확실성에 따라 값이
+        # 갈리도록) 방식을 통일했다.
+        "confidence": 0.9,
     }
 
 
@@ -313,7 +322,12 @@ def extract_fund_aum_coordinates(doc_id):
                 "page": page_num,
                 "evidence": " / ".join(evidence_parts),
                 "method": "coordinate_reconstruction",
-                "confidence": 0.8,
+                # text_regex 경로보다 낮게 둔다 - 이 경로는 글자 간격이
+                # 벌어진 라벨을 좌표로 다시 붙이고, 숫자도 토큰 사이 간격
+                # (`_merge_number_fragments`의 3pt 임계값)으로 조각을
+                # 합칠지 말지 휴리스틱으로 판단하는 재구성 단계를 거쳐서,
+                # 그 자체가 정규식 직접 매치보다 오차 여지가 더 있다.
+                "confidence": 0.75,
             }
     return None
 
