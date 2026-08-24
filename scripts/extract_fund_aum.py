@@ -55,6 +55,14 @@ LIAB_TOTAL_RE = re.compile(rf"부채총계\s*({NUM_OR_DASH}(?:\s+{NUM_OR_DASH}){
 # 이 값을 우선 채택한다.
 CAP_TOTAL_RE = re.compile(rf"자본총계\s*({NUM_OR_DASH}(?:\s+{NUM_OR_DASH}){{0,2}})")
 UNIT_RE = re.compile(r"단위\s*[:：]\s*(백만원|천원|원)")
+# 펀드 재무상태표에서 "자산총계"와 "운용자산"의 상대 위치가 문서마다
+# 다르다 - 어떤 문서는 "운용자산"이 세부항목 첫 줄로 "자산총계"보다
+# *먼저*(KR510902511M: 운용자산/증권/.../자산총계), 어떤 문서는 "자산총계"가
+# 소계로 먼저 나오고 "운용자산"이 그 바로 *다음* 줄에 온다(KR5114420027:
+# 자산총계/운용자산/증권/...). 한쪽 방향만 보면 절반의 문서를 놓친다.
+# "운용자산규모"(전혀 다른 섹션 제목 - 운용사 자체 재무제표 뒤에 붙는
+# "라. 운용자산규모")는 제외해야 하므로 부정형 전방탐색을 둔다.
+OPERATING_ASSET_RE = re.compile(r"운용자산(?!규모)")
 
 
 def to_num(token):
@@ -73,15 +81,31 @@ def find_fund_balance_sheet(doc_id):
 
     for p in pages:
         t = p.get("text", "")
-        if "운용자산" not in t or "자산총계" not in t:
-            continue
-        idx = t.find("자산총계")
-        window_before = t[max(0, idx - 400):idx]
-        # 운용사 자체 법인 재무제표(제4부)는 "유동자산/고정자산" 같은 일반
-        # 기업회계 용어를 쓴다 - 펀드 재무상태표가 아니므로 제외.
-        if "유동자산" in window_before or "고정자산" in window_before:
-            continue
-        return p.get("page"), t
+        # "자산총계"가 한 페이지에 여러 번 나올 수 있다(운용사 자체
+        # 재무제표 + 펀드 재무상태표가 같은 페이지에 같이 있는 문서도
+        # 있음) - 첫 번째 등장만 보면 그게 운용사 것일 때 펀드 것을
+        # 영영 못 본다. 등장할 때마다 각각 확인한다.
+        for m in re.finditer("자산총계", t):
+            idx = m.start()
+            # "운용자산"과 "자산총계"의 순서가 문서마다 다르다(아래
+            # OPERATING_ASSET_RE 주석 참고) - 앞뒤 양쪽을 다 본다.
+            window_around = t[max(0, idx - 400):idx + 400]
+            # 진짜 펀드 재무상태표는 "운용자산"이 자산총계 바로 앞/뒤 몇 줄
+            # 안에 항목으로 찍혀 있다. 이전엔 "운용자산"이 페이지 어딘가에만
+            # 있으면 통과시켰는데, 운용사 자체 재무제표 밑에 우연히 "라.
+            # 운용자산규모"라는 완전히 다른 섹션 제목이 같은 페이지에 있어서
+            # 그 회사 재무제표(자본금/법인세 같은 일반 기업회계 항목)를
+            # 펀드 것으로 잘못 집어온 사고가 있었다(KR5144420091 실측 -
+            # 사용자가 "법인세랑 자본금 어디서 찾은거야"라고 지적해서
+            # 발견). "운용자산"이 바로 이 자산총계 근처에도 있는지로
+            # 좁힌다("운용자산규모"는 제외 - OPERATING_ASSET_RE 참고).
+            if not OPERATING_ASSET_RE.search(window_around):
+                continue
+            # 운용사 자체 법인 재무제표(제4부)는 "유동자산/고정자산" 같은
+            # 일반 기업회계 용어를 쓴다 - 펀드 재무상태표가 아니므로 제외.
+            if "유동자산" in window_around or "고정자산" in window_around:
+                continue
+            return p.get("page"), t
     return None
 
 
@@ -210,17 +234,11 @@ def extract_fund_aum_coordinates(doc_id):
             page = pdf.pages[page_num - 1]
             words = page.extract_words(x_tolerance=5, keep_blank_chars=False)
             lines = cluster_lines(words)
-
-            full_norm = re.sub(r"\s+", "", " ".join(w["text"] for line in lines for w in line))
-            if "운용자산" not in full_norm:
-                continue
-            if "유동자산" in full_norm or "고정자산" in full_norm:
-                continue
+            line_norms = [re.sub(r"\s+", "", " ".join(w["text"] for w in line)) for line in lines]
 
             asset_vals = liab_vals = unit = None
             seen_balance_sheet_heading = False
-            for line in lines:
-                norm = re.sub(r"\s+", "", " ".join(w["text"] for w in line))
+            for i, (line, norm) in enumerate(zip(lines, line_norms)):
                 if "재무상태표" in norm or "요약재무정보" in norm:
                     seen_balance_sheet_heading = True
                     unit = None  # 이전(다른 표의) 단위 표기는 무효화
@@ -232,6 +250,25 @@ def extract_fund_aum_coordinates(doc_id):
                     if um:
                         unit = um.group(1)
                 if norm.startswith("자산총계") and asset_vals is None:
+                    # 진짜 펀드 재무상태표에서 "운용자산"과 "자산총계"의
+                    # 순서가 문서마다 다르다(위 OPERATING_ASSET_RE 주석
+                    # 참고: 어떤 문서는 운용자산이 세부항목 첫 줄로 자산
+                    # 총계보다 먼저, 어떤 문서는 자산총계가 소계로 먼저
+                    # 나오고 운용자산이 바로 다음 줄) - 앞뒤 양쪽 몇 줄을
+                    # 다 본다. 이전엔 페이지 전체에서 "운용자산"이 있는지만
+                    # 봤는데, 운용사 자체 재무제표 밑에 우연히 "라. 운용
+                    # 자산규모"라는 완전히 다른 섹션 제목이 같은 페이지에
+                    # 있어서 그 회사 재무제표(자본금/법인세 같은 일반
+                    # 기업회계 항목)를 펀드 것으로 잘못 집어온 사고가
+                    # 있었다(KR5144420081/091 실측 - 사용자가 "법인세랑
+                    # 자본금 어디서 찾은거야"라고 지적해서 발견, text_regex
+                    # 경로는 먼저 고쳤는데 이 좌표 폴백 경로엔 같은 문제가
+                    # 그대로 남아 있었다).
+                    nearby = "".join(line_norms[max(0, i - 15):min(len(line_norms), i + 15)])
+                    if not OPERATING_ASSET_RE.search(nearby):
+                        continue
+                    if "유동자산" in nearby or "고정자산" in nearby:
+                        continue
                     nums = _merge_number_fragments(line)
                     if nums:
                         asset_vals = nums
