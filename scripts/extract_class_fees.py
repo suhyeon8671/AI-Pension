@@ -57,6 +57,12 @@ CLASS_CODE_PREFIX_RE = re.compile(r"^([A-Za-z]{1,3})\(")
 # 깨진 게 아니라 원래 이렇게 이중 괄호로 표기됨). 여는 괄호 바로 다음에
 # 또 여는 괄호가 오면(닫는 괄호 대신) 그 사이를 코드로 본다.
 CLASS_CODE_NESTED_RE = re.compile(r"\(([A-Za-z0-9\-]{1,8})\(")
+# "운용전환일"이 고정된 캘린더 날짜가 아니라 목표기준가격 도달 같은 조건이
+# 충족돼야 발생하는 문서가 있다(KR5147430065 실측: "목표전환형" 펀드 -
+# "목표기준가격(종류A 누적기준가격 1,060원 이상)에 도달한 이후 운용전환").
+# total_fee_after_conversion 등 필드만 보면 "후"가 언제/왜인지 알 수 없다는
+# 지적을 받아, 그 조건 문구를 찾아 같이 남긴다.
+CONVERSION_TRIGGER_RE = re.compile(r"목표기준가격\(([^)]*)\)")
 # 판매수수료 칸은 숫자가 아니라 정형화된 문구("없음" 또는 "납입금액의 N%[ ]이내")인데,
 # "납입금액의"와 "N%이내"가 셀 줄바꿈 때문에 서로 다른 줄(그 사이에 다른 칸 텍스트가
 # 끼어든 상태)로 떨어져 있는 경우가 많아 하나의 정규식으로는 못 잡는다. "이내"까지
@@ -748,6 +754,26 @@ def candidate_pages_for_doc(doc_id, max_page):
     return sorted(pages)
 
 
+def conversion_trigger_note(doc_id):
+    """total_fee_after_conversion 등이 채워진 행에, "운용전환일"이 실제로
+    무엇 때문에 발생하는지(고정 날짜가 아니라 조건부일 수 있음) 원문에서
+    찾아 짧은 설명으로 남긴다. 못 찾으면(고정 날짜인 일반적인 경우) None."""
+    fp = os.path.join(EXTRACTED_DIR, f"{doc_id}_text.json")
+    if not os.path.exists(fp):
+        return None
+    with open(fp, "r", encoding="utf-8") as f:
+        pages = json.load(f)
+    full_text = " ".join(p.get("text", "") for p in pages)
+    m = CONVERSION_TRIGGER_RE.search(full_text)
+    if not m:
+        return None
+    condition = re.sub(r"\s+", " ", m.group(1)).strip()
+    return (
+        f"운용전환일은 고정된 날짜가 아니라 목표기준가격({condition}) 도달 시 "
+        "발생하는 조건부 전환일 - total_fee_after_conversion 등은 전환 이후 적용 예정인 수수료."
+    )
+
+
 def process_doc(doc_id):
     pdf_candidates = glob.glob(os.path.join(DATA_DIR, doc_id, "*.pdf"))
     if not pdf_candidates:
@@ -825,7 +851,15 @@ def process_doc(doc_id):
         key = r["class_code"]
         if key not in dedup or r["confidence"] > dedup[key]["confidence"]:
             dedup[key] = r
-    return list(dedup.values()) + unlabeled
+    final_rows = list(dedup.values()) + unlabeled
+    if any(r.get("total_fee_after_conversion") is not None for r in final_rows):
+        note = conversion_trigger_note(doc_id)
+        for r in final_rows:
+            r["conversion_note"] = note if r.get("total_fee_after_conversion") is not None else None
+    else:
+        for r in final_rows:
+            r["conversion_note"] = None
+    return final_rows
 
 
 def main():
