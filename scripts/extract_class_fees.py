@@ -375,15 +375,23 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
             if base_up and any(")" in w["text"] for w in base_up[0]):
                 base_up = []
 
+        # 판매수수료가 없다고 이미 결론난 행(own_row_no_commission)도
+        # 클래스명 자체는 여러 줄에 걸쳐 나뉠 수 있다(KR5113450111 실측:
+        # "수수료미"(2줄 위)/"징구-"(1줄 위)/[없음+데이터]/"개인연금"(1줄
+        # 아래)/"(C)"(2줄 아래) - "없음"이 있다고 위/아래 확장을 아예 막아
+        # 버리면 "수수료미"를 놓쳐 evidence의 클래스명이 "징구-..."로
+        # 잘려 보인다). 그래서 확장 자체는 막지 않되, 그러다가 "이내"
+        # (위쪽)/"납입금"(아래쪽)을 만나면 - 이 행 자신은 판매수수료가
+        # 없다고 이미 확인됐으니 그건 무조건 다른(이웃) 클래스의 판매수수료
+        # 문구 잔재다 - 포함하지 않고 그 자리에서 멈춘다.
         up_lines = list(base_up)
         found_napipgeum = any(_has_word(wl, "납입금") for wl in up_lines)
         j = i - 2
         extra = 0
-        while (
-            up_lines and not own_row_no_commission
-            and j >= 0 and extra < MAX_EXTRA_LINES and not found_napipgeum
-        ):
+        while up_lines and j >= 0 and extra < MAX_EXTRA_LINES and not found_napipgeum:
             if _is_full_data_row(lines[j]) or _has_class_paren(lines[j]):
+                break
+            if own_row_no_commission and _has_word(lines[j], "이내"):
                 break
             up_lines.insert(0, lines[j])
             found_napipgeum = _has_word(lines[j], "납입금")
@@ -396,10 +404,12 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
         j = i + 2
         extra = 0
         while (
-            down_lines and not own_row_no_commission
-            and j < len(lines) and extra < MAX_EXTRA_LINES and not found_ianae and not stop_down
+            down_lines and j < len(lines) and extra < MAX_EXTRA_LINES
+            and not found_ianae and not stop_down
         ):
             if _is_full_data_row(lines[j]):
+                break
+            if own_row_no_commission and _has_word(lines[j], "납입금"):
                 break
             down_lines.append(lines[j])
             found_ianae = _has_word(lines[j], "이내")
