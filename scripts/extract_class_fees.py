@@ -1067,10 +1067,44 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
     # "환매금액의..." 등 - "-"로 확정된 행은 같은 그룹일 수 있어 경계로
     # 안 본다)로 확정된 다른 행이 끼어있지 않은 가장 가까운 "없음"을
     # 찾아 같은 병합 셀로 보고 채운다.
+    #
+    # 다만 이 판정은 "중간에 진짜 문구가 없다"만 보기 때문에, 표에 아무
+    # 마커도 안 남기고 진짜로 비어있는 행(우리가 아직 본 적 없는 케이스)이
+    # 끼어 있으면 엉뚱하게 먼 "없음"을 끌어다 붙일 위험이 있다. 실측
+    # 병합 그룹(KR5194450018)의 최대 거리가 6줄이었던 것에 근거해, 그보다
+    # 뚜렷이 먼 "없음"은 같은 병합 셀이라 확신할 수 없다고 보고 채우지
+    # 않는다 - 틀린 "-"보다 null로 남겨 이상치 검사에 걸리게 하는 게 낫다
+    # ("틀린 값은 없는 값보다 나쁘다").
+    # "없음" 판정을 줄 안에 그 글자가 있는지만으로 하면, 표가 아니라
+    # 근처의 다른 문장(각주/설명 문구 등)에 우연히 등장한 "없음"까지
+    # 병합 셀로 착각할 위험이 있다(사용자 지적). 판매수수료 칸 자체에서
+    # 이미 직접 "없음"이 잡힌 행(예: 이 페이지의 C-e처럼 병합 그룹
+    # 가운데라 기존 로직으로도 맞은 행)이 있으면 그 x좌표를 이 칸의
+    # 실제 위치로 보고, 후보 "없음"도 그 x좌표 근처에 있는 것만
+    # 인정한다(class_returns의 최초설정일 병합 셀 판정과 같은 방식 -
+    # 표 밖 문장은 x좌표가 이 칸과 다를 수밖에 없어 걸러진다). 이 페이지에
+    # 그런 직접-매치 행이 아예 없으면(앵커를 못 구하면) 판정 불가로 보고
+    # 안전하게 x좌표 필터 없이 기존 방식(거리 상한만 적용)으로 대체한다.
+    MAX_MERGED_CELL_DISTANCE = 8
     unresolved = [r for r in rows if r.get("sales_commission_desc") is None]
     if unresolved:
+        row_line_idxs = {r["_row_line_idx"] for r in rows}
+        commission_col_x0 = None
+        for idx in row_line_idxs:
+            for w in lines[idx]:
+                if w["text"] == "없음":
+                    commission_col_x0 = w["x0"]
+                    break
+            if commission_col_x0 is not None:
+                break
+
+        def _none_word_x0(l):
+            return next((w["x0"] for w in l if w["text"] == "없음"), None)
+
         none_word_lines = [
-            idx for idx, l in enumerate(lines) if any(w["text"] == "없음" for w in l)
+            idx for idx, l in enumerate(lines)
+            if (x0 := _none_word_x0(l)) is not None
+            and (commission_col_x0 is None or abs(x0 - commission_col_x0) < 15)
         ]
         real_phrase_positions = [
             r["_row_line_idx"] for r in rows
@@ -1080,6 +1114,8 @@ def find_fee_rows_on_page(page, page_num, has_cost_column, next_page_head_lines=
             ri = r["_row_line_idx"]
             best = None
             for ni in none_word_lines:
+                if abs(ni - ri) > MAX_MERGED_CELL_DISTANCE:
+                    continue
                 lo, hi = min(ri, ni), max(ri, ni)
                 if any(lo < p < hi for p in real_phrase_positions):
                     continue
