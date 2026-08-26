@@ -492,6 +492,13 @@ def process_doc(doc_id):
     # 개수도 더 많이 나오는 걸 실측으로 확인해서(같은 문서에서 요약표엔
     # 없던 클래스가 상세표에만 있는 경우 - C-F 등) 상세표를 더 완전한
     # 쪽으로 본다.
+    # 뒤쪽(상세표) 행을 통째로 승자로 남기면, 요약표에만 있고 상세표엔
+    # 아예 컬럼 자체가 없는 필드(최초설정일 - 실측: KR510902773M의
+    # "가.연평균수익률" 표가 요약표(3페이지)엔 최초설정일 칸이 있는데
+    # 상세표(45페이지)엔 그 칸이 통째로 빠져 있었다)까지 패자 행과 함께
+    # 버려진다. 값(values)/row_kind는 그대로 승자(뒤쪽) 기준으로 두되,
+    # 승자에 없는 필드만 패자에서 채워 넣는다 - 사용자 지적: "최초
+    # 설정일이 없어지는건데 ㄱㅊ은거야?" → merge로 처리.
     best_by_class = {}
     demoted_pages = set()
     for r in deduped:
@@ -504,9 +511,13 @@ def process_doc(doc_id):
             continue
         if (r["confidence"], r["page"]) > (cur["confidence"], cur["page"]):
             demoted_pages.add(cur["page"])
+            if r.get("inception_date") is None and cur.get("inception_date") is not None:
+                r["inception_date"] = cur["inception_date"]
             best_by_class[key] = r
         else:
             demoted_pages.add(r["page"])
+            if cur.get("inception_date") is None and r.get("inception_date") is not None:
+                cur["inception_date"] = r["inception_date"]
     kept_class_return_ids = {id(r) for r in best_by_class.values()}
 
     # class_code가 없는 행(비교지수/수익률변동성/투자신탁 합계)은 클래스
