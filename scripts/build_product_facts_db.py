@@ -162,6 +162,11 @@ def load_product_master(conn, path):
 
 
 def load_class_fees(conn, path):
+    # class_fees.json의 "fee_breakdown"(상세표 보강으로 채워진 클래스에만
+    # 있음 - 집합투자업자보수/신탁업자보수/기타비용 등 세부 항목)은 6축
+    # 숫자 비교 질의엔 안 쓰여서 SQL 스키마에 안 넣는다 - JSON 파일에서
+    # 그대로 조회하면 된다(README "class fee의 역할" 참고: 스키마 밖
+    # 데이터라고 버리는 게 아니라 JSON에 그대로 보존하는 것).
     with open(path, "r", encoding="utf-8") as f:
         records = json.load(f)
     n = 0

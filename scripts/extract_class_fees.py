@@ -1176,6 +1176,244 @@ def conversion_trigger_nav_price(doc_id):
         return None
 
 
+def _cluster_header_labels(lines, header_end_idx, x_tol=8):
+    """header_end_idx 위쪽 최대 12줄에서 x좌표로 헤더 라벨 텍스트를
+    재구성한다(소수 값 토큰은 제외) - "나.집합투자기구에 부과되는 보수"류
+    상세표는 헤더가 여러 줄에 걸쳐 한 글자씩 쌓이는 서식이 많다."""
+    header_lines = lines[max(0, header_end_idx - 12) : header_end_idx + 1]
+    clusters = []
+    for row_i, line in enumerate(header_lines):
+        for w in line:
+            if DECIMAL_RE.match(w["text"]):
+                continue
+            placed = False
+            for c in clusters:
+                if abs(c["x0"] - w["x0"]) <= x_tol:
+                    c["pieces"].append((row_i, w["text"]))
+                    placed = True
+                    break
+            if not placed:
+                clusters.append({"x0": w["x0"], "pieces": [(row_i, w["text"])]})
+    labels = []
+    for c in clusters:
+        pieces = sorted(c["pieces"])
+        labels.append((c["x0"], "".join(t for _, t in pieces)))
+    return sorted(labels)
+
+
+def _find_detail_fee_data_rows(pdf):
+    """"나.집합투자기구에 부과되는 보수 및 비용"류 상세표 - 캡션 문구가
+    문서마다 달라서(README 참고: "투자실적" 같은 고정 캡션이 없음) 캡션
+    대신 데이터 행 자체의 모양으로 찾는다: 순수 소수(%아님, 정수 비용예시도
+    아님)가 7개 이상 한 줄에 있으면 이 표의 데이터 행으로 본다(앞쪽
+    요약표는 소수 3~4개 + 정수 비용예시라 이 조건에 안 걸림). 페이지별로
+    (page_num, 그 페이지의 lines, 데이터 행 인덱스 목록)을 돌려준다."""
+    results = []
+    for i, page in enumerate(pdf.pages):
+        words = page.extract_words(x_tolerance=2, keep_blank_chars=False)
+        lines = cluster_lines(words)
+        data_idx = []
+        for j, line in enumerate(lines):
+            decimals = [w for w in line if DECIMAL_RE.match(w["text"]) and "%" not in w["text"]]
+            if len(decimals) >= 7:
+                data_idx.append(j)
+        if data_idx:
+            results.append((i + 1, lines, data_idx))
+    return results
+
+
+def _detail_fee_row_class_code(lines, row_idx):
+    """데이터 행 자신 또는 바로 다음 줄에서 클래스 코드를 찾는다(클래스명이
+    데이터 행 앞/뒤로 걸쳐 있는 서식이 많음 - class_returns.py에서 이미
+    검증된 것과 같은 패턴)."""
+    line = lines[row_idx]
+    decimals = [w for w in line if DECIMAL_RE.match(w["text"]) and "%" not in w["text"]]
+    if not decimals:
+        return None, None
+    pre_text = "".join(w["text"] for w in line if w["x0"] < decimals[0]["x0"])
+    m = CLASS_CODE_RE.search(pre_text)
+    if m:
+        return m.group(1), pre_text
+    if row_idx + 1 < len(lines):
+        next_text = "".join(w["text"] for w in lines[row_idx + 1])
+        m2 = CLASS_CODE_RE.search(next_text)
+        if m2:
+            return m2.group(1), pre_text + next_text
+    return None, pre_text
+
+
+def enrich_with_detail_fee_table(doc_id, existing_rows):
+    """요약표(앞쪽)엔 없고 "나.집합투자기구에 부과되는 보수 및 비용"류
+    상세표에만 있는 클래스를 보강한다(KR5122420005 실측: 요약표엔 5개
+    클래스뿐인데 상세표엔 18개 - README "class_fees.json 코퍼스 전체
+    완전성 문제" 참고). 상세표 컬럼 구성이 문서마다 달라서(신탁업자보수/
+    수탁회사보수처럼 이름도 다르고 컬럼 개수도 다름) 고정 매핑을 쓰지
+    않고, 이미 확인된(요약표에서 뽑힌) 클래스 값과 대조해서 이 문서
+    안에서만 통하는 매핑을 매번 다시 찾는다 - 검증 안 되면(요약표 클래스가
+    2개 미만이거나 값이 안 맞으면) 아무것도 안 채우고 조용히 넘어간다."""
+    known = {r["class_code"]: r for r in existing_rows if r.get("class_code")}
+    if len(known) < 2:
+        return existing_rows
+
+    def close(a, b, tol=0.0005):
+        try:
+            return abs(float(a) - float(b)) <= tol
+        except (TypeError, ValueError):
+            return False
+
+    pdf_candidates = glob.glob(os.path.join(DATA_DIR, doc_id, "*.pdf"))
+    if not pdf_candidates:
+        return existing_rows
+
+    new_rows = []
+    with pdfplumber.open(pdf_candidates[0]) as pdf:
+        for page_num, lines, data_idx in _find_detail_fee_data_rows(pdf):
+            # 헤더 위치: 이 페이지에서 "동종"이 들어간 줄(동종유형총보수는
+            # 이 표 유형에 항상 있는 걸로 실측됨) 중 데이터 행보다 앞선 것.
+            header_idx = None
+            for j in range(min(data_idx) - 1, -1, -1):
+                if any("동종" in w["text"] for w in lines[j]):
+                    header_idx = j
+                    break
+            if header_idx is None:
+                continue
+            labels = _cluster_header_labels(lines, header_idx)
+
+            raw_rows = []
+            for j in data_idx:
+                decimals = [
+                    w for w in lines[j] if DECIMAL_RE.match(w["text"]) and "%" not in w["text"]
+                ]
+                code, label_text = _detail_fee_row_class_code(lines, j)
+                values = sorted(
+                    ((w["x0"], w["text"]) for w in decimals), key=lambda v: v[0]
+                )
+                raw_rows.append({"class_code": code, "values": values})
+
+            # 컬럼 좌표 기준: 값이 가장 많이 잡힌 행(보통 9개 다 채워진 행)의
+            # x좌표를 "표준 컬럼 위치"로 삼는다 - 어떤 클래스는 특정 칸이
+            # "-"라 아예 빠져서(KR5122420005 A2 등 실측) 행마다 값 개수가
+            # 다르므로, 순서(왼→오 몇 번째)가 아니라 각 값의 x좌표를 표준
+            # 컬럼 중 가장 가까운 것에 매칭해야 클래스마다 안 밀린다.
+            if not raw_rows:
+                continue
+            fullest = max(raw_rows, key=lambda r: len(r["values"]))
+            col_x0s = [x0 for x0, _ in fullest["values"]]
+            if len(col_x0s) < 7:
+                continue
+
+            def assign_columns(values):
+                out = {}
+                for x0, text in values:
+                    ci = min(range(len(col_x0s)), key=lambda k: abs(col_x0s[k] - x0))
+                    if abs(col_x0s[ci] - x0) <= 15:
+                        out[ci] = text
+                return out
+
+            for r in raw_rows:
+                r["cols"] = assign_columns(r["values"])
+
+            ref_rows = [r for r in raw_rows if r["class_code"] in known]
+            if len(ref_rows) < 2:
+                continue
+
+            n_cols = len(col_x0s)
+
+            # distribution_fee/peer_avg_fee/total_fee_and_cost: 특정 컬럼
+            # 위치 하나가, 값이 있는 참조 행들에서 전부 일치하는지 테스트
+            # (그 컬럼 값이 "-"인 참조 행은 그 필드 검증에서만 제외).
+            def find_column(field):
+                for col in range(n_cols):
+                    matched = [
+                        r for r in ref_rows
+                        if col in r["cols"] and close(r["cols"][col], known[r["class_code"]][field])
+                    ]
+                    if len(matched) >= 2 and len(matched) == sum(
+                        1 for r in ref_rows if col in r["cols"]
+                    ):
+                        return col
+                return None
+
+            dist_col = find_column("distribution_fee")
+            peer_col = find_column("peer_avg_fee")
+            cost_col = find_column("total_fee_and_cost")
+
+            # total_fee: 단일 컬럼으로 안 맞으면 왼쪽부터 N개 합으로 시도
+            # (관측: 항상 "관리 성격" 앞쪽 컬럼들의 합 - README 참고).
+            total_col = find_column("total_fee")
+            total_sum_n = None
+            if total_col is None:
+                for n in range(2, min(6, n_cols) + 1):
+                    complete_refs = [r for r in ref_rows if all(c in r["cols"] for c in range(n))]
+                    if len(complete_refs) >= 2 and all(
+                        close(
+                            sum(float(r["cols"][c]) for c in range(n)),
+                            known[r["class_code"]]["total_fee"],
+                        )
+                        for r in complete_refs
+                    ):
+                        total_sum_n = n
+                        break
+
+            if dist_col is None or peer_col is None or cost_col is None:
+                continue
+            if total_col is None and total_sum_n is None:
+                continue
+
+            label_by_col = []
+            for x0 in col_x0s:
+                nearest = min(labels, key=lambda l: abs(l[0] - x0)) if labels else None
+                label_by_col.append(nearest[1] if nearest else None)
+
+            for r in raw_rows:
+                if not r["class_code"] or r["class_code"] in known:
+                    continue
+                cols = r["cols"]
+                # 동종유형총보수 등 특정 칸이 원본에 "-"로 찍혀 대시 토큰
+                # 자체가 안 잡히는 클래스가 있다(KR5122420005 C-W 등 실측).
+                # peer_avg_fee 하나 없다고 행 전체(total_fee 등 나머지 다
+                # 있는 값까지)를 버리면 안 되므로, 그 필드만 "-"로 남기고
+                # 나머지는 살린다 - class_fees.json 기존 관례(peer_avg_fee
+                # "-" 보존)와 동일.
+                if dist_col not in cols or cost_col not in cols:
+                    continue
+                if total_col is not None:
+                    if total_col not in cols:
+                        continue
+                    total_fee = cols[total_col]
+                elif all(c in cols for c in range(total_sum_n)):
+                    total_fee = f"{sum(float(cols[c]) for c in range(total_sum_n)):.4f}"
+                else:
+                    continue
+                breakdown = [
+                    {"label": label_by_col[c], "value": v}
+                    for c, v in sorted(cols.items())
+                    if c not in (dist_col, peer_col, cost_col)
+                    and (total_col is None or c != total_col)
+                ]
+                new_rows.append({
+                    "class_code": r["class_code"],
+                    "sales_commission_desc": None,
+                    "total_fee": total_fee,
+                    "distribution_fee": cols[dist_col],
+                    "peer_avg_fee": cols.get(peer_col, "-"),
+                    "total_fee_and_cost": cols[cost_col],
+                    # 상세표엔 1,000만원 비용예시(1년~10년) 칸이 없다 -
+                    # build_product_facts_db.py의 cp.get("1y") 등이
+                    # None.get()에서 죽지 않도록 dict({})로 둔다(요약표
+                    # 클래스는 실제 값이 채워진 dict를 씀).
+                    "cost_projection_per_10m": {},
+                    "fee_breakdown": breakdown,
+                    "page": page_num,
+                    "evidence": f"[상세표 보강] {sorted(cols.items())}",
+                    "method": "detail_table_cross_validated",
+                    "confidence": 0.7,
+                    "product_code": doc_id,
+                })
+
+    return existing_rows + new_rows
+
+
 def process_doc(doc_id):
     pdf_candidates = glob.glob(os.path.join(DATA_DIR, doc_id, "*.pdf"))
     if not pdf_candidates:
@@ -1279,12 +1517,21 @@ def main():
     all_rows = []
     docs_with_hits = 0
     docs_with_missing_class_code = 0
+    detail_enriched = 0
     for doc_id in doc_ids:
         rows = process_doc(doc_id)
         if rows:
             docs_with_hits += 1
             if any(r["confidence"] < 0.7 for r in rows):
                 docs_with_missing_class_code += 1
+        # 요약표엔 없고 상세표("나.집합투자기구에 부과되는 보수 및 비용")
+        # 에만 있는 클래스를 보강한다 - README "class_fees.json 코퍼스
+        # 전체 완전성 문제" 참고. 요약표에서 뽑힌 클래스가 2개 미만이면
+        # 대조 기준이 없어 조용히 그대로 넘어간다.
+        before = len(rows)
+        rows = enrich_with_detail_fee_table(doc_id, rows)
+        if len(rows) > before:
+            detail_enriched += 1
         all_rows.extend(rows)
 
     with open(args.output, "w", encoding="utf-8") as f:
@@ -1292,6 +1539,7 @@ def main():
 
     print(f"{len(all_rows)}개 클래스 레코드 ({docs_with_hits}개 문서) → {args.output}")
     print(f"클래스 코드 인식 실패(confidence<0.7): {docs_with_missing_class_code}개 문서")
+    print(f"상세표 보강으로 클래스 추가된 문서: {detail_enriched}개")
 
 
 if __name__ == "__main__":
