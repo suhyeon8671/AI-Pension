@@ -177,12 +177,14 @@ def row_kind(pre_text, prev_line_text="", next_line_text=""):
     return "class_return"
 
 
-def find_return_rows_on_page(page, page_num, section="가"):
+def find_return_rows_on_page(page, page_num, section="가", known_classes=None):
     """section: 이 페이지 시작 시점의 "가/나" 섹션 상태(문서 내 이전 페이지에서
     이어받음). "나.연도별 수익률 추이" 섹션에 들어간 뒤로는 다음 "가" 제목을
     다시 만나기 전까지 데이터 행을 전부 스킵한다 - 컬럼 의미가 다른 표라
     "가" 표 스키마(1y/2y/3y/5y/since_inception)에 잘못 매핑하면 안 되기 때문.
-    반환값은 (rows, 이 페이지가 끝난 시점의 section)."""
+    known_classes: class_fees.json에서 이미 확인된 이 상품의 클래스 코드
+    목록(제공되면 라벨이 상품명 전체와 붙어 나오는 상세표에서 class_code
+    보강용으로 씀). 반환값은 (rows, 이 페이지가 끝난 시점의 section)."""
     # x_tolerance=2(기본)로는 일부 문서에서 폰트 문제로 글자가 한 자씩 떨어져
     # 나오는 케이스(예: "4 .2 1")가 있어 숫자 인식이 아예 안 된다. 5로 올리면
     # 그 문제가 해결되면서도(검증 완료) 다른 문서의 값이 잘못 합쳐지진 않았다.
@@ -316,6 +318,24 @@ def find_return_rows_on_page(page, page_num, section="가"):
                     )
                     if m3:
                         class_code = m3.group(1)
+                    elif known_classes:
+                        # 상세 부속서류(제2부 등)는 라벨이 "(A1)"처럼 괄호로
+                        # 안 떨어지고 "마이다스 책임투자 증권 투자신탁(주식)A1"
+                        # 처럼 상품 전체 명칭 뒤에 클래스 코드가 그냥 이어
+                        # 붙기도 한다(KR5157450017 실측). 이런 임의의 접미사를
+                        # 정규식만으로 뽑으면 엉뚱한 문자열을 클래스 코드로
+                        # 오인할 위험이 크다 - 대신 class_fees.json에서 이미
+                        # 확인된 "이 상품의 진짜 클래스 코드 목록"에 있는
+                        # 것으로 끝나는 경우에만(더 긴 코드 우선, 그 앞
+                        # 글자가 영문/숫자가 아닌 경우만 - "BA1"의 "A1"처럼
+                        # 엉뚱하게 잘라 오는 걸 방지) 인정한다.
+                        combined = (prev_line_text + " " + label_search_text).rstrip()
+                        for code in sorted(known_classes, key=len, reverse=True):
+                            if combined.endswith(code):
+                                before = combined[: -len(code)]
+                                if not before or not before[-1].isalnum():
+                                    class_code = code
+                                    break
 
             if class_code:
                 # 클래스 코드가 확실히 잡혔으면 그 자체로 "클래스 행"이라는
@@ -466,11 +486,33 @@ def candidate_pages_for_doc(doc_id, max_page):
     return sorted(pages)
 
 
+_KNOWN_CLASSES_BY_DOC = None
+
+
+def _known_classes_for_doc(doc_id):
+    """class_fees.json에 이미 확인된 이 상품의 class_code 목록(있으면) -
+    상세 부속서류에서 라벨이 상품 전체 명칭에 붙어 나올 때 class_code
+    보강용으로 쓴다. class_fees.json이 없으면(아직 안 만들었으면) 그냥
+    빈 결과로 조용히 넘어간다 - 이 보강은 있으면 좋고 없어도 기존 동작
+    그대로다."""
+    global _KNOWN_CLASSES_BY_DOC
+    if _KNOWN_CLASSES_BY_DOC is None:
+        _KNOWN_CLASSES_BY_DOC = defaultdict(set)
+        fp = os.path.join(REPO_ROOT, "class_fees.json")
+        if os.path.exists(fp):
+            with open(fp, "r", encoding="utf-8") as f:
+                for r in json.load(f):
+                    if r.get("class_code"):
+                        _KNOWN_CLASSES_BY_DOC[r["product_code"]].add(r["class_code"])
+    return _KNOWN_CLASSES_BY_DOC.get(doc_id, set())
+
+
 def process_doc(doc_id):
     pdf_candidates = glob.glob(os.path.join(DATA_DIR, doc_id, "*.pdf"))
     if not pdf_candidates:
         return []
 
+    known_classes = _known_classes_for_doc(doc_id)
     results = []
     with pdfplumber.open(pdf_candidates[0]) as pdf:
         pages = candidate_pages_for_doc(doc_id, len(pdf.pages))
@@ -481,7 +523,9 @@ def process_doc(doc_id):
             if page_num < 1 or page_num > len(pdf.pages):
                 continue
             page = pdf.pages[page_num - 1]
-            rows, section = find_return_rows_on_page(page, page_num, section=section)
+            rows, section = find_return_rows_on_page(
+                page, page_num, section=section, known_classes=known_classes
+            )
             for r in rows:
                 r["product_code"] = doc_id
                 results.append(r)
