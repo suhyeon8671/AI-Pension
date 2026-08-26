@@ -155,8 +155,14 @@ def row_kind(pre_text, prev_line_text="", next_line_text=""):
         return "volatility"
     # "투자신탁"만 라벨로 있는 행은 특정 클래스가 아니라 펀드 전체 평균(모든
     # 클래스를 합친 수익률)이다. class_code가 없는 게 아니라 애초에 클래스가
-    # 아니므로 별도 종류로 구분한다.
-    if normalized == "투자신탁":
+    # 아니므로 별도 종류로 구분한다. 원래 "==" 완전일치였는데, 요약표(3페이지
+    # 스타일)에서는 "투자신탁" 옆에 최초설정일이 같은 줄에 붙어 나와
+    # normalized가 "투자신탁2013.08.19"처럼 되면서 매치가 실패해 기본값인
+    # class_return(class_code=null)으로 잘못 새는 버그가 있었다(KR510902773M
+    # 실측 - 상세표(45페이지, 설정일 없이 "투자신탁"만 있어 정상 매치)의
+    # fund_aggregate 행과 row_kind가 달라져 cross-page dedup도 안 먹혔다).
+    # "비교지수"/"변동성"과 같은 방식으로 부분일치로 바꾼다.
+    if "투자신탁" in normalized:
         return "fund_aggregate"
     return "class_return"
 

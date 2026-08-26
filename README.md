@@ -1187,6 +1187,28 @@ class_fees의 peer_avg_fee "-" 값에도 이미 쓰고 있었음) SQL의 REAL �
 C/Ce) 전부 자기 몫의 비교지수·변동성을 갖춘 15행으로, KR5153520012는
 C/C-P2e/C-F가 (더 완전한 상세표 기준) 각 1행씩으로 원본과 일치.
 
+**"투자신탁" 행이 요약표/상세표에서 서로 다른 row_kind로 갈라져 dedup을
+피해가던 버그** — class_fees 클래스 개수가 다 맞는지 class_returns와
+교차검증하다가(같은 PDF의 두 표가 같은 클래스 집합을 가리켜야 하므로),
+KR510902773M에서 요약표(3페이지)의 "투자신탁"(펀드 전체 평균) 행이
+`row_kind: class_return, class_code: null, confidence: 0.5`로 이상하게
+남아있는 걸 발견했다. `row_kind()` 함수가 "투자신탁"인지 볼 때
+`normalized == "투자신탁"`으로 완전일치를 요구하고 있었는데(비교지수/
+변동성은 부분일치 `in`으로 이미 되어 있었음), 요약표에서는 "투자신탁"
+옆에 최초설정일이 같은 줄에 붙어 나와 `normalized`가
+"투자신탁2013.08.19"가 되면서 매치가 깨져 기본값(class_return)으로
+샜다. 상세표(45페이지)는 그 줄에 설정일이 안 붙어 정상적으로
+`fund_aggregate`로 분류됐고, row_kind가 서로 달라져(class_return vs
+fund_aggregate) "같은 row_kind+값이 다른 페이지에 있으면 뒤 페이지만
+남긴다"는 기존 dedup도 못 잡고 요약표 쪽이 그대로 남아있었다.
+"비교지수"/"변동성"과 같은 방식(부분일치)으로 통일해 수정.
+
+전체 재실행 후 재확인: 588건→**582건**(요약표에 잘못 남아있던
+"투자신탁" 중복 6건 제거, class_return 298→290/fund_aggregate 37→39),
+97개 문서 그대로. 페이지 걸친 동일값 중복 0건, (product_code,
+class_code) 중복 0건 - 회귀 없음. KR510902773M은 이제 45페이지의
+C/C-e/C-F/fund_aggregate/benchmark/volatility만 깔끔하게 남음.
+
 ### AUM(운용규모)
 
 처음엔 "데이터 자체가 없다"고 결론 냈었다. products 100개 문서 전체(텍스트+표)를
