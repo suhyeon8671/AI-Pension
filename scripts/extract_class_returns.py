@@ -198,6 +198,19 @@ def find_return_rows_on_page(page, page_num, section="가"):
         decimals = [w for w in line if DECIMAL_RE.match(w["text"])]
         dashes = [w for w in line if DASH_RE.match(w["text"])]
         value_tokens = sorted(decimals + dashes, key=lambda w: w["x0"])
+        # 비교지수(benchmark) 행은 자기 몫의 최초설정일이 없어서 그 칸에
+        # 날짜 대신 "-"를 찍는 문서가 있다(KR5113420012 실측: "비교지수 -
+        # 5.43 5.18 3.19 1.49 4.00" - 진짜 값 5개 + 설정일 자리의 "-" 1개
+        # 해서 6개가 되어 "값 5개 초과"로 행 전체가 통째로 버려지고
+        # 있었다). 이 "-"는 항상 실제 값 5개(1y~since_inception) 왼쪽,
+        # 최초설정일 칸 위치에 딱 1개만 나온다 - 정확히 6개(진짜 값 5개 +
+        # 여분 대시 1개)일 때만, 그 여분이 대시인 걸 확인하고 가장 왼쪽
+        # 것만 버린다. 아무 라벨도 없이 대시만 여러 개(예: "- - - - - - -
+        # - -" 9개, 설정/환매현황 표의 빈 칸들 - KR510902773M 실측)인
+        # 줄까지 5개로 뭉개면 있지도 않은 가짜 행이 생기므로, 6개인
+        # 경우로만 좁힌다.
+        if len(value_tokens) == 6 and DASH_RE.match(value_tokens[0]["text"]):
+            value_tokens = value_tokens[1:]
         if len(value_tokens) < 3 or len(value_tokens) > 5:
             continue
         # 운용전문인력 표(성명/생년/직위 등)와 구분: 그 표는 억원 단위 정수(운용규모)나
