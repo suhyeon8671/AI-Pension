@@ -1201,12 +1201,30 @@ def _cluster_header_labels(lines, header_end_idx, x_tol=8):
     return sorted(labels)
 
 
+DETAIL_FEE_DASH_RE = re.compile(r"^-$")
+# "(C)"처럼 괄호로 안 떨어지고 "종류C"/"종류C-F"로만 나오는 라벨 서식
+# (KR510902773M 실측). 뒤에 다른 한글이 바로 안 붙게(예: "종류형") 경계를
+# 둔다 - class_returns.py의 CLASS_CODE_JONGRYU_RE와 같은 취지.
+DETAIL_FEE_CLASS_CODE_JONGRYU_RE = re.compile(r"종류([A-Za-z][A-Za-z0-9\-]{0,6})(?![A-Za-z0-9\-])")
+# 헤더 여러 줄이 데이터 행과 가까워서(표마다 헤더 줄 수가 달라 정확한
+# 경계를 못 잡음) 클래스 코드 정규식에 걸리는 흔한 금융 약어들
+# (KR5172450019 실측: 헤더의 "(TER)"이 A클래스 행의 코드로 잘못 붙어서
+# 이후 모든 클래스가 한 칸씩 밀림). 실제 클래스 코드로 이 값들이 나올
+# 일은 없다고 봐도 안전하다.
+DETAIL_FEE_CODE_BLOCKLIST = {"TER", "CDSC", "IRP", "Class", "Wrap", "Cost"}
+
+
 def _find_detail_fee_data_rows(pdf):
     """"나.집합투자기구에 부과되는 보수 및 비용"류 상세표 - 캡션 문구가
     문서마다 달라서(README 참고: "투자실적" 같은 고정 캡션이 없음) 캡션
     대신 데이터 행 자체의 모양으로 찾는다: 순수 소수(%아님, 정수 비용예시도
-    아님)가 7개 이상 한 줄에 있으면 이 표의 데이터 행으로 본다(앞쪽
-    요약표는 소수 3~4개 + 정수 비용예시라 이 조건에 안 걸림). 페이지별로
+    아님) + "-"(원본이 명시적으로 비워둔 칸)를 합쳐 7개 이상 한 줄에 있으면
+    이 표의 데이터 행으로 본다(앞쪽 요약표는 소수 3~4개 + 정수 비용예시라
+    이 조건에 안 걸림). 소수만으로 세면, 컬럼 대부분이 "-"인 클래스(직판/
+    기관형 등 부가서비스가 거의 없는 클래스 - KR510902773M의 C-F 실측:
+    소수 6개뿐이라 7개 기준에 아예 안 걸려서 데이터 행 취급을 못 받았다)를
+    통째로 놓친다 - "-"도 원본이 실제로 채워 넣은 값(칸이 빈 게 아니라
+    명시적으로 "없음"이라고 표시한 것)이므로 같이 센다. 페이지별로
     (page_num, 그 페이지의 lines, 데이터 행 인덱스 목록)을 돌려준다."""
     results = []
     for i, page in enumerate(pdf.pages):
@@ -1215,31 +1233,74 @@ def _find_detail_fee_data_rows(pdf):
         data_idx = []
         for j, line in enumerate(lines):
             decimals = [w for w in line if DECIMAL_RE.match(w["text"]) and "%" not in w["text"]]
-            if len(decimals) >= 7:
+            dashes = [w for w in line if DETAIL_FEE_DASH_RE.match(w["text"])]
+            if len(decimals) + len(dashes) >= 7:
                 data_idx.append(j)
         if data_idx:
             results.append((i + 1, lines, data_idx))
     return results
 
 
-def _detail_fee_row_class_code(lines, row_idx):
-    """데이터 행 자신 또는 바로 다음 줄에서 클래스 코드를 찾는다(클래스명이
+def _detail_fee_row_class_code(lines, row_idx, consumed=None, header_idx=None):
+    """데이터 행 자신 또는 앞/뒤 몇 줄에서 클래스 코드를 찾는다(클래스명이
     데이터 행 앞/뒤로 걸쳐 있는 서식이 많음 - class_returns.py에서 이미
-    검증된 것과 같은 패턴)."""
+    검증된 것과 같은 패턴). consumed: 이미 앞선(위쪽) 행의 라벨로 확정돼
+    "소비"된 줄 번호 집합 - 한 클래스의 라벨이 "시작(앞) / 데이터 / 끝(뒤)"
+    구조로 자기 데이터 행을 감싸는 서식에서, 다음 클래스가 위로 훑을 때
+    바로 이전 클래스의 "끝" 조각을 자기 라벨로 잘못 주워가는 걸 막는다
+    (KR5122420005 실측: A-E 행이 바로 위의 "형(A)"(A 자신의 끝 라벨
+    조각)를 A-E의 라벨로 착각해 코드가 "A"로 잘못 나옴 - consumed로
+    한 번 쓰인 줄은 다음 행 탐색에서 제외해야 고쳐짐). header_idx: 이
+    줄보다 위로는 절대 안 넘어간다 - 첫 번째 데이터 행이 헤더 바로
+    다음이면, 헤더 자체에 있는 "(TER)"(Total Expense Ratio 약자) 같은
+    괄호 문구를 클래스 코드로 잘못 주워서 전체 클래스가 한 칸씩 밀리는
+    사고가 났었다(KR5172450019 실측 - A행이 "TER"로 잘못 라벨링되면서
+    A/Ae/C1/... 전체 값이 한 행씩 밀려 대응됨). 호출부는 데이터 행을
+    위→아래 순서로 처리해야 한다."""
+    if consumed is None:
+        consumed = set()
+    floor = header_idx if header_idx is not None else -1
     line = lines[row_idx]
     decimals = [w for w in line if DECIMAL_RE.match(w["text"]) and "%" not in w["text"]]
     if not decimals:
         return None, None
     pre_text = "".join(w["text"] for w in line if w["x0"] < decimals[0]["x0"])
-    m = CLASS_CODE_RE.search(pre_text)
-    if m:
-        return m.group(1), pre_text
-    if row_idx + 1 < len(lines):
-        next_text = "".join(w["text"] for w in lines[row_idx + 1])
-        m2 = CLASS_CODE_RE.search(next_text)
-        if m2:
-            return m2.group(1), pre_text + next_text
-    return None, pre_text
+    # 다른 클래스의 데이터 행(소수 3개 이상)이나 이미 소비된 줄, 헤더 위
+    # 영역을 만나면 그 전에서 멈춰 옆 클래스 라벨(또는 헤더 문구)을 잘못
+    # 가져오지 않게 한다. prev는 가장 가까운(마지막) 매치, next는 가장
+    # 가까운(첫) 매치만 쓴다.
+    prev_idx = []
+    for k in range(row_idx - 1, max(row_idx - 4, floor), -1):
+        if k in consumed or sum(1 for w in lines[k] if DECIMAL_RE.match(w["text"])) >= 3:
+            break
+        prev_idx.insert(0, k)
+    next_idx = []
+    for k in range(row_idx + 1, min(row_idx + 4, len(lines))):
+        if sum(1 for w in lines[k] if DECIMAL_RE.match(w["text"])) >= 3:
+            break
+        next_idx.append(k)
+    prev_text = "".join("".join(w["text"] for w in lines[k]) for k in prev_idx)
+    next_text = "".join("".join(w["text"] for w in lines[k]) for k in next_idx)
+
+    def _nearest_match(regex, text, want_last):
+        matches = [m for m in regex.finditer(text) if m.group(1) not in DETAIL_FEE_CODE_BLOCKLIST]
+        if not matches:
+            return None
+        return (matches[-1] if want_last else matches[0]).group(1)
+
+    for regex in (CLASS_CODE_RE, DETAIL_FEE_CLASS_CODE_JONGRYU_RE):
+        code = _nearest_match(regex, pre_text, want_last=True)
+        if code:
+            return code, pre_text
+        code = _nearest_match(regex, prev_text, want_last=True)
+        if code:
+            consumed.update(prev_idx)
+            return code, prev_text
+        code = _nearest_match(regex, next_text, want_last=False)
+        if code:
+            consumed.update(next_idx)
+            return code, next_text
+    return None, prev_text + pre_text + next_text
 
 
 def enrich_with_detail_fee_table(doc_id, existing_rows):
@@ -1280,11 +1341,12 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
             labels = _cluster_header_labels(lines, header_idx)
 
             raw_rows = []
+            consumed_lines = set()  # 위→아래 순서로 처리, 앞 행이 쓴 라벨 줄은 다음 행이 재사용 못 하게
             for j in data_idx:
                 decimals = [
                     w for w in lines[j] if DECIMAL_RE.match(w["text"]) and "%" not in w["text"]
                 ]
-                code, label_text = _detail_fee_row_class_code(lines, j)
+                code, label_text = _detail_fee_row_class_code(lines, j, consumed_lines, header_idx)
                 values = sorted(
                     ((w["x0"], w["text"]) for w in decimals), key=lambda v: v[0]
                 )
@@ -1355,7 +1417,17 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
                         total_sum_n = n
                         break
 
-            if dist_col is None or peer_col is None or cost_col is None:
+            # peer_avg_fee(동종유형총보수)는 요약표에서 이미 아는 클래스들도
+            # 전부 "-"인 문서가 있다(KR510902773M 실측: C/C-e 둘 다 이미
+            # "-") - 대조할 실제 숫자가 하나도 없어 컬럼을 특정할 수 없다.
+            # 이 경우 "그 칸이 있는지조차 특정 못 함"이 아니라 "이 문서
+            # 자체가 이 필드를 클래스별로 안 보여줌"으로 보고, 새로 채우는
+            # 행도 똑같이 "-"로 둔다(거짓으로 숫자를 지어내지 않되, 행
+            # 전체를 놓치지도 않는다).
+            peer_all_dash = all(known[r["class_code"]]["peer_avg_fee"] == "-" for r in ref_rows)
+            if dist_col is None or cost_col is None:
+                continue
+            if peer_col is None and not peer_all_dash:
                 continue
             if total_col is None and total_sum_n is None:
                 continue
@@ -1369,14 +1441,15 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
                 if not r["class_code"] or r["class_code"] in known:
                     continue
                 cols = r["cols"]
-                # 동종유형총보수 등 특정 칸이 원본에 "-"로 찍혀 대시 토큰
-                # 자체가 안 잡히는 클래스가 있다(KR5122420005 C-W 등 실측).
-                # peer_avg_fee 하나 없다고 행 전체(total_fee 등 나머지 다
-                # 있는 값까지)를 버리면 안 되므로, 그 필드만 "-"로 남기고
-                # 나머지는 살린다 - class_fees.json 기존 관례(peer_avg_fee
-                # "-" 보존)와 동일.
-                if dist_col not in cols or cost_col not in cols:
-                    continue
+                # 판매회사보수/동종유형총보수 등 특정 칸이 원본에 "-"로
+                # 찍혀 대시 토큰 자체가 안 잡히는 클래스가 있다
+                # (KR5122420005 C-W, KR510902773M C-F 등 실측 - 부가서비스가
+                # 거의 없는 클래스라 관련 칸이 통째로 "없음"). 이 필드
+                # 하나 없다고 행 전체(total_fee 등 나머지 다 있는 값까지)를
+                # 버리면 안 되므로, 그 필드만 "-"로 남기고 나머지는 살린다
+                # - class_fees.json 기존 관례(peer_avg_fee "-" 보존)와
+                # 동일. total_fee만은 이 행의 핵심 값이라 "-" 대체 없이
+                # 못 찾으면 이 행 자체를 건너뛴다.
                 if total_col is not None:
                     if total_col not in cols:
                         continue
@@ -1395,9 +1468,9 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
                     "class_code": r["class_code"],
                     "sales_commission_desc": None,
                     "total_fee": total_fee,
-                    "distribution_fee": cols[dist_col],
+                    "distribution_fee": cols.get(dist_col, "-"),
                     "peer_avg_fee": cols.get(peer_col, "-"),
-                    "total_fee_and_cost": cols[cost_col],
+                    "total_fee_and_cost": cols.get(cost_col, "-"),
                     # 상세표엔 1,000만원 비용예시(1년~10년) 칸이 없다 -
                     # build_product_facts_db.py의 cp.get("1y") 등이
                     # None.get()에서 죽지 않도록 dict({})로 둔다(요약표
