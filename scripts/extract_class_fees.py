@@ -1179,21 +1179,32 @@ def conversion_trigger_nav_price(doc_id):
 def _cluster_header_labels(lines, header_end_idx, x_tol=8):
     """header_end_idx 위쪽 최대 12줄에서 x좌표로 헤더 라벨 텍스트를
     재구성한다(소수 값 토큰은 제외) - "나.집합투자기구에 부과되는 보수"류
-    상세표는 헤더가 여러 줄에 걸쳐 한 글자씩 쌓이는 서식이 많다."""
+    상세표는 헤더가 여러 줄에 걸쳐 한 글자씩 쌓이는 서식이 많다.
+
+    묶는 기준은 x0가 아니라 글자 뭉치의 가운데(center)다. 헤더 칸 이름은
+    가운데 정렬이라 조각마다 글자 수가 다르면 x0가 어긋난다
+    (KR510902511M 28페이지 실측: "집합"@141.1 / "투자업자"@131.1 /
+    "보수"@141.1 - x0로 묶으면 10pt 차이라 "투자업자"가 떨어져 나가
+    라벨이 "집합"으로 잘렸다. 가운데로 맞추면 세 조각이 하나로 묶여
+    "집합투자업자보수"가 된다). 칸 간격은 실측상 45pt 안팎이라 이
+    허용오차로 옆 칸과 섞일 위험은 없다. 돌려주는 x는 그 칸의 왼쪽
+    끝(x0 최솟값)으로, 값 토큰의 x0와 비교하는 호출부와 기준을 맞춘다."""
     header_lines = lines[max(0, header_end_idx - 12) : header_end_idx + 1]
     clusters = []
     for row_i, line in enumerate(header_lines):
         for w in line:
             if DECIMAL_RE.match(w["text"]):
                 continue
+            center = (w["x0"] + w["x1"]) / 2
             placed = False
             for c in clusters:
-                if abs(c["x0"] - w["x0"]) <= x_tol:
+                if abs(c["center"] - center) <= x_tol:
                     c["pieces"].append((row_i, w["text"]))
+                    c["x0"] = min(c["x0"], w["x0"])
                     placed = True
                     break
             if not placed:
-                clusters.append({"x0": w["x0"], "pieces": [(row_i, w["text"])]})
+                clusters.append({"center": center, "x0": w["x0"], "pieces": [(row_i, w["text"])]})
     labels = []
     for c in clusters:
         pieces = sorted(c["pieces"])
@@ -1212,6 +1223,68 @@ DETAIL_FEE_CLASS_CODE_JONGRYU_RE = re.compile(r"종류([A-Za-z][A-Za-z0-9\-]{0,6
 # 이후 모든 클래스가 한 칸씩 밀림). 실제 클래스 코드로 이 값들이 나올
 # 일은 없다고 봐도 안전하다.
 DETAIL_FEE_CODE_BLOCKLIST = {"TER", "CDSC", "IRP", "Class", "Wrap", "Cost"}
+
+
+def _detail_fee_labels_by_column(lines, first_data_idx, col_x0s):
+    """상세표의 각 컬럼(값 x좌표) 위에 있는 헤더 글자들을 모아 칸 이름을
+    복원한다. fee_breakdown 항목 이름으로 쓰이므로 "집합"처럼 잘리거나
+    옆 칸 이름이 붙으면 안 된다(잘린 이름은 못 쓰고, 틀린 이름은 더 나쁘다).
+
+    처음엔 페이지 전체 헤더를 x좌표로 한 번에 클러스터링하고 컬럼마다
+    "가장 가까운 라벨"을 붙였는데, 두 가지로 깨졌다(KR510902511M 28페이지
+    실측):
+      - 문서 제목("미래에셋장기성장포커스...")이나 여러 칸을 아우르는
+        묶음 헤더("지급비용(연간%)")가 가로로 넓어 개별 칸 글자와 같은
+        클러스터로 묶였다 - 그 바람에 "집합투자업자보수"가 제목 클러스터에
+        흡수되고, 0.72(집합투자업자보수)에 옆 칸 이름 "판매회사보수"가
+        붙는 밀림이 생겼다.
+      - "총 보수"처럼 한 줄에 띄어 쓴 칸 이름은 세로로 쌓이지 않아 하나로
+        안 묶였다.
+    그래서 전역 클러스터링 대신 컬럼마다 "이 칸 위에 실제로 겹쳐 있는
+    글자"만 모은다. 칸 하나를 넘어 퍼지는 토큰(칸 간격의 1.5배 초과)은
+    묶음 헤더/제목으로 보고 제외한다."""
+    if len(col_x0s) < 2:
+        return [None] * len(col_x0s)
+    spacing = min(b - a for a, b in zip(col_x0s, col_x0s[1:]))
+    max_width = spacing * 1.5
+    # 헤더 영역의 위 경계: 표 제목("나.집합투자기구에 부과되는 보수 및
+    # 비용")보다 위로는 안 올라간다. 제목 글자도 폭이 좁아 폭 필터에 안
+    # 걸리고 컬럼 위에 겹쳐서, 안 자르면 칸 이름이 "부과되는보수집합투자
+    # 업자보수"처럼 제목 조각을 달고 나온다(KR5122420005/KR5172450019 실측).
+    start = max(0, first_data_idx - 14)
+    for j in range(first_data_idx - 1, start - 1, -1):
+        if "부과되는" in "".join(w["text"] for w in lines[j]):
+            start = j + 1
+            break
+    header_lines = lines[start:first_data_idx]
+
+    out = []
+    for cx in col_x0s:
+        # 칸 이름은 값 위에 가운데 정렬로 찍히므로, 값의 가운데를 기준으로
+        # 칸 간격의 절반 안에 "글자 뭉치의 가운데"가 들어올 때만 이 칸의
+        # 이름으로 본다(겹침만 보면 옆 칸 이름까지 딸려온다 - 실측으로
+        # "집합판매회사투자업자보수"처럼 두 칸 이름이 섞였다). 값 폭은
+        # "0.72"류 4~6글자라 10pt를 더해 가운데로 잡는다.
+        center = cx + 10
+        lo, hi = center - spacing * 0.5, center + spacing * 0.5
+        pieces = []
+        for row_i, line in enumerate(header_lines):
+            for w in line:
+                if DECIMAL_RE.match(w["text"]):
+                    continue
+                if (w["x1"] - w["x0"]) > max_width:
+                    continue  # 묶음 헤더("지급비용(연간%)")/문서 제목
+                # 값 칸 전체를 아우르는 단위·범위 표기("지급비율",
+                # "지급비용", "(연간,%)")는 특정 칸의 이름이 아니다 -
+                # 폭이 좁아 위 필터를 통과하므로 글자로도 걸러낸다.
+                if w["text"].startswith("지급") or "연간" in w["text"]:
+                    continue
+                wc = (w["x0"] + w["x1"]) / 2
+                if lo <= wc <= hi:
+                    pieces.append((row_i, w["x0"], w["text"]))
+        text = "".join(t for _, _, t in sorted(pieces))
+        out.append(text or None)
+    return out
 
 
 def _find_detail_fee_data_rows(pdf):
@@ -1338,7 +1411,13 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
                     break
             if header_idx is None:
                 continue
-            labels = _cluster_header_labels(lines, header_idx)
+            # 헤더는 "동종"이 있는 줄에서 끝나지 않고 그 아래로도 이어진다
+            # (KR510902511M 28페이지 실측: "동종유형"은 5행인데 "총/보수"
+            # 나머지 조각과 "(피투자집합투자기구보수포함)"은 6~9행에 있다).
+            # header_idx까지만 보면 라벨이 통째로 잘려서 fee_breakdown의
+            # 항목 이름이 "집합"/"일반"처럼 뜻을 알 수 없게 된다 - 첫 데이터
+            # 행 직전까지를 헤더 영역으로 본다.
+            labels = _cluster_header_labels(lines, min(data_idx) - 1)
 
             raw_rows = []
             consumed_lines = set()  # 위→아래 순서로 처리, 앞 행이 쓴 라벨 줄은 다음 행이 재사용 못 하게
@@ -1432,15 +1511,42 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
             if total_col is None and total_sum_n is None:
                 continue
 
-            label_by_col = []
-            for x0 in col_x0s:
-                nearest = min(labels, key=lambda l: abs(l[0] - x0)) if labels else None
-                label_by_col.append(nearest[1] if nearest else None)
+            label_by_col = _detail_fee_labels_by_column(lines, min(data_idx), col_x0s)
 
             for r in raw_rows:
-                if not r["class_code"] or r["class_code"] in known:
+                if not r["class_code"]:
                     continue
                 cols = r["cols"]
+                if r["class_code"] in known:
+                    # 요약표에서 이미 뽑힌 클래스라도, 상세표에만 있는
+                    # 세부 항목(집합투자업자보수/신탁업자보수/일반사무관리
+                    # 회사보수 등 = fee_breakdown)은 가져와서 채운다.
+                    # 처음엔 이런 클래스를 통째로 건너뛰어서, 같은 상세표
+                    # 안에 값이 멀쩡히 있는데도 요약표 출신 클래스만
+                    # fee_breakdown이 없는 상태가 됐다(KR510902511M 실측:
+                    # 14개 클래스 중 요약표 출신 6개만 breakdown 없음 -
+                    # 사용자가 원본 표와 대조해서 지적). class_returns에서
+                    # 쓴 것과 같은 원칙(FULL OUTER JOIN처럼 "어느 쪽에만
+                    # 있는 정보든 다 살린다")을 여기에도 적용한다.
+                    # 숫자 필드(total_fee 등)는 요약표 것을 그대로 둔다 -
+                    # 이 페이지를 채택한 조건 자체가 "요약표 값과 정확히
+                    # 일치"라서 어느 쪽을 써도 같고, 요약표 쪽엔 비용예시
+                    # (cost_projection_per_10m)까지 있어 더 완전하다.
+                    cur = known[r["class_code"]]
+                    if not cur.get("fee_breakdown"):
+                        bd = [
+                            {"label": label_by_col[c], "value": v}
+                            for c, v in sorted(cols.items())
+                            if c not in (dist_col, peer_col, cost_col)
+                            and (total_col is None or c != total_col)
+                        ]
+                        if bd:
+                            cur["fee_breakdown"] = bd
+                            cur.setdefault("field_source_pages", {})["fee_breakdown"] = page_num
+                            sp = cur.setdefault("source_pages", [cur["page"]])
+                            if page_num not in sp:
+                                sp.append(page_num)
+                    continue
                 # 판매회사보수/동종유형총보수 등 특정 칸이 원본에 "-"로
                 # 찍혀 대시 토큰 자체가 안 잡히는 클래스가 있다
                 # (KR5122420005 C-W, KR510902773M C-F 등 실측 - 부가서비스가
@@ -1478,6 +1584,8 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
                     "cost_projection_per_10m": {},
                     "fee_breakdown": breakdown,
                     "page": page_num,
+                    "source_pages": [page_num],
+                    "field_source_pages": {},
                     "evidence": f"[상세표 보강] {sorted(cols.items())}",
                     "method": "detail_table_cross_validated",
                     "confidence": 0.7,
@@ -1485,6 +1593,350 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
                 })
 
     return existing_rows + new_rows
+
+
+# "가.투자자에게 직접 부과되는 수수료" 표: enrich_with_detail_fee_table로 새로
+# 추가된 클래스는 sales_commission_desc가 전부 null이다("나" 상세표엔 판매
+# 수수료 문구 자체가 없음). 이 표에서 채울 수 있는데, 선취/후취/환매/전환
+# 4칸이 텍스트라서("납입금액의 N%이내" 문구가 데이터 행 앞뒤 줄로 걸쳐
+# 나옴 - "나" 표와 같은 줄바꿈 문제) 원문을 그대로 이어붙이면 위험하다
+# (KR5122420005 실측: A클래스는 이 표엔 "0.10%"만 있는데 이미 확인된 진짜
+# 값은 "납입금액의 0.10%이내"로 "이내"가 빠져 있음).
+#
+# 4칸이 전부 "없음"이면(수수료가 정말 하나도 없는 확실한 경우) 그대로
+# "-"로 채운다.
+#
+# 3칸만 "없음"이고 한 칸이 빠진 행은 그 칸에 진짜 수수료가 있어서 문구가
+# 위/아래 줄로 걸쳐 나간 것이다(KR5122420005 S클래스 실측: "후취" 칸만
+# 빠진 채 나머지 3칸이 "없음"인데, 실제로는 "3년 미만 환매시: 환매금액의
+# 0.15%이내"라는 후취 판매수수료가 있음). 이 경우는 원문을 그대로 옮기는
+# 대신(위 "이내" 누락 사례처럼 원문 자체가 불완전할 수 있어서) 앞쪽 요약
+# 표(find_fee_rows_on_page)와 똑같은 방식으로 - 데이터 행 앞/뒤로 창을
+# 넓혀가며 "납입"/"환매금액"(기준)과 "N%"/"100분의 N"(비율), 그리고
+# "OO년 미만 환매시"(후취 조건, 있으면)를 정규식으로 뽑아 정형화된 문구
+# "{조건}{기준}의 {비율}%이내"로 재구성한다 - 원문을 그대로 베끼지 않고
+# 항상 같은 틀로 다시 쓰므로 위 "이내" 누락 같은 원문 표기 흠결에 영향을
+# 안 받는다. 창을 넓히다가 다른 클래스의 완전한 데이터 행("없음" 3개
+# 이상)이나 닫는 괄호(위쪽)/다음 클래스 라벨 시작(아래쪽)을 만나면 그
+# 즉시 멈추고(다른 클래스 문구를 끌고 오지 않기 위해), 그래도 기준+비율을
+# 둘 다 못 찾으면 채우지 않고 null로 남긴다(KR5122420005 A/A2/A-E/A-G/S
+# 5개 클래스 전부 실측 검증 완료 - README 참고).
+# "가.투자자에게 직접 부과되는 수수료" 표의 제목. 자본시장법 투자설명서
+# 서식의 고정 문구라 문서마다 안 바뀐다(번호가 "가."/"1)"로 갈리거나 띄어
+# 쓰기가 달라서 번호는 빼고 본문만 본다). 판매수수료가 아직 안 채워진
+# 43개 문서 전부에서 이 문구로 페이지가 찾아지는 걸 실측으로 확인했다
+# (43/43).
+GA_CAPTION_RE = re.compile(r"투자자에게직접부과되는수수료")
+
+
+def _ga_table_pages(pdf):
+    """이 표가 있는 페이지를 찾는다.
+
+    처음엔 캡션이 문서마다 다를까 봐("나" 표에서 실제로 그랬다) 칸 이름
+    ("환매수수료"+"판매수수료")으로 찾았는데, 그 단어들은 표가 아닌
+    곳에도 흔히 나와서(가입자격 표, 용어사전, 환매절차 설명 페이지 등
+    실측) 엉뚱한 페이지가 걸리고 정작 진짜 표는 못 찾는 경우가 많았다
+    (43개 문서에서 판매수수료가 null로 남음 - "판매수수료 다 있는 거
+    아니었냐"는 사용자 지적으로 재조사). 이 표의 제목은 법정 서식 고정
+    문구라 실제로는 전 문서에서 안 바뀐다는 걸 전수 확인해서(43/43)
+    캡션 기준으로 바꿨다.
+
+    표가 다음 페이지로 이어지는 문서가 있어 캡션 페이지와 그 다음
+    페이지를 같이 본다(엉뚱한 페이지가 아니라 "이 표의 연속"이라
+    범위를 넓혀도 안전하다)."""
+    caption_pages = []
+    for i, page in enumerate(pdf.pages):
+        words = page.extract_words(x_tolerance=2, keep_blank_chars=False)
+        for l in cluster_lines(words):
+            flat = "".join(w["text"] for w in l).replace(" ", "")
+            if GA_CAPTION_RE.search(flat):
+                caption_pages.append(i)
+                break
+
+    wanted = set()
+    for i in caption_pages:
+        wanted.add(i)
+        if i + 1 < len(pdf.pages):
+            wanted.add(i + 1)
+
+    results = []
+    for i in sorted(wanted):
+        words = pdf.pages[i].extract_words(x_tolerance=2, keep_blank_chars=False)
+        results.append((i + 1, cluster_lines(words)))
+    return results
+
+
+def _ga_table_header_columns(lines):
+    """선취/후취/환매수수료/전환수수료 칸의 x좌표를 헤더에서 찾는다.
+
+    헤더 칸 이름이 한 토큰으로 나오는 문서도 있고("선취판매수수료"),
+    여러 줄에 나뉘어 쌓이는 문서도 있다(KR510902511M 실측: "선취판매"/
+    "수수료"가 서로 다른 줄, "전환"과 "수수료"도 마찬가지) - 단어 하나씩
+    비교하면 후자를 못 잡아 칸 수를 3개로 잘못 세고, 그러면 데이터 행의
+    마커 4개와 개수가 안 맞아 이 문서 전체가 통째로 빠진다. "나" 상세표
+    에서 쓰던 것과 같은 방식으로 x좌표가 비슷한 조각들을 세로로 이어붙여
+    (_cluster_header_labels) 칸 이름을 복원한 뒤 매칭한다.
+
+    전환수수료 칸 자체가 없는(선취/후취/환매 3칸뿐인) 문서가 있어
+    (KR5113420012 실측) 4칸을 다 요구하지 않고 찾아지는 만큼만 돌려준다.
+    "없음"/"-" 토큰이 처음 나오는 줄 위쪽(헤더 영역)에서만 찾아 본문
+    각주에 같은 단어가 다시 나와도 안 걸리게 한다."""
+    first_data_idx = None
+    for j, l in enumerate(lines):
+        if any(w["text"] == "없음" or DETAIL_FEE_DASH_RE.match(w["text"]) for w in l):
+            first_data_idx = j
+            break
+    if first_data_idx is None:
+        return None
+    labels = _cluster_header_labels(lines, first_data_idx - 1)
+    cols = {}
+    for x0, text in labels:
+        t = text.replace(" ", "")
+        if "선취" in t and "선취" not in cols:
+            cols["선취"] = x0
+        elif "후취" in t and "후취" not in cols:
+            cols["후취"] = x0
+        elif "환매수수료" in t and "환매" not in cols:
+            cols["환매"] = x0
+        elif "전환수수료" in t and "전환" not in cols:
+            cols["전환"] = x0
+    if "환매" not in cols or len(cols) < 2:
+        return None
+    return cols
+
+
+GA_MAX_EXTRA_LINES = 3
+
+
+def _ga_no_value_markers(line):
+    """이 표는 문서에 따라 "수수료 없음"을 "없음"이라는 글자 또는 그냥
+    "-"로 표시한다("나" 상세표와 같은 관례 - KR5114420027 실측: "-"만
+    씀). 둘 다 같은 뜻으로 취급한다."""
+    return [w for w in line if w["text"] == "없음" or DETAIL_FEE_DASH_RE.match(w["text"])]
+
+
+def _ga_row_is_full(line, min_markers):
+    return len(_ga_no_value_markers(line)) >= min_markers
+
+
+def _ga_row_has_close_paren(line):
+    return any(")" in w["text"] for w in line)
+
+
+def _ga_row_is_class_start(line):
+    return bool(CLASS_NAME_START_RE.match("".join(w["text"] for w in line)))
+
+
+def _ga_row_class_code(lines, row_idx, min_markers, consumed):
+    """데이터 행 자신의 줄에 클래스 코드가 없으면(라벨이 데이터 행을
+    위/아래로 감싸는 서식 - KR5114420027 실측: "수수료미징구-오프라인
+    -기관"(위 1줄) / [데이터 행] / "(Cf)"(아래 1줄)) 위/아래 몇 줄까지
+    찾아본다. "나" 상세표의 _detail_fee_row_class_code와 같은 이유로
+    consumed(이미 다른 행이 라벨로 쓴 줄)와 다른 클래스의 완전한 데이터
+    행을 경계로 삼는다."""
+    line = lines[row_idx]
+    label_text = "".join(w["text"] for w in line if id(w) not in {id(x) for x in _ga_no_value_markers(line)})
+    for regex in (CLASS_CODE_RE, DETAIL_FEE_CLASS_CODE_JONGRYU_RE):
+        m = regex.search(label_text)
+        if m and m.group(1) not in DETAIL_FEE_CODE_BLOCKLIST:
+            return m.group(1)
+
+    prev_idx = []
+    for k in range(row_idx - 1, max(row_idx - 4, -1), -1):
+        if k in consumed or _ga_row_is_full(lines[k], min_markers):
+            break
+        prev_idx.insert(0, k)
+    next_idx = []
+    for k in range(row_idx + 1, min(row_idx + 4, len(lines))):
+        if _ga_row_is_full(lines[k], min_markers):
+            break
+        next_idx.append(k)
+    prev_text = "".join("".join(w["text"] for w in lines[k]) for k in prev_idx)
+    next_text = "".join("".join(w["text"] for w in lines[k]) for k in next_idx)
+
+    for regex in (CLASS_CODE_RE, DETAIL_FEE_CLASS_CODE_JONGRYU_RE):
+        matches = [mm for mm in regex.finditer(prev_text) if mm.group(1) not in DETAIL_FEE_CODE_BLOCKLIST]
+        if matches:
+            consumed.update(prev_idx)
+            return matches[-1].group(1)
+        matches = [mm for mm in regex.finditer(next_text) if mm.group(1) not in DETAIL_FEE_CODE_BLOCKLIST]
+        if matches:
+            consumed.update(next_idx)
+            return matches[0].group(1)
+    return None
+
+
+def _ga_commission_column_left(lines, min_markers):
+    """이 표에서 수수료 칸들이 시작하는 x좌표를 찾는다.
+
+    "없음"/"-" 마커는 수수료 칸에만 찍히므로(클래스명·가입자격 칸엔 나올
+    일이 없다) 페이지의 모든 데이터 행에서 마커 x좌표를 모아 그 최솟값을
+    쓰면, 헤더 파싱에 기대지 않고도 수수료 칸 영역의 왼쪽 경계를 알 수
+    있다(헤더는 문서마다 줄바꿈/병합이 제각각이라 x좌표를 믿기 어렵다 -
+    KR5157450090 실측: 헤더 클러스터링이 "선취" x를 60(왼쪽 여백)으로
+    잘못 잡았다). 마커가 2개 미만인 줄은 본문에 우연히 있는 하이픈일 수
+    있어 제외한다.
+
+    마커만으로 세면 가장 왼쪽 수수료 칸(선취)에 마커가 하나도 없는 문서
+    에서 경계가 너무 오른쪽으로 잡힌다(KR5120420039 실측: 마커는 393
+    부터인데 선취 칸의 "납입금액의"/"0.02%"는 321~332에 있어 통째로
+    잘려나갔다). 수수료율 표기인 "N%"와 "이내"도 수수료 칸에만 나오므로
+    같이 세서 경계를 잡는다("납입금액"은 가입자격 설명문에도 나와서
+    ("최초 납입금액이 3억원 이상인 경우") 기준으로 쓰면 안 된다)."""
+    xs = []
+    for line in lines:
+        if sum(1 for w in line if DECIMAL_RE.match(w["text"])) >= 3:
+            continue
+        markers = _ga_no_value_markers(line)
+        if len(markers) >= min(2, min_markers):
+            xs.extend(w["x0"] for w in markers)
+        for w in line:
+            if w["text"] == "이내" or re.fullmatch(r"\d+(?:\.\d+)?%", w["text"]):
+                xs.append(w["x0"])
+    return min(xs) if xs else None
+
+
+def _ga_reconstruct_commission_desc(lines, row_idx, min_markers, commission_x_left=None):
+    """데이터 행(row_idx) 앞/뒤로 창을 넓혀 "납입금액의 N%이내"류 문구를
+    정형화된 틀로 재구성한다(원문 그대로 베끼지 않는 이유는 위
+    enrich_sales_commission_from_ga_table 앞 주석 참고). 못 찾으면 None.
+
+    commission_x_left: 수수료 칸들의 왼쪽 경계 x좌표. 창 안의 줄을 통째로
+    이어붙이면 같은 줄에 있는 *다른 칸*(클래스명/가입자격) 텍스트가 문구
+    사이에 끼어들어 정규식이 깨진다(KR5157450090 S 실측: "3년미만"(13행)과
+    "환매시"(15행) 사이에 클래스명 "수수료후취-"(14행)가 끼어 "3년미만
+    수수료후취-환매시"가 되면서 "N년 미만 환매시" 조건을 통째로 놓쳤다 -
+    조건이 빠지면 "무조건 떼는 수수료"로 뜻이 달라진다). 이 경계보다
+    오른쪽 단어만 남겨 수수료 칸 텍스트만 이어붙인다."""
+    up_lines = []
+    found_basis = False
+    j = row_idx - 1
+    extra = 0
+    while j >= 0 and extra < GA_MAX_EXTRA_LINES and not found_basis:
+        if _ga_row_is_full(lines[j], min_markers) or _ga_row_has_close_paren(lines[j]):
+            break
+        up_lines.insert(0, lines[j])
+        text = "".join(w["text"] for w in lines[j])
+        if "납입" in text or "환매금액" in text:
+            found_basis = True
+        extra += 1
+        j -= 1
+
+    down_lines = []
+    found_pct = False
+    j = row_idx + 1
+    extra = 0
+    while j < len(lines) and extra < GA_MAX_EXTRA_LINES and not found_pct:
+        if _ga_row_is_full(lines[j], min_markers) or _ga_row_is_class_start(lines[j]):
+            break
+        down_lines.append(lines[j])
+        text = "".join(w["text"] for w in lines[j])
+        if SALES_COMMISSION_PCT_RE.search(text) or BUNUI_RE.search(text):
+            found_pct = True
+        extra += 1
+        j += 1
+
+    def _cols_only(wl):
+        if commission_x_left is None:
+            return wl
+        return [w for w in wl if w["x0"] >= commission_x_left - 20]
+
+    window_text = "".join(
+        w["text"] for wl in (up_lines + [lines[row_idx]] + down_lines) for w in _cols_only(wl)
+    )
+    basis = (
+        "환매금액" if "환매금액" in window_text
+        else ("납입금액" if "납입" in window_text else None)
+    )
+    if not basis:
+        return None
+    pct_m = SALES_COMMISSION_PCT_RE.search(window_text)
+    bunui_m = BUNUI_RE.search(window_text)
+    if not pct_m and not bunui_m:
+        return None
+    pct = pct_m.group(1) if pct_m else bunui_m.group(1)
+    condition_prefix = ""
+    if basis == "환매금액":
+        cond_m = REDEMPTION_CONDITION_RE.search(window_text)
+        if cond_m:
+            condition_prefix = f"{cond_m.group(1)}년 미만 환매시: "
+    return f"{condition_prefix}{basis}의 {pct}%이내"
+
+
+def enrich_sales_commission_from_ga_table(doc_id, existing_rows):
+    targets = [
+        r for r in existing_rows
+        if r.get("class_code") and r.get("sales_commission_desc") is None
+    ]
+    if not targets:
+        return existing_rows
+    by_code = {}
+    for r in targets:
+        by_code.setdefault(r["class_code"], []).append(r)
+
+    pdf_candidates = glob.glob(os.path.join(DATA_DIR, doc_id, "*.pdf"))
+    if not pdf_candidates:
+        return existing_rows
+
+    with pdfplumber.open(pdf_candidates[0]) as pdf:
+        prev_page_num, prev_cols = None, None
+        for page_num, lines in _ga_table_pages(pdf):
+            col_x0s = _ga_table_header_columns(lines)
+            if not col_x0s:
+                # 표가 다음 페이지로 이어지면 그 페이지엔 헤더가 없다
+                # (KR510902511M 실측: 26페이지에 헤더+첫 행, 27페이지엔
+                # 나머지 클래스만). 바로 앞 페이지에서 찾은 칸 구성을
+                # 그대로 이어 쓴다 - 같은 표의 연속이라 칸 x좌표도 같다.
+                if prev_cols is None or prev_page_num != page_num - 1:
+                    continue
+                col_x0s = prev_cols
+            prev_page_num, prev_cols = page_num, col_x0s
+            n_cols = len(col_x0s)
+            # 다른 클래스의 "완전한" 데이터 행(창 확장 경계로 쓰임)을
+            # 판별하는 기준 - 칸이 3개인 문서는 2개, 4개인 문서는 3개
+            # 이상 채워져 있으면 완전한 행으로 본다.
+            min_markers = max(2, n_cols - 1)
+            commission_x_left = _ga_commission_column_left(lines, min_markers)
+            # 마커(없음/-)를 각 칸의 x좌표와 거리로 매칭하려 했는데, 헤더
+            # 칸 이름과 그 아래 실제 값 사이의 오프셋이 문서마다 달라서
+            # (KR5122420005 ~14pt, KR5113420012 ~24pt, KR5114420027는
+            # letter-spacing 탓에 칸 간격 자체가 좁아 25pt에서도 못 잡는
+            # 경우 실측) 고정 허용오차로는 계속 놓치는 문서가 나왔다. 이
+            # 표는 칸이 항상 왼→오 순서로 고정돼 있어서(선취/후취/환매/
+            # [전환]), 마커 "개수"가 칸 개수와 같은지만 보면 충분하다 -
+            # x좌표 매칭 자체가 필요 없다(개수가 같으면 왼쪽부터 순서대로
+            # 대응된다고 봐도 되고, "몇 번째 칸인지"는 "-"로 채우는
+            # 결정에도, 재구성 함수에도 안 쓰인다).
+            consumed_lines = set()  # 위→아래 순서로 처리, 앞 행이 쓴 라벨 줄은 다음 행이 재사용 못 하게
+            for row_idx, line in enumerate(lines):
+                markers = _ga_no_value_markers(line)
+                if not markers:
+                    continue
+                # 이 페이지엔 "나.집합투자기구에 부과되는 보수" 같은 다른
+                # 표(순수 %숫자로만 된 데이터 행)가 같이 있을 수 있다
+                # (KR5114420027 실측: "가"표 바로 아래 "나"표가 이어지는데,
+                # 그 표의 값 하나("-")가 우연히 이 줄 판별에 걸릴 뻔했다).
+                # "가"표 데이터 행은 판매수수료 % 하나 정도만 있고 다른
+                # 표처럼 소수가 여러 개(3개 이상) 몰려 있을 일이 없으므로,
+                # 그런 줄은 아예 후보에서 제외해 다른 표 값을 잘못 가져올
+                # 위험을 원천 차단한다.
+                if sum(1 for w in line if DECIMAL_RE.match(w["text"])) >= 3:
+                    continue
+                code = _ga_row_class_code(lines, row_idx, min_markers, consumed_lines)
+                if not code or code not in by_code:
+                    continue
+                desc = None
+                if len(markers) == n_cols:
+                    desc = "-"
+                elif len(markers) == n_cols - 1:
+                    desc = _ga_reconstruct_commission_desc(
+                        lines, row_idx, min_markers, commission_x_left
+                    )
+                if desc:
+                    for r in by_code[code]:
+                        r["sales_commission_desc"] = desc
+
+    return existing_rows
 
 
 def process_doc(doc_id):
@@ -1605,6 +2057,18 @@ def main():
         rows = enrich_with_detail_fee_table(doc_id, rows)
         if len(rows) > before:
             detail_enriched += 1
+        # "나" 상세표 보강으로 새로 생긴 클래스들의 sales_commission_desc
+        # null을 "가.투자자에게 직접 부과되는 수수료" 표에서 채운다(확실한
+        # "없음"만 - 위 enrich_sales_commission_from_ga_table 주석 참고).
+        rows = enrich_sales_commission_from_ga_table(doc_id, rows)
+        # 출처 필드는 모든 행이 갖도록 맞춘다(class_returns.json과 같은
+        # 규칙) - 합쳐진 행만 갖고 있으면 조회하는 쪽이 매번 존재 여부를
+        # 따져야 한다. 보강 함수 안에서 하면 그 함수가 일찍 return하는
+        # 문서(클래스가 1개뿐이라 대조 기준이 없는 KR5123365001 등)가
+        # 빠지므로 여기서 한다.
+        for r in rows:
+            r.setdefault("source_pages", [r["page"]])
+            r.setdefault("field_source_pages", {})
         all_rows.extend(rows)
 
     with open(args.output, "w", encoding="utf-8") as f:

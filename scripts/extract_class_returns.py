@@ -63,6 +63,19 @@ SECTION_NA_RE = re.compile(r"나[\.．]연도별수익률")
 # 클래스 행의 설정일("2016-04-18", "2001.01.31" 등) - 표 데이터가 아니라 각 행에
 # 딸린 값이라 구조화 필드로 남겨둘 만하다.
 INCEPTION_DATE_RE = re.compile(r"\d{4}[.\-]\d{1,2}[.\-]\d{1,2}")
+
+
+def _normalize_date(s):
+    """설정일 표기가 문서마다 "2013.08.19"와 "2009-04-20"으로 갈린다(실측:
+    점 140건 / 하이픈 128건). 이건 원본이 담은 "정보"가 아니라 그냥 조판
+    표기 차이라, 다른 값들("-" 같은 건 원본 뜻이 있어 그대로 두는 것과
+    달리) 통일해도 잃는 게 없다. 반대로 섞인 채 두면 SQL에서 날짜 비교/
+    정렬이 안 돼서("가장 먼저 설정된 클래스는?" 같은 질의) 실제로 답을
+    못 하게 된다. ISO(YYYY-MM-DD)로 맞춘다 - 한 자리 월/일도 0을 채운다."""
+    m = re.fullmatch(r"(\d{4})[.\-](\d{1,2})[.\-](\d{1,2})", s)
+    if not m:
+        return s
+    return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
 PERIOD_LABELS = ["1y", "2y", "3y", "5y", "since_inception"]
 # 최근3년/최근5년 칸이 원본에 아예 빈칸인(설정된 지 얼마 안 된 펀드) 행이
 # 있다(KR5120420091 실측: "최근1년 최근2년 최근3년 최근5년 설정일이후" 5칸
@@ -329,13 +342,60 @@ def find_return_rows_on_page(page, page_num, section="가", known_classes=None):
                         # 것으로 끝나는 경우에만(더 긴 코드 우선, 그 앞
                         # 글자가 영문/숫자가 아닌 경우만 - "BA1"의 "A1"처럼
                         # 엉뚱하게 잘라 오는 걸 방지) 인정한다.
-                        combined = (prev_line_text + " " + label_search_text).rstrip()
-                        for code in sorted(known_classes, key=len, reverse=True):
-                            if combined.endswith(code):
-                                before = combined[: -len(code)]
-                                if not before or not before[-1].isalnum():
-                                    class_code = code
+                        # 클래스명이 3줄로 쪼개지면서 코드가 데이터 줄
+                        # *두 줄* 아래에 오는 서식이 있다(KR5172450019
+                        # 실측: "수수료미징구-" / "오프라인- 14.78 ..." /
+                        # "11.6.27"(최초설정일) / "보수체감(C4)"). 한 줄만
+                        # 보면 이런 클래스를 통째로 놓친다(이 문서는 15개
+                        # 클래스 중 1개만 잡혔다).
+                        # 그렇다고 코드 탐색 창을 일반적으로 넓히면 바로
+                        # 다음 클래스의 이름을 이 행 것으로 잘못 가져오는
+                        # 사고가 난다(이 파일 곳곳의 주석 참고 - 넓은 창은
+                        # "틀렸는데 그럴듯한 값"을 만들어 이상치 검사도
+                        # 못 걸러낸다). 그래서 두 줄 아래는 known_classes
+                        # (class_fees.json으로 검증된 이 상품의 실제 코드
+                        # 목록)로 걸러지는 이 경로에서만, 그리고 사이 줄이
+                        # 값도 비교지수/변동성도 아닐 때만(=아직 이 행의
+                        # 라벨이 이어지는 중일 때만) 본다.
+                        # 한 줄까지만 본 텍스트로 "먼저" 맞춰보고, 거기서
+                        # 못 찾을 때만 두 줄째를 붙여 다시 본다. 처음엔
+                        # 무조건 두 줄째까지 붙여서 봤는데, 라벨이 한 줄
+                        # 아래에서 이미 끝나는 문서(KR5157450017: "...
+                        # 신탁(주식)A1"에서 끝남)는 그 뒤에 비교지수 줄이
+                        # 딸려 붙어 "...3.98"로 끝나게 돼 endswith 매칭이
+                        # 깨졌다(그 문서 클래스가 7개→1개로 회귀).
+                        candidates = [(prev_line_text + " " + label_search_text).rstrip()]
+                        if i + 2 < len(lines):
+                            mid_has_value = any(
+                                DECIMAL_RE.match(t) or DASH_RE.match(t)
+                                for t in next_line_text.split()
+                            )
+                            if not mid_has_value and row_kind(next_line_text) not in ("benchmark", "volatility"):
+                                candidates.append(
+                                    (candidates[0] + " " + _line_text_skipping_captions(lines, i + 2, 1)).rstrip()
+                                )
+                        for combined in candidates:
+                            # 괄호형("...보수체감(C3)")도 여기서 같이 본다.
+                            # 위 CLASS_CODE_RE 검사는 좁은 창(pre_text +
+                            # 한 줄)만 보기 때문에 두 줄 아래에 있는 괄호
+                            # 코드를 못 잡는데(KR5172450019), 그렇다고 그
+                            # 검사 자체의 창을 넓히면 옆 클래스 코드를
+                            # 주워온다. known_classes에 있는 코드만
+                            # 인정하는 이 경로에서는 넓혀도 안전하다.
+                            for mm in reversed(list(CLASS_CODE_RE.finditer(combined))):
+                                if mm.group(1) in known_classes:
+                                    class_code = mm.group(1)
                                     break
+                            if class_code:
+                                break
+                            for code in sorted(known_classes, key=len, reverse=True):
+                                if combined.endswith(code):
+                                    before = combined[: -len(code)]
+                                    if not before or not before[-1].isalnum():
+                                        class_code = code
+                                        break
+                            if class_code:
+                                break
 
             if class_code:
                 # 클래스 코드가 확실히 잡혔으면 그 자체로 "클래스 행"이라는
@@ -357,7 +417,7 @@ def find_return_rows_on_page(page, page_num, section="가", known_classes=None):
                 kind = row_kind(pre_text, raw_prev_line_text, raw_next_line_text)
 
         date_m = INCEPTION_DATE_RE.search(pre_text)
-        inception_date = date_m.group() if date_m else None
+        inception_date = _normalize_date(date_m.group()) if date_m else None
 
         # 아직 수익률이 없는 신규 클래스 등은 원본이 그 칸에 "-"를 직접
         # 찍어서 "값이 없다"는 걸 명시적으로 밝힌다. 이걸 그냥 None으로
@@ -452,7 +512,7 @@ def _apply_merged_cell_dates(page, words, rows):
             continue
         for r in rows:
             if rc["top"] - 1 <= r["_top"] <= rc["bottom"] + 1:
-                r["inception_date"] = cell_date
+                r["inception_date"] = _normalize_date(cell_date)
 
 
 def candidate_pages_for_doc(doc_id, max_page):
@@ -507,6 +567,159 @@ def _known_classes_for_doc(doc_id):
     return _KNOWN_CLASSES_BY_DOC.get(doc_id, set())
 
 
+# 앞쪽 "요약정보" 섹션의 "가.연평균수익률" 표에는 대표 클래스 한두 개만 싣고,
+# 전 클래스 수익률은 문서 뒤쪽(제2부 상세)의 같은 형식 표에만 싣는 문서가 아주
+# 많다(KR5122420005 실측: 요약표엔 ClassC 하나뿐인데 52페이지 상세표엔 14개
+# 클래스가 전부 있음). candidate_pages_for_doc은 "투자실적" 캡션이 붙은
+# 요약 섹션만 보기 때문에 이 상세표를 통째로 놓쳤고, 그 결과 class_fees.json
+# 기준 612개 클래스 중 수익률이 있는 건 269개뿐이었다(399개 클래스의 수익률이
+# 빠짐 - 6축 중 "수익률" 축이 문서당 사실상 1개 클래스만 있는 상태였다).
+#
+# 이걸 고치려고 candidate_pages_for_doc의 페이지 후보를 넓히는 방식은 이미
+# 3번 시도했다가 전부 되돌렸다(위 그 함수의 주석 참고 - 600건이 1799~1822건
+# 으로 튀고, 좌수 변동표처럼 "라벨 + 숫자 5개" 모양이 똑같은 무관한 표까지
+# 딸려 들어왔다). 페이지의 "모양"만으로는 이 상품의 진짜 수익률 표와 우연히
+# 같은 모양인 다른 표를 구분할 수 없다는 게 그때의 결론이었다.
+#
+# 그래서 class_fees.py의 enrich_with_detail_fee_table에서 검증된 방식을 쓴다:
+# 모양이 아니라 "이미 확실히 아는 값과 대조"해서 판단한다. 요약표에서 뽑아
+# 둔 클래스(위 예시의 ClassC = 2.85/3.49/4.08/2.93/2.37)가 그 페이지에도
+# 있고 값이 전부 일치할 때만 그 표를 "같은 표"로 인정하고, 거기 있는 나머지
+# 클래스를 가져온다. 값이 하나라도 어긋나면 그 페이지는 통째로 버린다.
+#
+# 이 대조 하나로 "나.연도별 수익률 추이" 표(1~5년차 단년도 수익률 - 컬럼
+# 의미가 달라서 같은 스키마에 넣으면 안 되는 표)도 자동으로 걸러진다:
+# KR5122420005 53페이지의 ClassC는 2.85/4.13/5.29/1.93/0.50 이라 첫 값만
+# 우연히 같고 나머지가 전부 달라 검증에 실패한다(섹션 제목 판정에 더해
+# 이중 안전장치가 되는 셈).
+def _values_agree(a, b):
+    """(일치하는 숫자 칸 수, 어긋난 칸이 있는지) - 한쪽이 "-"인 칸은 비교에서
+    제외한다(아직 수익률이 없는 클래스는 원본이 "-"로 두는데, 요약표와
+    상세표의 기준일이 달라 한쪽에만 값이 생겼을 수 있어 그것만으로 다른
+    표라고 볼 근거는 안 된다)."""
+    matched = 0
+    for k in PERIOD_LABELS:
+        va, vb = a.get(k), b.get(k)
+        if va is None or vb is None:
+            continue
+        try:
+            fa, fb = float(va), float(vb)
+        except (TypeError, ValueError):
+            continue  # "-" 등 숫자가 아닌 칸
+        if abs(fa - fb) <= 0.0005:
+            matched += 1
+        else:
+            return matched, True
+    return matched, False
+
+
+def _merge_detail_into_summary(summary, detail):
+    """같은 클래스가 요약표와 상세표에 둘 다 있을 때의 합치기 규칙.
+
+    처음엔 "요약표 행을 그대로 두고 최초설정일만 채운다"는 식으로 필요한
+    필드만 하나씩 백필했는데, 그러다 values(수익률 값 자체)를 빠뜨렸다
+    (사용자 지적: "최초설정일 말고 다른것들은?"). 필드를 하나씩 떠올려
+    가며 채우는 방식은 빠뜨리기 쉬워서, SQL의 FULL OUTER JOIN처럼 "이
+    행이 가진 모든 필드에 대해 어느 쪽을 쓸지"를 여기 한 곳에 전부
+    적어두는 방식으로 바꿨다(사용자 제안: "미리 FULL OUTER JOIN으로
+    만들어두면 안 되나"). 새 필드가 생기면 여기만 고치면 된다.
+
+    전제: 호출 전에 이미 값 대조(_values_agree)로 "같은 표의 같은 행"임을
+    확인했다 - 숫자가 서로 어긋나는 경우는 애초에 여기까지 안 온다.
+    """
+    # values: 칸 단위로 COALESCE. 요약표가 "-"(원본이 비워둔 칸)이거나
+    # 칸 자체가 없는데 상세표엔 실제 숫자가 있으면 그 숫자를 살린다
+    # (반대로 요약표에 숫자가 있으면 그대로 둔다 - 둘 다 숫자면 위
+    # 대조에서 같음이 확인된 값이라 어느 쪽을 써도 같다).
+    # 상세표에서 가져온 필드는 어느 페이지에서 왔는지 필드 단위로 남긴다.
+    # source_pages(=이 행이 어느 페이지들에서 만들어졌는지)만으론 "그
+    # 최초설정일 어디서 봤어?"에 "4번 아니면 47번"까지밖에 못 답한다
+    # (사용자 지적: "최초설정일을 47에서 가져와도 물어보면 47인지 아는
+    # 거야?"). 근거 페이지를 틀리게 대면 사람이 그 페이지를 열어보고
+    # 값을 못 찾게 되므로, 채워 넣은 필드는 정확한 페이지를 기록한다.
+    # 이 행의 기본 page에서 온 필드는 안 적는다(그게 대부분이라 다
+    # 적으면 파일만 커진다) - 여기 없는 필드는 page에서 온 것이다.
+    from_detail = summary.setdefault("field_source_pages", {})
+    for k in PERIOD_LABELS:
+        sv, dv = summary["values"].get(k), detail["values"].get(k)
+        if dv is None:
+            continue
+        try:
+            float(dv)
+        except (TypeError, ValueError):
+            continue  # 상세표도 "-"면 채울 게 없다
+        try:
+            float(sv)
+        except (TypeError, ValueError):
+            summary["values"][k] = dv  # 요약표가 "-"이거나 없음 → 상세표 숫자 채택
+            from_detail[f"values.{k}"] = detail["page"]
+    # inception_date: COALESCE (최초설정일 칸이 요약표에만 있는 문서도,
+    # 상세표에만 있는 문서도 실측으로 확인됨 - KR510902773M vs KR5157450017)
+    if summary.get("inception_date") is None and detail.get("inception_date"):
+        summary["inception_date"] = detail["inception_date"]
+        from_detail["inception_date"] = detail["page"]
+    # page/evidence/confidence/method: 요약표 것을 유지한다. page는 "이
+    # 행의 값이 실제로 적혀 있던 위치"라 근거 표시에 쓰이는데, 요약표
+    # 페이지가 문서 앞쪽이라 사람이 찾아보기도 쉽다.
+    pages = summary.setdefault("source_pages", [summary["page"]])
+    if detail["page"] not in pages:
+        pages.append(detail["page"])
+
+
+def enrich_with_detail_return_table(pdf, doc_id, existing_rows, used_pages, known_classes):
+    """요약표엔 없고 뒤쪽 상세표에만 있는 클래스의 수익률 행을 보강한다.
+    검증 실패 시(대조할 클래스가 없거나 값이 어긋나면) 아무것도 안 돌려준다."""
+    known_rows = {
+        r["class_code"]: r
+        for r in existing_rows
+        if r["row_kind"] == "class_return" and r.get("class_code")
+    }
+    known = {code: r["values"] for code, r in known_rows.items()}
+    if not known:
+        return []
+
+    new_rows = []
+    seen_codes = set(known)
+    section = "가"
+    for page_num in range(1, len(pdf.pages) + 1):
+        page = pdf.pages[page_num - 1]
+        rows, section = find_return_rows_on_page(
+            page, page_num, section=section, known_classes=known_classes
+        )
+        if page_num in used_pages:
+            continue  # 이미 요약표로 처리한 페이지 - 섹션 상태만 이어받고 넘어감
+        class_rows = [r for r in rows if r["row_kind"] == "class_return" and r.get("class_code")]
+        refs = [r for r in class_rows if r["class_code"] in known]
+        if not refs:
+            continue
+        total_matched = 0
+        conflict = False
+        for r in refs:
+            matched, bad = _values_agree(r["values"], known[r["class_code"]])
+            total_matched += matched
+            conflict = conflict or bad
+        # 숫자 3칸 이상이 정확히 일치해야 인정한다 - 소수점 둘째 자리까지
+        # 3개가 우연히 맞을 확률은 사실상 없어서, 이 표가 같은 표라는 걸
+        # 충분히 특정한다(반대로 "-"뿐이라 대조할 숫자가 없는 문서는 그냥
+        # 보강을 포기한다 - 틀린 값을 넣느니 없는 채로 두는 쪽).
+        if conflict or total_matched < 3:
+            continue
+        for r in class_rows:
+            r.pop("_top", None)  # 요약표 쪽은 _dedupe_and_merge가 지운다
+            cur = known_rows.get(r["class_code"])
+            if cur is not None:
+                _merge_detail_into_summary(cur, r)
+                continue
+            if r["class_code"] in seen_codes:
+                continue
+            seen_codes.add(r["class_code"])
+            r["product_code"] = doc_id
+            r["method"] = "detail_return_table_cross_validated"
+            r["source_pages"] = [r["page"]]
+            new_rows.append(r)
+    return new_rows
+
+
 def process_doc(doc_id):
     pdf_candidates = glob.glob(os.path.join(DATA_DIR, doc_id, "*.pdf"))
     if not pdf_candidates:
@@ -530,6 +743,26 @@ def process_doc(doc_id):
                 r["product_code"] = doc_id
                 results.append(r)
 
+        # 요약표 기준으로 중복 제거/merge를 먼저 끝낸 뒤(그 결과가 상세표
+        # 대조의 "정답지"가 된다) 뒤쪽 상세표 보강을 돌린다 - pdf 핸들이
+        # 필요해서 이 with 블록 안에서 호출한다.
+        final = _dedupe_and_merge(results)
+        final += enrich_with_detail_return_table(
+            pdf, doc_id, final, set(pages), known_classes
+        )
+        # 합쳐진 행만 source_pages를 갖고 나머지는 없으면 스키마가 들쭉날쭉
+        # 해진다(조회하는 쪽이 매번 존재 여부를 따져야 함) - 모든 행이
+        # 갖도록 맞춘다(안 합쳐진 행은 자기 page 하나).
+        for r in final:
+            r.setdefault("source_pages", [r["page"]])
+            r.setdefault("field_source_pages", {})
+        return final
+
+
+def _dedupe_and_merge(results):
+    """요약표 후보 페이지들에서 뽑힌 행들의 중복 제거 + 같은 클래스 merge.
+    (원래 process_doc 본문이었는데, 상세표 보강이 "중복 제거까지 끝난
+    결과"를 대조 기준으로 써야 해서 별도 함수로 분리했다.)"""
     # 페이지 후보를 넓게 잡다 보니(다음 페이지도 포함) 같은 행이 중복될 수 있다.
     # 처음엔 (row_kind, class_code, values의 1y값)으로 판정했는데, 비교지수/
     # 수익률변동성 행은 class_code가 애초에 없고(None) 같은 상품 안의 여러
