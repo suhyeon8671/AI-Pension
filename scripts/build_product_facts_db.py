@@ -126,6 +126,26 @@ CREATE TABLE fund_aum (
     page INTEGER,
     confidence REAL
 );
+
+-- 클래스 코드가 무슨 뜻인지 (extract_class_meaning.py).
+-- 코드로 뜻을 짐작할 수 없어서(운용사마다 C-P가 개인연금이기도 퇴직연금이기도
+-- 하다) 문서가 적어 둔 이름표를 그대로 담는다. retail=0이면 기관·고액·랩
+-- 전용이라 일반 고객이 살 수 없는 클래스이므로 답변에서 빼야 한다.
+DROP TABLE IF EXISTS class_meaning;
+CREATE TABLE class_meaning (
+    product_code TEXT NOT NULL,
+    class_code TEXT NOT NULL,
+    fee_type TEXT,          -- 선취 / 미징구 / 후취
+    channel TEXT,           -- 오프라인 / 온라인 / 온라인슈퍼 / 직판
+    account_type TEXT,      -- 개인연금 / 퇴직연금 / NULL
+    attributes TEXT,        -- 쉼표로 이은 원문 속성
+    retail INTEGER,         -- 1이면 일반 고객이 가입 가능
+    description TEXT,       -- 고객에게 보여 줄 말 ("연금저축 · 온라인")
+    raw_label TEXT,         -- 문서 원문 이름표
+    page INTEGER,
+    PRIMARY KEY (product_code, class_code)
+);
+CREATE INDEX IF NOT EXISTS idx_class_meaning_product ON class_meaning(product_code);
 """
 
 
@@ -304,6 +324,32 @@ def load_fund_aum(conn, path):
     return n
 
 
+def load_class_meaning(conn, path):
+    if not os.path.exists(path):
+        return 0
+    with open(path, "r", encoding="utf-8") as f:
+        records = json.load(f)
+    n = 0
+    for r in records:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO class_meaning
+                (product_code, class_code, fee_type, channel, account_type,
+                 attributes, retail, description, raw_label, page)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                r["product_code"], r["class_code"], r.get("fee_type"),
+                r.get("channel"), r.get("account_type"),
+                ",".join(r.get("attributes") or []),
+                1 if r.get("retail") else 0,
+                r.get("description"), r.get("raw_label"), r.get("page"),
+            ),
+        )
+        n += 1
+    return n
+
+
 def main():
     parser = argparse.ArgumentParser(description="상품 팩트 3종을 SQLite로 적재")
     parser.add_argument("--db", default=DEFAULT_DB_PATH)
@@ -312,6 +358,8 @@ def main():
     parser.add_argument("--class-returns", default=os.path.join(REPO_ROOT, "class_returns.json"))
     parser.add_argument("--manager-info", default=os.path.join(REPO_ROOT, "manager_info.json"))
     parser.add_argument("--fund-aum", default=os.path.join(REPO_ROOT, "fund_aum.json"))
+    parser.add_argument("--class-meaning",
+                        default=os.path.join(REPO_ROOT, "class_meaning.json"))
     args = parser.parse_args()
 
     conn = sqlite3.connect(args.db)
@@ -322,12 +370,13 @@ def main():
     n3 = load_class_returns(conn, args.class_returns)
     n4 = load_manager_info(conn, args.manager_info)
     n5 = load_fund_aum(conn, args.fund_aum)
+    n6 = load_class_meaning(conn, args.class_meaning)
 
     conn.commit()
     conn.close()
     print(
         f"product_master {n1}건, class_fees {n2}건, class_returns {n3}건, "
-        f"manager_info(참고용) {n4}건, fund_aum {n5}건 → {args.db}"
+        f"manager_info(참고용) {n4}건, fund_aum {n5}건, class_meaning {n6}건 → {args.db}"
     )
 
 
