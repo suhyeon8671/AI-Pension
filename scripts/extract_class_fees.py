@@ -1681,6 +1681,115 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
     return existing_rows + new_rows
 
 # ---------------------------------------------------------------------------
+# 상세 비용예시표("<1,000만원 투자시 투자자가 부담하는 ...>")
+#
+# 요약표에 안 나오는 클래스는 상세표에서 보수를 보강해 왔는데, 그 표엔
+# 비용예시 칸이 없어서 298개 레코드의 cost_projection_per_10m이 비어
+# 있었다. 비용예시는 뒤쪽 부속서류에 따로 있고("1년후/2년후/3년후/
+# 5년후/10년후"), 구조가 요약표와 달라 별도로 읽는다.
+# ---------------------------------------------------------------------------
+
+COST_AFTER_RE = re.compile(r"^(\d+)년\s*후?$")
+
+
+def _detail_cost_grids(pdf):
+    """상세 비용예시표를 셀 격자로 읽어
+    [(page_num, {클래스코드: {"1y": ...}}), ...]를 돌려준다.
+    머리글이 앞 페이지에 있고 값만 이어지는 경우가 흔해 열 구성을
+    페이지 사이에 물려준다."""
+    out = []
+    carry = None          # (year_by_col, col_x0s, 직전 페이지 번호)
+    for i, page in enumerate(pdf.pages):
+        page_num = i + 1
+        words = page.extract_words(x_tolerance=2, keep_blank_chars=False)
+        for t in page.find_tables():
+            cells = [c for c in t.cells if c]
+            if len(cells) < 8:
+                continue
+            raw = sorted({round(c[0], 1) for c in cells})
+            col_x0s = []
+            for x in raw:
+                if col_x0s and x - col_x0s[-1] <= 6:
+                    continue
+                col_x0s.append(x)
+            if len(col_x0s) < 4:
+                continue
+
+            def col_of(x0):
+                return min(range(len(col_x0s)),
+                           key=lambda k: abs(col_x0s[k] - x0))
+
+            bands = sorted({(round(c[1], 1), round(c[3], 1)) for c in cells})
+            grid = []
+            for top, bottom in bands:
+                ent = {}
+                for (x0, ct, x1, cb) in [c for c in cells
+                                         if abs(c[1] - top) < 1
+                                         and abs(c[3] - bottom) < 1]:
+                    ws = [w for w in words
+                          if x0 - 1 <= (w["x0"] + w["x1"]) / 2 <= x1 + 1
+                          and ct - 1 <= (w["top"] + w["bottom"]) / 2 <= cb + 1]
+                    ws.sort(key=lambda w: (round(w["top"], 1), w["x0"]))
+                    txt = " ".join(w["text"] for w in ws).strip()
+                    if txt:
+                        ent[col_of(x0)] = txt
+                grid.append({"top": top, "bottom": bottom, "cells": ent})
+
+            year_by_col = {}
+            for r in grid:
+                cand = {}
+                for ci, v in r["cells"].items():
+                    m = COST_AFTER_RE.match(v.replace(" ", ""))
+                    if m and m.group(1) in ("1", "2", "3", "5", "10"):
+                        cand[ci] = f"{m.group(1)}y"
+                if len(set(cand.values())) >= 4:
+                    year_by_col = cand
+                    break
+            if not year_by_col and carry and carry[2] == page_num - 1:
+                # 머리글이 앞 페이지에 있고 값만 이어지는 경우
+                prev_years, prev_cols = carry[0], carry[1]
+                if len(col_x0s) == len(prev_cols):
+                    year_by_col = dict(prev_years)
+                else:
+                    for ci, x in enumerate(col_x0s):
+                        near = min(range(len(prev_cols)),
+                                   key=lambda k: abs(prev_cols[k] - x))
+                        if abs(prev_cols[near] - x) <= 8 and near in prev_years:
+                            year_by_col[ci] = prev_years[near]
+            if len(set(year_by_col.values())) < 4:
+                continue
+
+            first_val = min(year_by_col)
+            by_code = {}
+            for r in grid:
+                vals = {}
+                for ci, y in year_by_col.items():
+                    v = r["cells"].get(ci, "").replace(" ", "").replace(",", "")
+                    if v.isdigit():
+                        vals[y] = v
+                if len(vals) < 4:
+                    continue
+                # 클래스명은 값 행과 다른 띠에 그려진다 - 이 행의 y구간
+                # 안에서 첫 값 열보다 왼쪽에 있는 글자를 모은다.
+                lim = col_x0s[first_val] - 2
+                ws = [w for w in words
+                      if (w["x0"] + w["x1"]) / 2 < lim
+                      and r["top"] - 1 <= (w["top"] + w["bottom"]) / 2 <= r["bottom"] + 1]
+                ws.sort(key=lambda w: (round(w["top"], 1), w["x0"]))
+                label = " ".join(w["text"] for w in ws)
+                code = _label_class_code(label)
+                if not code:
+                    continue
+                # 같은 클래스가 "판매수수료 및 보수·비용"과 "(피투자
+                # 집합투자기구 포함)" 두 줄로 나오는데 앞줄이 기본값이다.
+                by_code.setdefault(code, vals)
+            if by_code:
+                out.append((page_num, by_code))
+                carry = (year_by_col, col_x0s, page_num)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # "가.투자자에게 직접 부과되는 수수료" 표 - 셀 경계 기반 판매수수료 복구
 #
 # 이 표는 원래 다른 표들과 같이 좌표(단어의 y로 줄 묶기 + x로 칸 판정)로
@@ -2090,13 +2199,6 @@ AS_OF_RE = re.compile(r"(?:작성)?기준일\s*[:：]?\s*(\d{4})\s*[.\-]\s*(\d{1
 # (종류A 누적기준가격 1,060원 이상)에 도달하여 운용전환이 이루어질 경우").
 # 날짜가 문서 어디에도 없으므로 조건 문장을 그대로 남겨야 "전환됐나요"
 # 같은 질문에 근거를 들어 답할 수 있다.
-# 전환 조건 문장만 정확히 집는다. 느슨하게 잡으면 펀드명 줄
-# ("(운용전환일 이후) KCGI코리아목표전환형...")이나 비용예시 각주
-# ("목표기준가격을 도달하지 못한 경우를 가정하여 5%로 하였습니다")를
-# 조건으로 착각한다 - 조건 문장은 "목표기준가격 ... 도달 ... 운용전환"
-# 세 조각이 이 순서로 다 들어 있다.
-FEE_PERIOD_COND_RE = re.compile(
-    r"목표기준가격[^.\n]*?도달[^.\n]*?운용전환[^.\n]*")
 
 
 def _page_as_of(text):
@@ -2676,7 +2778,6 @@ def summary_rows_for_doc(doc_id, pdf, pages):
     inherited = None
     prev_page = None
     as_of = None
-    doc_condition = None
     for page_num in pages:
         if page_num < 1 or page_num > len(pdf.pages):
             continue
@@ -2689,10 +2790,6 @@ def summary_rows_for_doc(doc_id, pdf, pages):
         # 작성기준일은 보통 첫 요약 페이지에만 찍힌다 - 문서 안에서 한 번
         # 찾으면 이어지는 페이지의 행에도 같이 붙인다.
         as_of = _page_as_of(page_text) or as_of
-        if doc_condition is None:
-            pm = FEE_PERIOD_COND_RE.search(page_text)
-            if pm:
-                doc_condition = " ".join(pm.group().split()).lstrip("ㆍ·- ")
         got = _summary_grid(pdf.pages[page_num - 1], nxt, use_inherited)
         if not got:
             continue
@@ -2859,15 +2956,10 @@ def summary_rows_for_doc(doc_id, pdf, pages):
             # 조건뿐이다). 조건 문장과 작성기준일을 남겨야 "지금 전환됐나요"
             # 같은 질문에 "작성기준일 기준으로는 전환 전이고, 조건은 이것"
             # 이라고 근거를 들어 답할 수 있다.
-            if period and doc_condition:
-                condition = doc_condition
-            else:
-                condition = None
 
             rows.append({
                 "class_code": code,
                 **({"fee_period": period} if period else {}),
-                **({"fee_period_condition": condition} if condition else {}),
                 **({"as_of": as_of} if as_of else {}),
                 "sales_commission_desc": desc,
                 "total_fee": total_fee.replace(" ", "").rstrip("%"),
@@ -2903,6 +2995,18 @@ def summary_rows_for_doc(doc_id, pdf, pages):
             out.append(r)
             continue
         keep, extra = seen[code], {}
+        # "운용전환일부터 ..." 행은 같은 클래스의 전환 후 보수다. 이
+        # 파일엔 이미 그 규격(*_after_conversion + conversion_trigger_
+        # nav_price)이 있으므로 거기에 맞춘다 - 좌표 방식에만 있던 걸
+        # 셀 방식으로 옮기면서 빠졌던 부분이다.
+        if "운용전환일부터" in (r.get("fee_period") or "").replace(" ", ""):
+            for f, tgt in (("total_fee", "total_fee_after_conversion"),
+                           ("distribution_fee", "distribution_fee_after_conversion"),
+                           ("peer_avg_fee", "peer_avg_fee_after_conversion"),
+                           ("total_fee_and_cost", "total_fee_and_cost_after_conversion")):
+                if r.get(f) is not None:
+                    keep.setdefault(tgt, r[f])
+            continue
         for y, cv in (r.get("cost_projection_per_10m") or {}).items():
             keep.setdefault("cost_projection_per_10m", {}).setdefault(y, cv)
         for f in fee_fields:
@@ -3088,6 +3192,57 @@ def process_doc(doc_id):
     return final_rows
 
 
+def fill_detail_cost_projections(doc_id, rows):
+    """상세표에서만 나온 클래스는 요약표에 없어 비용예시가 비어 있다
+    (실측 298건). 뒤쪽 부속서류의 "<1,000만원 투자시 ...>" 표에서
+    가져온다. 요약표에도 있는 클래스로 먼저 대조해서, 값이 어긋나면
+    (다른 기준일 표를 잘못 읽은 것) 그 문서는 통째로 건드리지 않는다."""
+    if all(r.get("cost_projection_per_10m") for r in rows):
+        return 0
+    pdfs = glob.glob(os.path.join(DATA_DIR, doc_id, "*.pdf"))
+    if not pdfs:
+        return 0
+    with pdfplumber.open(pdfs[0]) as pdf:
+        grids = _detail_cost_grids(pdf)
+    if not grids:
+        return 0
+    by_code = {}
+    for _, m in grids:
+        for code, vals in m.items():
+            by_code.setdefault(code, vals)
+
+    checked = conflict = 0
+    for r in rows:
+        cur = r.get("cost_projection_per_10m") or {}
+        cand = by_code.get(r.get("class_code"))
+        if not cur or not cand:
+            continue
+        for y, v in cur.items():
+            if y in cand:
+                checked += 1
+                if str(v).replace(",", "") != cand[y]:
+                    conflict += 1
+    if conflict:
+        return 0
+
+    filled = 0
+    for r in rows:
+        if r.get("cost_projection_per_10m"):
+            continue
+        cand = by_code.get(r.get("class_code"))
+        if not cand:
+            continue
+        r["cost_projection_per_10m"] = dict(cand)
+        r.setdefault("field_source_pages", {})["cost_projection_per_10m"] = next(
+            pn for pn, m in grids if r["class_code"] in m)
+        pages = r.setdefault("source_pages", [r["page"]])
+        pg = r["field_source_pages"]["cost_projection_per_10m"]
+        if pg not in pages:
+            pages.append(pg)
+        filled += 1
+    return filled
+
+
 def main():
     parser = argparse.ArgumentParser(description="클래스별 총보수 좌표 기반 추출 (1차: 총보수 표만)")
     parser.add_argument("--output", default=DEFAULT_OUTPUT)
@@ -3102,6 +3257,7 @@ def main():
     docs_with_hits = 0
     docs_with_missing_class_code = 0
     detail_enriched = 0
+    cost_filled = 0
     for doc_id in doc_ids:
         rows = process_doc(doc_id)
         if rows:
@@ -3120,6 +3276,10 @@ def main():
         # null을 "가.투자자에게 직접 부과되는 수수료" 표에서 채운다(확실한
         # "없음"만 - 위 enrich_sales_commission_from_ga_table 주석 참고).
         rows = enrich_sales_commission_from_ga_table(doc_id, rows)
+        # 상세표에서만 나온 클래스는 요약표에 비용예시 칸이 없어 비어
+        # 있다 - 뒤쪽 부속서류의 "<1,000만원 투자시 ...>" 표에서 채운다.
+        # 요약표에도 있는 클래스로 먼저 대조해서 어긋나면 안 채운다.
+        cost_filled += fill_detail_cost_projections(doc_id, rows)
         # 출처 필드는 모든 행이 갖도록 맞춘다(class_returns.json과 같은
         # 규칙) - 합쳐진 행만 갖고 있으면 조회하는 쪽이 매번 존재 여부를
         # 따져야 한다. 보강 함수 안에서 하면 그 함수가 일찍 return하는
@@ -3136,6 +3296,7 @@ def main():
     print(f"{len(all_rows)}개 클래스 레코드 ({docs_with_hits}개 문서) → {args.output}")
     print(f"클래스 코드 인식 실패(confidence<0.7): {docs_with_missing_class_code}개 문서")
     print(f"상세표 보강으로 클래스 추가된 문서: {detail_enriched}개")
+    print(f"상세 비용예시표로 비용예시 채운 레코드: {cost_filled}건")
     print(f"요약표 좌표 방식 폴백 문서: {len(_SUMMARY_FALLBACK_DOCS)}개 {sorted(_SUMMARY_FALLBACK_DOCS)}")
 
 
