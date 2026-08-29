@@ -19,7 +19,10 @@ import argparse
 import re
 import sqlite3
 
-from router import PRODUCT_CODE_RE  # noqa: E402
+# 예전엔 router에서 상품코드 정규식을 가져왔는데, router가 벡터 검색
+# (chromadb)을 끌어와서 벡터 스토어가 없는 환경에선 이 모듈까지 못 쓰게
+# 된다. 구조화 DB 조회는 벡터 검색과 무관하므로 끊어 둔다.
+from product_lookup import PRODUCT_CODE_RE  # noqa: E402
 from build_product_facts_db import DEFAULT_DB_PATH
 
 COMPARISON_KEYWORDS = ["비교", "차이", "어느", "어디가", "더 낮", "더 높", "vs", "대비"]

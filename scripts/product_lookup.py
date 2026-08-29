@@ -11,6 +11,7 @@
 고유한 부분만 부르므로, 상투어를 걷어낸 "핵심 이름"으로 맞춘다.
 """
 
+import difflib
 import os
 import re
 import sqlite3
@@ -20,13 +21,14 @@ DEFAULT_DB_PATH = os.path.join(REPO_ROOT, "structured_store.db")
 
 PRODUCT_CODE_RE = re.compile(r"KR[0-9A-Z]{10}", re.IGNORECASE)
 
-# 상품명 뒤에 거의 항상 붙는 상투어. 사람이 상품을 부를 때 잘 쓰지 않아서
-# 이걸 걷어내면 남는 게 그 상품의 고유한 이름이 된다.
-GENERIC_RE = re.compile(
-    r"(증권|자투자신탁|모투자신탁|투자신탁|투자회사|집합투자기구|"
-    r"제?\d+호|주식형|채권형|혼합형|주식|채권|혼합|재간접|파생형|"
-    r"인덱스형|전환형|단위형|추가형|개방형|폐쇄형|종류형|"
-    r"\[.*?\]|\(.*?\))")
+# 상품 종류를 나타내는 상투어. 이 말들만으로 이뤄진 일치는 상품을
+# 가리키지 못한다("증권투자신탁"은 100개 상품 대부분에 들어 있다).
+GENERIC_WORDS = (
+    "증권", "자투자신탁", "모투자신탁", "투자신탁", "투자회사", "집합투자기구",
+    "주식형", "채권형", "혼합형", "주식", "채권", "혼합", "재간접", "파생형",
+    "인덱스", "전환형", "단위형", "추가형", "개방형", "폐쇄형", "종류형",
+    "연금저축", "연금", "펀드", "호",
+)
 
 # "A클래스" / "종류C-e" / "클래스 C-P" 처럼 클래스를 지목하는 표현
 CLASS_IN_QUERY_RE = re.compile(
@@ -34,12 +36,15 @@ CLASS_IN_QUERY_RE = re.compile(
 
 
 def _norm(s):
-    return re.sub(r"[\s.,·ㆍ\-_]", "", s or "")
+    return re.sub(r"[\s.,·ㆍ\-_()\[\]:]", "", s or "")
 
 
-def core_name(product_name):
-    """상품명에서 상투어를 걷어낸 핵심 이름."""
-    return _norm(GENERIC_RE.sub("", product_name or ""))
+def _is_generic(text):
+    """일치한 조각이 상투어만으로 이뤄졌는지. 그렇다면 상품을 못 가린다."""
+    t = text
+    for w in sorted(GENERIC_WORDS, key=len, reverse=True):
+        t = t.replace(w, "")
+    return len(t) < 2
 
 
 def load_products(db_path=DEFAULT_DB_PATH):
@@ -52,15 +57,7 @@ def load_products(db_path=DEFAULT_DB_PATH):
         ).fetchall()
     finally:
         conn.close()
-    out = []
-    for code, name in rows:
-        core = core_name(name)
-        if len(core) >= 3:
-            out.append((code, name, core))
-    # 긴 핵심 이름부터 본다 - "미래에셋코어밸류"와 "미래에셋코어밸류연금저축"이
-    # 둘 다 있으면 더 길게 맞는 쪽이 맞다.
-    out.sort(key=lambda x: len(x[2]), reverse=True)
-    return out
+    return [(code, name, _norm(name)) for code, name in rows if name]
 
 
 _CACHE = None
@@ -68,34 +65,46 @@ _CACHE = None
 
 def find_products(question, db_path=DEFAULT_DB_PATH, limit=4):
     """질문에서 상품을 찾는다. 코드가 직접 적혀 있으면 그게 우선.
-    돌려주는 것: [(product_code, product_name, 맞은 글자수)]"""
+
+    처음엔 상품명에서 상투어("증권자투자신탁1호(주식)")를 지운 "핵심
+    이름"이 질문에 통째로 들어 있는지로 맞췄는데, 상투어 목록에 있는
+    "전환형"이 "목표전환형"의 일부라 잘려 나가는 등 단어를 깎는 방식
+    자체가 취약했다(KCGI코리아목표전환형 -> KCGI코리아목표). 그래서
+    질문과 상품명의 "가장 긴 공통 문자열"로 바꿨다 - 어디를 어떻게
+    부르든 겹치는 만큼 점수가 된다. 다만 그 겹친 부분이 상투어뿐이면
+    상품을 못 가리므로 버린다.
+
+    돌려주는 것: [(product_code, product_name, 겹친 글자수)]"""
     global _CACHE
-    codes = list(dict.fromkeys(
-        c.upper() for c in PRODUCT_CODE_RE.findall(question or "")))
     if _CACHE is None:
         _CACHE = load_products(db_path)
-    by_code = {c: (c, n) for c, n, _ in _CACHE}
-    hits = [(c, by_code[c][1] if c in by_code else None, len(c))
-            for c in codes if c in by_code]
+
+    codes = list(dict.fromkeys(
+        c.upper() for c in PRODUCT_CODE_RE.findall(question or "")))
+    by_code = {c: n for c, n, _ in _CACHE}
+    if codes:
+        return [(c, by_code.get(c), 99) for c in codes if c in by_code][:limit]
 
     q = _norm(question)
-    if q:
-        for code, name, core in _CACHE:
-            if any(h[0] == code for h in hits):
-                continue
-            # 핵심 이름이 통째로 들어 있으면 확실하다. 사람이 줄여 부르는
-            # 경우("미래에셋장기성장포커스" -> "장기성장포커스")도 있어서,
-            # 6글자 이상이면 앞을 잘라낸 형태도 본다.
-            if core in q:
-                hits.append((code, name, len(core)))
-                continue
-            if len(core) >= 8:
-                for cut in range(2, min(6, len(core) - 5)):
-                    if core[cut:] in q:
-                        hits.append((code, name, len(core) - cut))
-                        break
-    hits.sort(key=lambda h: h[2], reverse=True)
-    return hits[:limit]
+    if len(q) < 3:
+        return []
+    best = {}
+    for code, name, nname in _CACHE:
+        m = difflib.SequenceMatcher(None, q, nname, autojunk=False)\
+            .find_longest_match(0, len(q), 0, len(nname))
+        if m.size < 4:
+            continue
+        piece = q[m.a:m.a + m.size]
+        if _is_generic(piece):
+            continue
+        if code not in best or m.size > best[code][2]:
+            best[code] = (code, name, m.size)
+    out = sorted(best.values(), key=lambda h: h[2], reverse=True)
+    # 1등과 많이 차이 나는 후보는 잡음이다(상투어 일부만 겹친 것)
+    if out:
+        top = out[0][2]
+        out = [h for h in out if h[2] >= max(4, top - 2)]
+    return out[:limit]
 
 
 def find_class_code(question):

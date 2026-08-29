@@ -37,8 +37,12 @@ from fastapi.responses import JSONResponse
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
 
-from router import route_search  # noqa: E402
-from compare_products import extract_product_codes, is_comparison_query, compare_products  # noqa: E402
+# router는 벡터 검색(chromadb)을 끌어오므로 모듈 로드 시점에 import하면
+# 벡터 스토어가 없는 환경에서 서버가 아예 안 뜬다. 구조화 DB로 답하는
+# 경로는 그것과 무관하게 동작해야 하므로 필요할 때 늦게 불러온다.
+from compare_products import is_comparison_query, compare_products  # noqa: E402
+from product_lookup import find_products, find_class_code  # noqa: E402
+from product_facts import detect_intents, product_facts  # noqa: E402
 
 app = FastAPI(title="연금 Agent 평가용 API")
 
@@ -135,11 +139,11 @@ def generate_answer(query: str, route_result: dict) -> str:
 
 @app.get("/answer")
 def answer(question_id: str, question: str):
-    # 상품 2개 이상을 비교하는 질의는 semantic_search로 텍스트 청크를 여러 개
-    # 긁어오는 대신, 이미 정확히 뽑아둔 구조화 DB(product_master/class_fees/
-    # class_returns)에서 숫자만 직접 조회한다 - 토큰을 훨씬 적게 쓰면서도
-    # 텍스트 검색보다 정확하다 (scripts/compare_products.py 참고).
-    product_codes = extract_product_codes(question)
+    # 상품을 이름으로도 찾는다. 예전엔 질의에 상품코드(KR...)가 문자
+    # 그대로 있을 때만 인식해서, "미래에셋장기성장포커스 총보수 얼마야?"
+    # 같은 실제 질문이 구조화 DB에 못 닿고 텍스트 검색으로 빠졌다.
+    hits = find_products(question)
+    product_codes = [h[0] for h in hits]
     if is_comparison_query(question, product_codes) and len(product_codes) >= 2:
         summary, evidence = compare_products(product_codes)
         body = {
@@ -158,6 +162,35 @@ def answer(question_id: str, question: str):
             "answer": f"[임시 답변 — HyperCLOVA X 연동 전 조회 결과]\n{summary}",
         }
         return JSONResponse(content=body)
+
+    # 상품 하나에 대한 정량 질문(총보수/수익률/위험등급/규모)은 구조화
+    # DB에서 바로 답한다. 텍스트 청크로 답하면 숫자가 청크 경계에 잘리거나
+    # 다른 클래스 값을 집어올 수 있는데, 이 표들은 이미 클래스 단위로
+    # 정확히 뽑아 두었다.
+    if len(product_codes) == 1:
+        intents = detect_intents(question)
+        if set(intents) & {"fee", "return", "risk", "aum", "cost_projection"}:
+            code = product_codes[0]
+            summary, ev = product_facts(code, find_class_code(question), intents)
+            body = {
+                "question_id": question_id,
+                "question": question,
+                "retrieved_context": summary,
+                "think_trace": (
+                    f"1. 질의 분류: 단일 상품 정량 질의 (의도: {intents})\n"
+                    f"   - 인식된 상품: {code} ({hits[0][1]})\n"
+                    f"   - 지목된 클래스: {find_class_code(question) or '없음(전체)'}\n"
+                    "2. semantic_search 대신 구조화 DB(product_master/class_fees/"
+                    "class_returns/fund_aum) 직접 조회\n"
+                    f"   - 조회 근거: {ev[:5]}\n"
+                    "3. [주의] 답변 생성 단계는 아직 HyperCLOVA X API 키가 없어 "
+                    "실제 LLM 호출이 아니라 조회 결과를 그대로 보여주는 임시 로직임"
+                ),
+                "answer": f"[임시 답변 — HyperCLOVA X 연동 전 조회 결과]\n{summary}",
+            }
+            return JSONResponse(content=body)
+
+    from router import route_search  # 벡터 검색은 여기서만 필요하다
 
     route_result = route_search(question, k=5)
     body = {
