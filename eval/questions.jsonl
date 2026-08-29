@@ -11,7 +11,7 @@
 {"id":"INST-11","category":"제도","q":"퇴직연금 적립금을 다른 금융회사로 옮길 수 있나요?","route":"rag","must":[],"note":"계약이전"}
 {"id":"INST-12","category":"제도","q":"연금계좌에서 연간 연금수령한도는 어떻게 계산하나요?","route":"rag","must":["연금수령한도"],"note":"평가액/(11-연금수령연차)*120%"}
 
-{"id":"PROD-01","category":"보수","q":"미래에셋장기성장포커스 총보수 얼마야?","route":"single_product","code":"KR510902511M","must":["1.47","A"],"note":"A클래스 1.47%"}
+{"id":"PROD-01","category":"보수","q":"미래에셋장기성장포커스 총보수 얼마야?","route":"single_product","code":"KR510902511M","must":["1.09","2.07"],"note":"대표 클래스 없이 범위로 답해야 함(일반 고객이 못 사는 랩 전용 제외). A클래스 1.47%는 범위 안"}
 {"id":"PROD-02","category":"보수","q":"하나파워e단기채 총보수 알려줘","route":"single_product","code":"KR5111420047","must":["0.1736"],"note":"A 0.1736%"}
 {"id":"PROD-03","category":"위험등급","q":"미래에셋차세대Fun인덱스 위험등급이 몇 등급이야?","route":"single_product","code":"KR5110601022","must":["2등급"],"note":""}
 {"id":"PROD-04","category":"수익률","q":"하나파워e단기채 1년 수익률 얼마나 돼?","route":"single_product","code":"KR5111420047","must":["4.21"],"note":"A 1년 4.21%"}
@@ -23,7 +23,7 @@
 {"id":"PROD-10","category":"보수","q":"한국투자 골드플랜 연금 채권형 판매보수는 얼마인가요?","route":"single_product","code":null,"must":["판매보수"],"note":"이름이 여러 상품에 걸침 - 어느 걸 고르는지 확인"}
 {"id":"PROD-11","category":"클래스","q":"미래에셋장기성장포커스 A-e 클래스 총보수 얼마야?","route":"single_product","code":"KR510902511M","must":["1.12"],"note":"클래스 지목이 먹히는지"}
 {"id":"PROD-12","category":"클래스","q":"미래에셋차세대Fun인덱스 종류C 총보수","route":"single_product","code":"KR5110601022","must":["0.5775"],"note":"'종류C' 표현"}
-{"id":"PROD-13","category":"복합","q":"미래에셋장기성장포커스 총보수랑 수익률 둘 다 알려줘","route":"single_product","code":"KR510902511M","must":["1.47","-23.62"],"note":"의도 2개 동시"}
+{"id":"PROD-13","category":"복합","q":"미래에셋장기성장포커스 총보수랑 수익률 둘 다 알려줘","route":"single_product","code":"KR510902511M","must":["1.09","-23.62"],"note":"의도 2개 동시. 보수는 범위로"}
 {"id":"PROD-14","category":"보수","q":"하나IT코리아 보수가 비싼 편인가요?","route":"single_product","code":"KR5111450067","must":["총보수"],"note":"'비싸' 키워드로 fee 의도 잡히는지"}
 {"id":"PROD-15","category":"수익률","q":"미래에셋프리미엄크레딧알파 설정 이후 수익률은?","route":"single_product","code":"KR5110501016","must":[],"note":"설정후 수익률"}
 

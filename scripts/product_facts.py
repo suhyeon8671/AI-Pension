@@ -18,6 +18,9 @@ import sqlite3
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB_PATH = os.path.join(REPO_ROOT, "structured_store.db")
 
+# 답변에 펼쳐 보일 클래스 줄 수. 열몇 개를 다 늘어놓으면 고객이 못 읽는다.
+MAX_CLASS_LINES = 5
+
 # 질문이 무엇을 묻는지 - 겹치면 여러 개를 다 담는다(한 질문에 보수와
 # 수익률을 같이 묻는 경우가 흔하다).
 INTENT_KEYWORDS = {
@@ -26,6 +29,8 @@ INTENT_KEYWORDS = {
     "risk": ("위험등급", "위험", "등급"),
     "aum": ("설정액", "순자산", "규모", "자산총액", "얼마나 큰"),
     "cost_projection": ("비용예시", "1,000만원", "1000만원", "천만원", "투자하면"),
+    "redemption": ("환매", "해지", "중도해지", "팔면", "빼면", "인출"),
+    "eligibility": ("가입", "살 수 있", "매수", "담을 수", "연금저축계좌", "IRP"),
 }
 
 
@@ -51,6 +56,110 @@ def _returns_for(conn, code, class_code=None):
            + " ORDER BY class_code")
     params = [code] + ([class_code] if class_code else [])
     return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def _meaning_for(conn, code):
+    """클래스 코드 -> 뜻. 코드를 그대로 답에 쓰면 고객이 못 알아본다."""
+    return {r["class_code"]: dict(r) for r in conn.execute(
+        "SELECT * FROM class_meaning WHERE product_code = ?", (code,))}
+
+
+def _charges_for(conn, code):
+    return {r["class_code"]: dict(r) for r in conn.execute(
+        "SELECT * FROM class_charges WHERE product_code = ?", (code,))}
+
+
+def _label(code, meaning):
+    """답변에 쓸 클래스 이름. 뜻을 알면 말로, 모르면 코드 그대로."""
+    m = meaning.get(code)
+    if m and m.get("description"):
+        return f"{m['description']} ({code})"
+    return f"{code} 클래스"
+
+
+def _fee_lines(fees, meaning):
+    """보수를 '범위 + 조건별'로 적는다.
+
+    대표 클래스를 정해 숫자 하나만 말할 수는 없다. 상품 100개의 클래스
+    구성이 70가지로 제각각이라 어떤 코드를 대표로 잡아도 최소 30개
+    상품에는 그게 없고, 한 펀드 안에서 총보수가 최대 1.5%p(0.7% <-> 2.2%)
+    까지 벌어져서 아무 클래스나 집으면 틀린 답이 된다.
+
+    그래서 일반 고객이 가입할 수 있는 클래스의 범위를 먼저 말하고,
+    조건별로 펼친다. 기관·고액·랩 전용은 살 수가 없으므로 뺀다 - 안 빼면
+    교보악사 Tomorrow장기우량처럼 싼 순서 넷이 전부 전용 클래스인 상품에서
+    "제일 싼 게 0.1195%"라고 살 수도 없는 걸 안내하게 된다."""
+    priced = [f for f in fees if f.get("total_fee") is not None]
+    if not priced:
+        return ["  보수: 총보수 값을 찾지 못했습니다."], []
+
+    retail, restricted, unknown = [], [], []
+    for f in priced:
+        m = meaning.get(f["class_code"])
+        if m is None:
+            unknown.append(f)
+        elif m.get("retail"):
+            retail.append(f)
+        else:
+            restricted.append(f)
+
+    shown = sorted(retail or unknown, key=lambda f: f["total_fee"])
+    # 표기만 다른 같은 클래스가 두 줄로 나오는 걸 막는다(C-E / CE).
+    # 코드는 다르지만 뜻도 값도 같으면 고객에겐 같은 것이다.
+    deduped, seen = [], set()
+    for f in shown:
+        m = meaning.get(f["class_code"]) or {}
+        key = (m.get("description"), f["total_fee"], f.get("distribution_fee"))
+        if m.get("description") and key in seen:
+            continue
+        seen.add(key)
+        deduped.append(f)
+    shown = deduped
+    lo, hi = shown[0]["total_fee"], shown[-1]["total_fee"]
+
+    lines = []
+    if lo == hi:
+        lines.append(f"  [총보수] 연 {lo}%")
+    else:
+        lines.append(f"  [총보수] 연 {lo}% ~ {hi}% — 가입 방법에 따라 다릅니다")
+
+    # 클래스가 열몇 개씩 되는 상품이 흔한데 전부 나열하면 고객이 못 읽는다.
+    # 연금 계좌로 살 수 있는 클래스를 앞세우고, 나머지는 제일 싼 것과
+    # 제일 비싼 것만 보인다(범위가 어디서 오는지는 보여야 하므로).
+    # 다만 범위의 양 끝은 반드시 보인다. 위에서 "연 1.09% ~ 2.07%"라고
+    # 말해 놓고 2.07%짜리 줄이 없으면 그 숫자가 어디서 나왔는지 알 수 없다.
+    pension = [f for f in shown
+               if (meaning.get(f["class_code"]) or {}).get("account_type")]
+    picked = pension or shown
+    if len(picked) > MAX_CLASS_LINES:
+        picked = picked[:MAX_CLASS_LINES - 1] + [picked[-1]]
+    for edge in (shown[-1], shown[0]):
+        if edge not in picked:
+            picked = [edge] + picked if edge is shown[0] else picked + [edge]
+    picked = sorted(picked, key=lambda f: f["total_fee"])
+
+    for f in picked:
+        bits = [f"    - {_label(f['class_code'], meaning)}: {f['total_fee']}%"]
+        if f.get("distribution_fee") is not None:
+            bits.append(f"판매보수 {f['distribution_fee']}%")
+        if f.get("sales_commission_desc") and f["sales_commission_desc"] != "-":
+            bits.append(f"판매수수료 {f['sales_commission_desc']}")
+        lines.append(", ".join(bits))
+    rest = len(shown) - len(picked)
+    if rest > 0:
+        lines.append(f"    (이 외 {rest}개 클래스가 있으며 모두 위 범위 안입니다)")
+
+    if restricted:
+        names = ", ".join(sorted({
+            meaning[f["class_code"]]["description"] for f in restricted}))
+        lines.append(f"    ※ 이 펀드에는 {names} 클래스도 있으나 일반 개인 "
+                     "고객은 가입할 수 없어 위 범위에서 제외했습니다.")
+    if retail and unknown:
+        lines.append(f"    ※ 가입 조건을 확인하지 못한 클래스 "
+                     f"{', '.join(f['class_code'] for f in unknown)}는 제외했습니다.")
+    elif unknown and not retail:
+        lines.append("    ※ 클래스별 가입 조건을 문서에서 확인하지 못했습니다.")
+    return lines, shown
 
 
 def _benchmark_for(conn, code):
@@ -86,23 +195,53 @@ def product_facts(code, class_code=None, intents=None, db_path=DEFAULT_DB_PATH):
         if "risk" in intents and prod.get("risk_level") is not None:
             ev.append({"table": "product_master", "product_code": code})
 
+        meaning = _meaning_for(conn, code)
+        charges = _charges_for(conn, code)
+
         if "fee" in intents or "cost_projection" in intents:
             fees = _classes_for(conn, code, class_code)
             if not fees:
                 lines.append("  보수: 해당 클래스 정보를 찾지 못했습니다.")
             else:
-                lines.append(f"  [보수] 클래스 {len(fees)}개")
-                for f in fees:
-                    bits = [f"    - {f['class_code']}: 총보수 {f['total_fee']}%"]
-                    if f.get("distribution_fee") not in (None, ""):
-                        bits.append(f"판매보수 {f['distribution_fee']}%")
-                    if f.get("total_fee_and_cost") not in (None, ""):
-                        bits.append(f"총보수·비용 {f['total_fee_and_cost']}%")
-                    if f.get("sales_commission_desc"):
-                        bits.append(f"판매수수료 {f['sales_commission_desc']}")
-                    lines.append(", ".join(bits))
+                fee_lines, shown = _fee_lines(fees, meaning)
+                lines.extend(fee_lines)
+                as_of = next((f.get("as_of") for f in fees if f.get("as_of")), None)
+                if as_of:
+                    lines.append(f"    (작성 기준일 {as_of})")
+                for f in shown:
                     ev.append({"table": "class_fees", "product_code": code,
                                "class_code": f["class_code"], "page": f.get("page")})
+
+        if "redemption" in intents:
+            # 값을 문장 그대로 담아 둔 이유가 여기서 드러난다. "90일미만
+            # 이익금의 30%"만 말하면 틀린 답이 되는 경우가 있다(뒤에
+            # "다만 ... 부과하지 않음"이 붙는다).
+            got = [(cc, c) for cc, c in sorted(charges.items())
+                   if c.get("redemption_fee")]
+            if not got:
+                lines.append("  [환매수수료] 문서에서 확인하지 못했습니다.")
+            elif len({c["redemption_fee"] for _cc, c in got}) == 1:
+                lines.append(f"  [환매수수료] {got[0][1]['redemption_fee']}")
+                ev.append({"table": "class_charges", "product_code": code,
+                           "page": got[0][1].get("page")})
+            else:
+                lines.append("  [환매수수료] 클래스에 따라 다릅니다")
+                for cc, c in got:
+                    lines.append(f"    - {_label(cc, meaning)}: {c['redemption_fee']}")
+                    ev.append({"table": "class_charges", "product_code": code,
+                               "class_code": cc, "page": c.get("page")})
+
+        if "eligibility" in intents:
+            got = [(cc, c) for cc, c in sorted(charges.items())
+                   if c.get("eligibility")]
+            if not got:
+                lines.append("  [가입자격] 문서에서 확인하지 못했습니다.")
+            else:
+                lines.append("  [가입자격]")
+                for cc, c in got:
+                    lines.append(f"    - {_label(cc, meaning)}: {c['eligibility']}")
+                    ev.append({"table": "class_charges", "product_code": code,
+                               "class_code": cc, "page": c.get("page")})
 
         if "return" in intents:
             rets = _returns_for(conn, code, class_code)

@@ -172,6 +172,13 @@ def _describe(rec):
     elif account and "퇴직연금" in account:
         account = "퇴직연금(DC/IRP)"
     parts = [p for p in (account, channel) if p]
+    # 계좌 종류도 제한도 아닌 속성(보수체감/무권유저비용 등)도 붙인다.
+    # 안 붙이면 C1~C4가 전부 "창구"로 똑같이 보여서, 보수가 왜 다른지
+    # 알 수 없는 답이 된다.
+    others = [a for a in rec["attributes"]
+              if not _match_any(a, ACCOUNT_TYPES) and not _match_any(a, RESTRICTED)
+              and a != rec["channel"]]
+    parts.extend(others)
     limits = [a for a in rec["attributes"] if _match_any(a, RESTRICTED)]
     if limits:
         parts.append("/".join(limits) + " 전용")
