@@ -496,7 +496,9 @@ def find_return_rows_on_page(page, page_num, section="가", known_classes=None):
 # 먼저 했고 폴백 0으로 끝냈다 - 같은 방식을 여기에도 적용한다.
 # ---------------------------------------------------------------------------
 
-RETURN_PERIOD_RE = re.compile(r"^(?:최근)?(\d)년$")
+# "1년차"라고 쓰는 연평균 표가 있다(KR5160420009 실측). 연도별 표도 같은
+# 표기를 쓰지만 그쪽엔 "설정일 이후" 칸이 없어서 표 단위로 구분된다.
+RETURN_PERIOD_RE = re.compile(r"^(?:최근)?(\d)년(?:차)?$")
 RETURN_LABEL_NAMES = ("종류", "클래스", "구분", "종류(클래스)")
 
 
@@ -627,7 +629,11 @@ def _return_grid(page, inherited=None):
             for other in grid:
                 if abs(other["top"] - anchor["top"]) > 30:
                     continue
-                if other["bottom"] - other["top"] > 60:
+                # 세로로 병합된 머리글 칸("종류 / 최초설정일 / 설정일 이후"가
+                # 기간 라벨 두 줄을 아우르는 높이로 그려진다)이 흔해서
+                # 높이 제한을 너무 낮게 잡으면 그 칸들을 통째로 놓친다
+                # (KR5129420031 실측: 61pt짜리 띠가 잘려 표를 못 찾았다).
+                if other["bottom"] - other["top"] > 100:
                     continue
                 for ci, v in other["cells"].items():
                     if len(re.sub(r"\s+", "", v)) > 24 or _is_multi_header(v):
