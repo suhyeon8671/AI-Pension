@@ -168,6 +168,20 @@ CREATE INDEX IF NOT EXISTS idx_class_charges_product ON class_charges(product_co
 
 -- 펀드 전체에 적용되는 환매수수료 문장. 클래스별 표가 없는 문서라도
 -- "이 투자신탁은 환매수수료를 부과하지 않습니다" 한 줄이면 답이 된다.
+-- 매입/환매 기준가격 적용과 환매대금 지급시기 (extract_trade_rules.py).
+-- "17시 50분에 환매 청구하면?", "돈 언제 들어와요?"에 답하기 위한 것.
+-- 조건문이라 문장을 그대로 담는다. 기준시각이 문서마다 다르고
+-- (15시 30분 / 오후 5시 / 17시) 시각별로 적용일이 갈리기 때문에,
+-- "제2영업일" 하나만 뽑으면 틀린 답이 된다.
+DROP TABLE IF EXISTS trade_rules;
+CREATE TABLE trade_rules (
+    product_code TEXT NOT NULL,
+    kind TEXT NOT NULL,     -- 매입기준가 / 환매기준가
+    text TEXT NOT NULL,
+    page INTEGER,
+    PRIMARY KEY (product_code, kind)
+);
+
 DROP TABLE IF EXISTS product_charges;
 CREATE TABLE product_charges (
     product_code TEXT PRIMARY KEY,
@@ -413,6 +427,21 @@ def load_product_charges(conn, path):
     return n
 
 
+def load_trade_rules(conn, path):
+    if not os.path.exists(path):
+        return 0
+    with open(path, "r", encoding="utf-8") as f:
+        records = json.load(f)
+    n = 0
+    for r in records:
+        conn.execute(
+            "INSERT OR REPLACE INTO trade_rules (product_code, kind, text, page)"
+            " VALUES (?, ?, ?, ?)",
+            (r["product_code"], r["kind"], r["text"], r.get("page")))
+        n += 1
+    return n
+
+
 def main():
     parser = argparse.ArgumentParser(description="상품 팩트 3종을 SQLite로 적재")
     parser.add_argument("--db", default=DEFAULT_DB_PATH)
@@ -425,6 +454,8 @@ def main():
                         default=os.path.join(REPO_ROOT, "class_meaning.json"))
     parser.add_argument("--class-charges",
                         default=os.path.join(REPO_ROOT, "class_charges.json"))
+    parser.add_argument("--trade-rules",
+                        default=os.path.join(REPO_ROOT, "trade_rules.json"))
     parser.add_argument("--product-charges",
                         default=os.path.join(REPO_ROOT, "product_charges.json"))
     args = parser.parse_args()
@@ -440,12 +471,13 @@ def main():
     n6 = load_class_meaning(conn, args.class_meaning)
     n7 = load_class_charges(conn, args.class_charges)
     n8 = load_product_charges(conn, args.product_charges)
+    n9 = load_trade_rules(conn, args.trade_rules)
 
     conn.commit()
     conn.close()
     print(
         f"product_master {n1}건, class_fees {n2}건, class_returns {n3}건, "
-        f"manager_info(참고용) {n4}건, fund_aum {n5}건, class_meaning {n6}건, class_charges {n7}건, product_charges {n8}건 → {args.db}"
+        f"manager_info(참고용) {n4}건, fund_aum {n5}건, class_meaning {n6}건, class_charges {n7}건, product_charges {n8}건, trade_rules {n9}건 → {args.db}"
     )
 
 

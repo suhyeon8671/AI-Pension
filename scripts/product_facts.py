@@ -30,6 +30,9 @@ INTENT_KEYWORDS = {
     "aum": ("설정액", "순자산", "규모", "자산총액", "얼마나 큰"),
     "cost_projection": ("비용예시", "1,000만원", "1000만원", "천만원", "투자하면"),
     "redemption": ("환매", "해지", "중도해지", "팔면", "빼면", "인출"),
+    # "몇 시까지 신청하면", "돈 언제 들어와요" 같은 질문
+    "timing": ("언제", "며칠", "몇 시", "시까지", "기준가", "지급", "들어와",
+               "입금", "영업일", "청구하면", "신청하면"),
     # "매수"만 넣으면 "환매수수료"의 가운데 글자에 걸린다("환매수수료"
     # -> 환+매수+수료). 붙는 말까지 넣어 구분한다.
     "eligibility": ("가입할", "가입 가능", "가입자격", "살 수 있", "매수할", "매수 가능",
@@ -241,6 +244,20 @@ def product_facts(code, class_code=None, intents=None, db_path=DEFAULT_DB_PATH):
                     lines.append(f"    - {_label(cc, meaning)}: {c['redemption_fee']}")
                     ev.append({"table": "class_charges", "product_code": code,
                                "class_code": cc, "page": c.get("page")})
+
+        if "timing" in intents:
+            rules = {r["kind"]: dict(r) for r in conn.execute(
+                "SELECT * FROM trade_rules WHERE product_code = ?", (code,))}
+            if not rules:
+                lines.append("  [매입·환매 기준가격] 문서에서 확인하지 못했습니다.")
+            for kind, title in (("매입기준가", "매입 시 기준가격"),
+                                ("환매기준가", "환매 시 기준가격·지급시기")):
+                r = rules.get(kind)
+                if not r:
+                    continue
+                lines.append(f"  [{title}] {r['text']}")
+                ev.append({"table": "trade_rules", "product_code": code,
+                           "kind": kind, "page": r.get("page")})
 
         if "eligibility" in intents:
             got = [(cc, c) for cc, c in sorted(charges.items())
