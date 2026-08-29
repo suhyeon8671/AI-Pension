@@ -1977,7 +1977,11 @@ def _label_class_code(label):
 # 사용자 정의 영역(U+F000~U+F0FF)에 들어와서 눈으로는 똑같은 "총보수·비용"인데
 # 글자 코드가 전혀 다르다(KR5111450067 실측: U+F09E - 총보수·비용 열이
 # 통째로 안 잡혔다).
-FOOTNOTE_RE = re.compile(r"^\(?주\s*\d*\)")
+# 각주 표시는 "(주1)"이 한 덩어리로 잡히기도 하고 "(주" + "1)"로 쪼개져
+# 나오기도 한다(KR5144420020 실측: 쪼개진 쪽을 못 걸러 마지막 클래스의
+# 이름이 각주 전체를 삼켰고, 그 안의 "투자실적/연평균" 때문에 수익률표
+# 행으로 오해받아 통째로 버려졌다).
+FOOTNOTE_RE = re.compile(r"^\(?주\s*\d*\)?$")
 DASHES = ("-", "\u2013", "\u2014", "\u2212")
 SUMMARY_DOT_RE = re.compile("[\u318d\u00b7\uff65\u2219\u25aa\u2022\u30fb\u22c5\u2027\uf000-\uf0ff]")
 
@@ -2000,6 +2004,51 @@ def _is_group_header(name):
     hits = t.count("|") + sum(t.count(k) for k in
                               ("판매수수료", "판매보수", "총보수"))
     return hits >= 2
+
+
+def _isnum_text(v):
+    t = v.replace(" ", "").rstrip("%").replace(",", "")
+    return bool(DECIMAL_RE.match(t) or t.isdigit())
+
+
+def _join_number_words(ws):
+    """숫자 칸을 만들 때 각주 번호를 떼어낸다. 세로줄이 안 그려진 열은
+    표 테두리까지 훑기 때문에 값 옆·아래의 각주 표시가 딸려 들어온다
+    (KR5114420022 실측: 10년 비용 "1,184" 옆의 위첨자 "1"이 붙어
+    "1184 1"이 됐다). 가장 긴 토큰을 값으로 보고, 같은 줄에서 바로
+    붙어 있는 조각만 함께 남긴다("1" "184"처럼 한 숫자가 쪼개진 경우)."""
+    ws = sorted(ws, key=lambda w: (round(w["top"], 1), w["x0"]))
+    if len(ws) < 2:
+        return " ".join(w["text"] for w in ws).strip()
+    main = max(ws, key=lambda w: len(w["text"].replace(",", "")))
+    keep = [main]
+    for w in ws:
+        if w is main:
+            continue
+        same_line = abs(w["top"] - main["top"]) < 3
+        gap = min(abs(w["x0"] - main["x1"]), abs(main["x0"] - w["x1"]))
+        if same_line and gap <= 3:
+            keep.append(w)
+    keep.sort(key=lambda w: (round(w["top"], 1), w["x0"]))
+    return " ".join(w["text"] for w in keep).strip()
+
+
+def _pick_cost_number(text, prev):
+    """비용예시 칸에 각주 번호가 섞여 들어오는 문서가 있다(KR5114420022
+    실측: "1,184" 옆 위첨자 1이 같은 칸에 잡혀 "1184 1"이 됐다).
+    각주 표시는 한두 자리이고 값은 세 자리 이상이라는 점으로 고르되,
+    고른 값이 앞 기간보다 작으면(비용예시는 기간이 길수록 커진다)
+    한 숫자가 쪼개진 것으로 보고 이어 붙인다."""
+    toks = [t.replace(",", "") for t in text.split()]
+    if len(toks) == 1:
+        return toks[0]
+    joined = "".join(toks)
+    longs = [t for t in toks if t.isdigit() and len(t) >= 3]
+    if len(longs) == 1 and all(len(t) <= 2 for t in toks if t is not longs[0]):
+        pick = longs[0]
+        if prev is None or not str(prev).isdigit() or int(pick) >= int(prev):
+            return pick
+    return joined if joined.isdigit() else text.replace(",", "")
 
 
 def _summary_column_field(name):
@@ -2106,7 +2155,12 @@ def _summary_grid(page, next_page=None, inherited=None):
                     if not ws:
                         continue
                     ws.sort(key=lambda w: (round(w["top"], 1), w["x0"]))
-                    r["cells"][xi] = " ".join(w["text"] for w in ws).strip()
+                    txt = " ".join(w["text"] for w in ws).strip()
+                    if _isnum_text(txt) is False and _join_number_words(ws) != txt:
+                        cand = _join_number_words(ws)
+                        if _isnum_text(cand):
+                            txt = cand
+                    r["cells"][xi] = txt
                     r["used"].update(id(w) for w in ws)
                     claimed.update(id(w) for w in ws)
 
@@ -2240,8 +2294,7 @@ def _summary_grid(page, next_page=None, inherited=None):
                           and r["top"] - 1 <= (w["top"] + w["bottom"]) / 2 <= r["bottom"] + 1]
                     if not ws:
                         continue
-                    ws.sort(key=lambda w: (round(w["top"], 1), w["x0"]))
-                    txt = " ".join(w["text"] for w in ws).strip()
+                    txt = _join_number_words(ws)
                     t = txt.replace(" ", "").rstrip("%").replace(",", "")
                     if DECIMAL_RE.match(t) or t.isdigit():
                         r["cells"][ci] = txt
@@ -2292,7 +2345,60 @@ def _summary_grid(page, next_page=None, inherited=None):
                 if ci not in ok:
                     move(ci, ok)
 
+        def spread_commission(field_map):
+            """판매수수료가 여러 클래스에 공통이면 원본이 칸 하나로 병합해
+            버린다(KR5194450018 실측: "없음" 한 칸이 C1~S 다섯 행을
+            세로로 덮는다). 그 칸이 세로로 품고 있는 행들에 같은 값을
+            채운다 - 병합 셀의 뜻 그대로다."""
+            cm = next((c for c, f in field_map.items()
+                       if f == "sales_commission_desc"), None)
+            if cm is None:
+                return
+            src = [(g["top"], g["bottom"], g["cells"][cm])
+                   for g in grid if cm in g["cells"]]
+            for g in grid:
+                if cm in g["cells"]:
+                    continue
+                mid = (g["top"] + g["bottom"]) / 2
+                for t0, b0, txt in src:
+                    if t0 - 1 <= mid <= b0 + 1:
+                        g["cells"][cm] = txt
+                        break
+
+        def infer_commission(field_map):
+            """판매수수료 칸은 제 이름이 묶음 머리글에 삼켜져 따로 안
+            잡히는 문서가 많다(KR5194450018 실측: "판매 수수료 총 보수
+            판매보수"가 한 칸에, KR5118420036 실측: 그 칸 이름이
+            "투자자가 부담하는 수수료..."라 묶음 머리글로 걸러진다).
+            이 표에서 판매수수료는 늘 총보수 왼쪽의 문구 칸이고 값은
+            "없음/-" 아니면 "납입금액의 X%" 꼴이다 - 그 자리로 채운다.
+            클래스명 칸은 이 조건에 안 걸린다(이름은 "-"가 아니고
+            "금액의"도 없다)."""
+            if "sales_commission_desc" in field_map.values():
+                return
+            tf = next((c for c, f in field_map.items() if f == "total_fee"), None)
+            if tf is None:
+                return
+            # 같은 격자에 붙어 있는 수익률표 행까지 보면 그 칸에 날짜가
+            # 들어 있어 판단이 깨진다 - 잡아 둔 칸들이 대부분 채워진
+            # "진짜 보수 행"만 본다.
+            need_row = max(3, int(len(field_map) * 0.6))
+            fee_rows = [r for r in grid[first_data:]
+                        if sum(1 for c in field_map if c in r["cells"]) >= need_row]
+            for ci in range(tf - 1, max(-1, tf - 4), -1):
+                if ci < 0 or ci in field_map:
+                    continue
+                vals = [r["cells"][ci].replace(" ", "")
+                        for r in (fee_rows or grid[first_data:]) if ci in r["cells"]]
+                if not vals:
+                    continue
+                if all(v in DASHES or v == "없음" or "금액의" in v for v in vals):
+                    field_map[ci] = "sales_commission_desc"
+                    return
+
         realign(field_by_col)
+        infer_commission(field_by_col)
+        spread_commission(field_by_col)
 
         # 표가 다음 페이지로 이어지면 그 페이지엔 헤더가 반복되지 않는다
         # (KR5113470030/KR5118420006 등 실측: A-e/C-e/C-P 같은 클래스가
@@ -2375,6 +2481,8 @@ def _summary_grid(page, next_page=None, inherited=None):
         # 총보수가 빈 칸을 가리켜 모든 행이 버려졌다).
         if inherited_need:
             realign(field_by_col)
+        infer_commission(field_by_col)
+        spread_commission(field_by_col)
         fill_missing(field_by_col)
 
         data_rows = grid[first_data:]
@@ -2581,10 +2689,12 @@ def summary_rows_for_doc(doc_id, pdf, pages):
                         "total_fee_and_cost")):
                 continue
             cost = {}
+            prev_cost = None
             for k in SUMMARY_COST_KEYS:
                 v = vals.get(f"cost_{k}")
                 if v:
-                    cost[k] = v.replace(",", "")
+                    cost[k] = _pick_cost_number(v, prev_cost)
+                    prev_cost = cost[k]
 
             raw_comm = vals.get("sales_commission_desc")
             if raw_comm is None:
@@ -2659,17 +2769,33 @@ def summary_rows_for_doc(doc_id, pdf, pages):
     # 실측: 클래스 A가 "최초설정일~운용전환일 전일"과 "운용전환일~해지일"
     # 두 행이고 이름 칸은 하나로 병합돼 있다). 클래스당 한 레코드를 내되
     # 나머지 기간을 버리지는 않고 additional_fee_rows로 남긴다.
+    # 같은 클래스가 두 띠로 쪼개져 한쪽엔 판매수수료·비용예시가, 다른
+    # 쪽엔 보수 값이 담기기도 한다(격자상 이름 칸이 두 행에 걸쳐서다).
+    # 그래서 뒤 행을 그냥 버리면 안 되고, 비어 있는 칸을 채운 뒤 값이
+    # 실제로 다른 것만 additional_fee_rows에 남긴다.
+    fee_fields = ("total_fee", "distribution_fee", "peer_avg_fee",
+                  "total_fee_and_cost", "sales_commission_desc")
     out, seen = [], {}
     for r in rows:
         code = r["class_code"]
-        if code in seen:
-            seen[code].setdefault("additional_fee_rows", []).append(
-                {k: r[k] for k in ("total_fee", "distribution_fee", "peer_avg_fee",
-                                   "total_fee_and_cost", "cost_projection_per_10m",
-                                   "evidence") if r.get(k)})
+        if code not in seen:
+            seen[code] = r
+            out.append(r)
             continue
-        seen[code] = r
-        out.append(r)
+        keep, extra = seen[code], {}
+        for y, cv in (r.get("cost_projection_per_10m") or {}).items():
+            keep.setdefault("cost_projection_per_10m", {}).setdefault(y, cv)
+        for f in fee_fields:
+            v = r.get(f)
+            if v is None:
+                continue
+            if keep.get(f) is None:
+                keep[f] = v
+            elif keep[f] != v:
+                extra[f] = v
+        if extra:
+            extra["evidence"] = r.get("evidence")
+            keep.setdefault("additional_fee_rows", []).append(extra)
     return out
 
 
