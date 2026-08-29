@@ -25,6 +25,9 @@ import sqlite3
 from product_lookup import PRODUCT_CODE_RE  # noqa: E402
 from build_product_facts_db import DEFAULT_DB_PATH
 
+# 나란히 견줄 조건 줄 수. 조건마다 상품 수만큼 줄이 늘어난다.
+MAX_COMPARE_CONDITIONS = 2
+
 COMPARISON_KEYWORDS = ["비교", "차이", "어느", "어디가", "더 낮", "더 높", "vs", "대비"]
 
 
@@ -77,110 +80,131 @@ def _fetch_best_class_return(conn, code, class_code=None):
     return conn.execute(sql, params).fetchone()
 
 
-def _fee_classes(conn, code):
-    return {r[0] for r in conn.execute(
-        "SELECT class_code FROM class_fees "
-        "WHERE product_code = ? AND total_fee IS NOT NULL", (code,))}
+def _classes_with_meaning(conn, code):
+    """이 상품의 클래스 -> (뜻, 총보수, 수익률행). 뜻을 모르는 건 뺀다.
+
+    코드가 같으면 같은 클래스라고 보면 안 된다. 미래에셋의 C-P는
+    개인연금이고 교보악사의 CP는 퇴직연금이며, 한국투자는 그냥 C가
+    개인연금이다. 코드로 맞추면 개인연금과 퇴직연금을 나란히 놓고
+    "같은 클래스끼리 비교했다"고 표시하게 된다."""
+    out = {}
+    for m in conn.execute(
+            "SELECT * FROM class_meaning WHERE product_code = ?", (code,)):
+        if not m["retail"]:
+            continue  # 기관/고액/랩 전용은 일반 고객이 살 수 없다
+        out[m["class_code"]] = {
+            "condition": (m["account_type"], m["channel"]),
+            "description": m["description"],
+        }
+    for f in conn.execute(
+            "SELECT class_code, total_fee FROM class_fees "
+            "WHERE product_code = ? AND total_fee IS NOT NULL", (code,)):
+        if f["class_code"] in out:
+            out[f["class_code"]]["total_fee"] = f["total_fee"]
+    for r in conn.execute(
+            "SELECT * FROM class_returns WHERE product_code = ? "
+            "AND row_kind = 'class_return' AND " + _RETURN_HAS_VALUE, (code,)):
+        if r["class_code"] in out:
+            out[r["class_code"]]["ret"] = dict(r)
+    return {k: v for k, v in out.items() if "total_fee" in v}
 
 
-def _return_classes(conn, code):
-    return {r[0] for r in conn.execute(
-        "SELECT class_code FROM class_returns WHERE product_code = ? "
-        "AND row_kind = 'class_return' AND " + _RETURN_HAS_VALUE, (code,))}
+def _fee_range(classes):
+    fees = [v["total_fee"] for v in classes.values()]
+    return (min(fees), max(fees)) if fees else (None, None)
 
 
-def _rep_class_key(c):
-    """대표로 보여줄 클래스 고르는 순서. A(창구 판매) -> C -> 나머지."""
-    c = c or ""
-    return (0 if c == "A" else 1 if c == "C" else 2, len(c), c)
+def _condition_name(cond):
+    account, channel = cond
+    account = {"개인연금": "연금저축", "퇴직연금": "퇴직연금(DC/IRP)"}.get(
+        account, account)
+    channel = {"오프라인": "창구", "온라인": "온라인",
+               "온라인슈퍼": "온라인슈퍼", "직판": "운용사 직판"}.get(channel, channel)
+    return " · ".join(p for p in (account, channel) if p)
 
 
-def _common_class(conn, codes, fields):
-    """비교 대상 전부가 갖고 있는 클래스 하나. 없으면 None.
+def _common_conditions(per_product):
+    """모든 상품이 함께 가진 가입 조건. 없으면 빈 리스트."""
+    sets = [{v["condition"] for v in cls.values()} for cls in per_product.values()]
+    if not sets:
+        return []
+    common = set.intersection(*sets)
+    # 연금 계좌로 살 수 있는 조건을 앞에 둔다(연금 상품을 견주는 자리이므로).
+    return sorted(common, key=lambda c: (c[0] is None, str(c[0]), str(c[1])))
 
-    클래스마다 보수가 크게 달라서(A 1.47% vs A-e 1.12%), 상품마다 다른
-    클래스를 대표로 뽑아 나란히 놓으면 상품 차이가 아니라 클래스 차이를
-    보여주게 된다. 가능하면 같은 클래스끼리 견준다."""
-    common = None
-    for code in codes:
-        s = _fee_classes(conn, code) if "fee" in fields else None
-        if "return" in fields:
-            r = _return_classes(conn, code)
-            s = r if s is None else (s & r)
-        if not s:
-            return None
-        common = s if common is None else (common & s)
-        if not common:
-            return None
-    return min(common, key=_rep_class_key) if common else None
+
+def _pick(classes, cond):
+    """그 조건에 해당하는 클래스 중 총보수가 가장 낮은 것."""
+    hits = [(cc, v) for cc, v in classes.items() if v["condition"] == cond]
+    return min(hits, key=lambda h: h[1]["total_fee"]) if hits else None
 
 
 def compare_products(product_codes, db_path=DEFAULT_DB_PATH, fields=None):
     """product_codes: ['KR...', 'KR...'] (2개 이상)
     fields: {"fee", "return", "risk"} 중 관심 있는 것만 (None이면 전부)
     반환: (요약 텍스트, 근거 목록)
+
+    상품마다 총보수 범위를 먼저 내고, 모든 상품이 함께 가진 가입 조건이
+    있으면 그 조건으로 나란히 견준다. 공통 조건이 없으면 없다고 말한다 -
+    조건이 다른 숫자를 나란히 놓으면 상품 차이가 아니라 가입 방법 차이를
+    보여주게 된다.
     """
     fields = fields or {"fee", "return", "risk"}
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
 
-    lines = []
-    evidence = []
-    common = _common_class(conn, product_codes, fields)
-    used_classes = set()
+    lines, evidence = [], []
+    per_product, names = {}, {}
     for code in product_codes:
         product = _fetch_product(conn, code)
         if not product:
             lines.append(f"[{code}] 상품 정보를 찾지 못함")
             continue
+        names[code] = product["product_name"] or code
+        classes = _classes_with_meaning(conn, code)
+        per_product[code] = classes
 
-        name = product["product_name"] or code
-        parts = [f"[{code}] {name}"]
+        parts = [f"[{code}] {names[code]}"]
         if "risk" in fields and product["risk_level"] is not None:
             parts.append(f"위험등급 {product['risk_level']}등급")
         if product["asset_type"]:
             parts.append(f"({product['asset_type']})")
-
-        # fee/return을 각각 독립적으로 "가장 좋은 클래스"를 고르면 서로 다른
-        # 클래스가 섞여서(총보수는 A-E클래스, 수익률은 C클래스처럼) 비교
-        # 결과가 혼란스러워진다. 수익률 표는 보통 대표 클래스 하나만 실어서
-        # (총보수 표는 클래스별로 다 있는 것과 달리) 더 희소하므로, 수익률이
-        # 있는 클래스를 먼저 정하고 총보수를 그 클래스에 맞춰 조회한다.
-        rep_class = common
-        ret = None
-        if "return" in fields:
-            ret = (_fetch_best_class_return(conn, code, class_code=rep_class)
-                   if rep_class else None) or _fetch_best_class_return(conn, code)
-            if ret:
-                rep_class = rep_class or ret["class_code"]
-
-        if "fee" in fields:
-            fee = _fetch_best_class_fee(conn, code, class_code=rep_class) or _fetch_best_class_fee(conn, code)
-            if fee:
-                rep_class = rep_class or fee["class_code"]
-                used_classes.add(fee["class_code"])
-                parts.append(f"총보수({fee['class_code']}클래스) {fee['total_fee']}%")
-                evidence.append({"product_code": code, "type": "class_fees", "class_code": fee["class_code"]})
-
-        if ret:
-            used_classes.add(ret["class_code"])
-            got = [(lbl, ret[col]) for lbl, col in
-                   (("최근1년", "return_1y"), ("최근3년", "return_3y"),
-                    ("설정후", "return_since_inception"))
-                   if ret[col] is not None]
-            if got:
-                parts.append(f"수익률({ret['class_code']}클래스) "
-                             + ", ".join(f"{lbl} {v}%" for lbl, v in got))
-            evidence.append({"product_code": code, "type": "class_returns", "class_code": ret["class_code"]})
-
+        lo, hi = _fee_range(classes)
+        if lo is None:
+            parts.append("총보수 정보를 찾지 못함")
+        elif lo == hi:
+            parts.append(f"총보수 {lo}%")
+        else:
+            parts.append(f"총보수 {lo}% ~ {hi}%")
         lines.append(" | ".join(parts))
+        evidence.append({"product_code": code, "type": "class_fees"})
 
-    # 같은 클래스로 못 맞췄으면 그 사실을 말한다. 클래스가 다르면 숫자를
-    # 그대로 견주는 게 틀린 비교가 되기 때문이다.
-    if len(used_classes) > 1:
-        lines.append("※ 상품마다 실린 클래스가 달라 서로 다른 클래스의 값입니다"
-                     f"({', '.join(sorted(used_classes))}). 클래스에 따라 보수가"
-                     " 달라지므로 같은 클래스끼리 비교해야 정확합니다.")
+    usable = {c: v for c, v in per_product.items() if v}
+    if len(usable) >= 2:
+        common = _common_conditions(usable)
+        if not common:
+            lines.append("※ 이 상품들이 함께 가진 가입 조건이 없어 같은 "
+                         "기준으로 나란히 견줄 수 없습니다. 위 범위로 비교해 주세요.")
+        for cond in common[:MAX_COMPARE_CONDITIONS]:
+            lines.append(f"— {_condition_name(cond)} 기준")
+            for code, classes in usable.items():
+                got = _pick(classes, cond)
+                if not got:
+                    continue
+                cc, v = got
+                bits = [f"    {names[code]}: 총보수 {v['total_fee']}%"]
+                r = v.get("ret")
+                if "return" in fields and r:
+                    got_r = [(lbl, r[col]) for lbl, col in
+                             (("최근1년", "return_1y"), ("최근3년", "return_3y"),
+                              ("설정후", "return_since_inception"))
+                             if r[col] is not None]
+                    if got_r:
+                        bits.append("수익률 " + ", ".join(
+                            f"{lbl} {x}%" for lbl, x in got_r))
+                lines.append(" | ".join(bits))
+                evidence.append({"product_code": code, "type": "class_fees",
+                                 "class_code": cc})
 
     conn.close()
     return "\n".join(lines), evidence

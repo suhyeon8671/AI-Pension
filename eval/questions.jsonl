@@ -27,7 +27,7 @@
 {"id":"PROD-14","category":"보수","q":"하나IT코리아 보수가 비싼 편인가요?","route":"single_product","code":"KR5111450067","must":["총보수"],"note":"'비싸' 키워드로 fee 의도 잡히는지"}
 {"id":"PROD-15","category":"수익률","q":"미래에셋프리미엄크레딧알파 설정 이후 수익률은?","route":"single_product","code":"KR5110501016","must":[],"note":"설정후 수익률"}
 
-{"id":"CMP-01","category":"비교","q":"KR510902511M과 KR5110601022 중에 뭐가 보수가 더 싸?","route":"comparison","must":["1.47","0.2775"],"note":""}
+{"id":"CMP-01","category":"비교","q":"KR510902511M과 KR5110601022 중에 뭐가 보수가 더 싸?","route":"comparison","must":["1.09","0.2275","기준"],"note":"코드가 아니라 가입 조건으로 맞춰 비교하고, 상품별 범위도 함께 내야 함"}
 {"id":"CMP-02","category":"비교","q":"미래에셋장기성장포커스랑 미래에셋차세대Fun인덱스 비교해줘","route":"comparison","must":[],"note":"이름 2개로 비교 경로 타는지"}
 {"id":"CMP-03","category":"비교","q":"하나파워e단기채와 한국투자 크레딧포커스 ESG 수익률 차이가 어때?","route":"comparison","must":[],"note":""}
 
