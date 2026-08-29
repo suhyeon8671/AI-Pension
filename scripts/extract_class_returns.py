@@ -603,21 +603,30 @@ def _return_grid(page, inherited=None):
             # "종류/최초설정일/설정일 이후"는 기간 라벨과 다른 띠에 그려지는
             # 문서가 있다(KR555202013M 실측: 626.3띠와 637.4띠,
             # KR5116501001 실측: 212.0띠와 227.4띠). 앵커 띠 근처(±30pt)에서
-            # 시작하는 띠들을 같은 머리글로 본다.
+            # 시작하는 띠들을 같은 머리글로 본다. 한 이름이 여러 띠로
+            # 쪼개지기도 해서("설정일" / "이후" - KR5131420007 실측) 칸마다
+            # 조각을 모아 이어 붙인 뒤에 이름을 판단한다.
             hb_bottom = anchor["bottom"]
+            parts_by_col, band_of = {}, {}
             for other in grid:
-                if abs(other["top"] - anchor["top"]) > 30 or other is anchor:
+                if abs(other["top"] - anchor["top"]) > 30:
                     continue
                 if other["bottom"] - other["top"] > 60:
                     continue
-                got_any = False
                 for ci, v in other["cells"].items():
-                    f = _return_column_field(v)
-                    if f and f not in fmap.values() and ci not in fmap:
+                    parts_by_col.setdefault(ci, []).append(v)
+                    band_of.setdefault(ci, []).append(other["bottom"])
+            for ci, parts in parts_by_col.items():
+                if ci in fmap:
+                    hb_bottom = max([hb_bottom] + band_of[ci])
+                    continue
+                uniq = list(dict.fromkeys(parts))
+                for cand in ["".join(parts), "".join(uniq)] + uniq:
+                    f = _return_column_field(cand)
+                    if f and f not in fmap.values():
                         fmap[ci] = f
-                        got_any = True
-                if got_any:
-                    hb_bottom = max(hb_bottom, other["bottom"])
+                        hb_bottom = max([hb_bottom] + band_of[ci])
+                        break
             cols_here, right_limit = col_x0s, max(c[2] for c in cells)
             if "since_inception" not in fmap.values():
                 # 표 테두리 오른쪽 바깥에 "설정일 이후" 칸이 칸 선 없이
@@ -644,32 +653,30 @@ def _return_grid(page, inherited=None):
             # 놓쳤다). 마지막으로 값이 나온 행에서 세로로 얼마나 떨어졌는지
             # 로 본다.
             def collect(cols):
+                """cols=None이면 어느 칸이든 값이 2개 이상인 띠를 모은다
+                (열 매핑을 아직 확정하기 전에 쓰는 후보)."""
                 got, last = [], None
                 for r in grid:
                     if r["top"] < hb_bottom - 1:
                         continue
-                    if sum(1 for c in cols if _val(r["cells"].get(c, ""))) >= 2:
+                    n = (sum(1 for v in r["cells"].values() if _val(v)) if cols is None
+                         else sum(1 for c in cols if _val(r["cells"].get(c, ""))))
+                    if n >= 2:
                         got.append(r)
                         last = r["bottom"]
                     elif last is not None and r["top"] - last > 60:
                         break
                 return got
 
-            data_rows = collect(period_cols)
-            if not data_rows:
-                # 머리글만 있고 값 행은 통째로 다음 페이지에 있는 문서가
-                # 있다(KR510902773M 실측: 44쪽 맨 아래에 "가.연평균수익률"
-                # 머리글, 45쪽부터 클래스 행). 값 행이 없어도 열 구성은
-                # 다음 페이지가 물려받을 수 있게 남겨 둔다.
-                if header_carry is None:
-                    header_carry = (fmap, [], cells, col_x0s, words)
-                continue
-
             # 머리글 칸과 값 칸의 x가 어긋나는 표가 있다(KR5113420012 실측:
-            # "최근 5년" 머리글은 7번 열인데 값은 6번 열에 있다). 값이 하나도
-            # 없는 칸은 옆의 빈 값 칸으로 옮긴다.
-            value_cols = {ci for r in data_rows for ci, v in r["cells"].items()
-                          if _val(v)}
+            # "최근 5년" 머리글은 7번 열인데 값은 6번 열에 있다.
+            # KR5174420011 실측: 머리글이 2/4/6/8번인데 값은 1/3/5/7번이라
+            # 표 전체가 한 칸씩 밀려 있다 - 이걸 먼저 고치지 않으면 값
+            # 행을 하나도 못 찾아 표를 통째로 버린다). 그래서 열 매핑을
+            # 확정하기 전에, 머리글 아래에서 값이 있는 띠를 먼저 모아
+            # "실제로 값이 들어 있는 칸"을 알아낸 뒤 어긋남을 고친다.
+            value_cols = {ci for r in collect(None)
+                          for ci, v in r["cells"].items() if _val(v)}
             for ci in sorted(fmap):
                 if fmap[ci] in ("label", "inception_date") or ci in value_cols:
                     continue
@@ -677,11 +684,17 @@ def _return_grid(page, inherited=None):
                     if nb in value_cols and nb not in fmap:
                         fmap[nb] = fmap.pop(ci)
                         break
-            # 옮긴 뒤 값 칸이 바뀌었을 수 있으니 행을 다시 고른다
-            # (값이 전부 "-"인 신규 클래스 행도 여기서 같이 들어온다).
             period_cols = [c for c, f in fmap.items()
                            if f.endswith("y") or f == "since_inception"]
-            rows2 = collect(period_cols) or data_rows
+            rows2 = collect(period_cols)
+            if not rows2:
+                # 머리글만 있고 값 행은 통째로 다음 페이지에 있는 문서가
+                # 있다(KR510902773M 실측: 44쪽 맨 아래에 "가.연평균수익률"
+                # 머리글, 45쪽부터 클래스 행). 값 행이 없어도 열 구성은
+                # 다음 페이지가 물려받을 수 있게 남겨 둔다.
+                if header_carry is None:
+                    header_carry = (fmap, [], cells, col_x0s, words)
+                continue
 
             # 세로줄이 값 구간에서 끊겨 그 열의 칸이 아예 안 생기는 표가
             # 있다(KR555202013M 실측: "설정일 이후" 값이 통째로 빠졌다).
@@ -748,7 +761,11 @@ def _return_grid(page, inherited=None):
         # 다른 표(운용전문인력 등)에 매핑이 씌워지면 엉뚱한 행이 생긴다.
         rows3, last = [], None
         for r in grid:
-            if sum(1 for c in pcols if _val(r["cells"].get(c, ""))) >= max(2, len(pcols) - 1):
+            # 기간 칸이 일부 비어 있는 클래스가 있다(KR5194450018 실측:
+            # 설정한 지 얼마 안 된 RP-e/S-P/CP-e는 1년·2년·설정후 세 칸만
+            # 있다). "거의 다 채워져야 한다"고 요구하면 그런 클래스를
+            # 통째로 잃는다.
+            if sum(1 for c in pcols if _val(r["cells"].get(c, ""))) >= max(2, int(len(pcols) * 0.6)):
                 rows3.append(r)
                 last = r["bottom"]
             elif last is not None and r["top"] - last > 60:
