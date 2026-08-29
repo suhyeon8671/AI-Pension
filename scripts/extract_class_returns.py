@@ -557,6 +557,29 @@ def _val(v):
 
 
 def _return_grid(page, inherited=None):
+    """페이지에서 연평균수익률 표를 읽는다. 표 테두리를 선(line)이 아니라
+    채워진 사각형(rect)으로 그린 페이지가 있는데, pdfplumber 기본 설정은
+    그런 표의 가로줄을 못 잡는다(KR5120420039 실측: 같은 문서인데 6쪽은
+    227칸으로 읽히고 7쪽은 6칸으로만 읽힌다 - 눈으로는 똑같이 테두리가
+    보인다). 기본 설정으로 못 읽은 페이지에 한해 가로줄을 글자 줄에서
+    잡는 설정으로 다시 읽는다."""
+    def nrows(got):
+        return sum(len(rows) for _, rows, _, _, _ in got) if got else 0
+
+    first = _return_grid_one(page, inherited, None)
+    if nrows(first) >= 3:
+        return first
+    # 기본 설정으로 거의 못 읽었으면 가로줄을 글자 줄에서 잡는 설정으로
+    # 다시 읽어 더 많이 나오는 쪽을 쓴다.
+    second = _return_grid_one(
+        page, inherited,
+        {"vertical_strategy": "lines", "horizontal_strategy": "text"})
+    if nrows(second) > nrows(first):
+        return second
+    return first or second or None
+
+
+def _return_grid_one(page, inherited=None, settings=None):
     """이 페이지에서 "가.연평균수익률" 표를 셀 격자로 읽는다.
     돌려주는 것: (field_by_col, data_rows, cells) 또는 None.
 
@@ -568,10 +591,14 @@ def _return_grid(page, inherited=None):
     넘어가면 이어지는 쪽엔 머리글이 반복되지 않는다(KR510902773M 실측:
     3쪽에 클래스 행, 4쪽에 비교지수·변동성 행 / 45쪽 상세표는 머리글이
     44쪽에 있다). 이 페이지에서 머리글을 못 찾았을 때만 물려받는다."""
-    words = page.extract_words(x_tolerance=2, keep_blank_chars=False)
+    # 글자가 한 자씩 떨어져 나오는 문서가 있어(폰트 문제 - "C la s s S")
+    # x_tolerance를 넉넉히 준다. 값은 공백을 지우고 쓰므로 붙여 읽어도
+    # 안전하고, 붙여야 클래스 이름을 알아본다.
+    words = page.extract_words(x_tolerance=5, keep_blank_chars=False)
     out = []
     header_carry = None
-    for t in page.find_tables():
+    for t in (page.find_tables(table_settings=settings) if settings
+              else page.find_tables()):
         cells = [c for c in t.cells if c]
         if len(cells) < 8:
             continue
@@ -803,6 +830,14 @@ def _return_grid(page, inherited=None):
                 best[near] = (dist, ci)
         for near, (_, ci) in best.items():
             mapped[ci] = prev_fields[near]
+        # 페이지마다 표가 통째로 조금씩 밀려 그려지는 문서가 있다
+        # (KR5120420039 실측: 6쪽 456.2 / 7쪽 447.4처럼 4~10pt씩 어긋난다).
+        # x만 보면 오른쪽 열부터 매칭이 끊긴다 - 열 개수가 앞 장과 같으면
+        # 순서대로 맞추는 게 확실하다(이어지는 표는 열 구성이 같으니까).
+        if len(mapped) < len(prev_fields) and len(col_x0s) == len(prev_fields):
+            mapped = {ci: prev_fields[k]
+                      for ci, k in enumerate(sorted(prev_fields))}
+            matched = len(col_x0s)
         pcols = [c for c, f in mapped.items()
                  if f.endswith("y") or f == "since_inception"]
         if matched < 3 or len(pcols) < 3:
@@ -881,6 +916,16 @@ def return_rows_for_doc(doc_id, pdf, pages, known_classes=None):
                 class_code = None
                 if kind == "class_return":
                     class_code = _return_label_code(label, known_classes)
+                # 열 구성을 앞 장에서 물려받으면 같은 페이지의 운용전문인력
+                # 표에도 매핑이 씌워질 수 있다(KR5120420039 실측: 권용범
+                # 1969 본부장 ... 행이 클래스로 잡혔다). 그 표에는 생년
+                # (네 자리 연도 단독)이나 운용규모(34,017억원)가 들어 있고
+                # 수익률 표에는 그런 값이 없다.
+                if kind == "class_return" and class_code is None:
+                    toks = " ".join(r["cells"].values()).split()
+                    if any(re.fullmatch(r"(19|20)\d{2}", t) for t in toks) or \
+                            any(re.match(r"^\d{1,3},\d{3}", t) for t in toks):
+                        continue
 
                 values = {}
                 for ci, f in field_by_col.items():
@@ -948,7 +993,8 @@ def _return_label_code(label, known_classes):
     m = CLASS_CODE_RE.search(flat)
     if m:
         return m.group(1)
-    m2 = CLASS_CODE_NOPAREN_RE.search(label)
+    # 글자가 떨어져 나오는 문서("C la s s S")도 있어 공백을 지운 쪽을 본다
+    m2 = CLASS_CODE_NOPAREN_RE.search(flat)
     if m2:
         return m2.group(1)
     m3 = CLASS_CODE_JONGRYU_RE.search(flat)
@@ -1209,6 +1255,50 @@ def enrich_with_detail_return_table(pdf, doc_id, existing_rows, used_pages, know
     return new_rows
 
 
+_RETURN_FALLBACK_DOCS = set()
+RETURN_PERIODS = ("1y", "2y", "3y", "5y", "since_inception")
+
+
+def _return_row_is_junk(r):
+    """좌표 방식이 만든 정체불명 행. 클래스 코드를 못 붙인 class_return이나
+    코드가 연도인 행은 재현 대상이 아니다(실측: "- - 20,369 20,466"인
+    설정/환매현황 행, "설정일 - - - 이후"에서 나온 코드 '2024')."""
+    if r["row_kind"] != "class_return":
+        return False
+    code = r.get("class_code")
+    return code is None or bool(re.fullmatch(r"(19|20)\d{2}", str(code)))
+
+
+def _return_cells_lose_anything(coord_rows, cell_rows):
+    """셀 결과가 좌표 결과에 비해 무엇이든 잃었는지 본다. class_fees에서
+    쓴 것과 같은 안전장치 - 하나라도 잃으면 그 문서는 좌표 결과를 쓴다."""
+    def key(r):
+        return (r["row_kind"], r.get("class_code"))
+
+    def fold(rows):
+        out = {}
+        for r in rows:
+            cur = out.setdefault(key(r), {})
+            for p in RETURN_PERIODS:
+                v = (r.get("values") or {}).get(p)
+                if v is not None and cur.get(p) is None:
+                    cur[p] = v
+            if r.get("inception_date") and not cur.get("date"):
+                cur["date"] = r["inception_date"]
+        return out
+
+    a = fold([r for r in coord_rows if not _return_row_is_junk(r)])
+    b = fold(cell_rows)
+    for k, av in a.items():
+        bv = b.get(k)
+        if bv is None:
+            return True
+        for f in list(RETURN_PERIODS) + ["date"]:
+            if av.get(f) is not None and bv.get(f) != av[f]:
+                return True
+    return False
+
+
 def process_doc(doc_id):
     pdf_candidates = glob.glob(os.path.join(DATA_DIR, doc_id, "*.pdf"))
     if not pdf_candidates:
@@ -1231,6 +1321,20 @@ def process_doc(doc_id):
             for r in rows:
                 r["product_code"] = doc_id
                 results.append(r)
+
+        # 같은 페이지들을 셀 격자로도 읽어 대조한다. 셀 방식이 좌표 방식이
+        # 뽑은 걸 하나도 잃지 않았을 때만 그쪽을 쓴다 - 좌표 방식은 값
+        # 개수와 줄 위치로 매번 추측해야 해서 문서별 예외가 계속 붙었고,
+        # 실제로 설정일이후 값을 3년 칸에 넣는 오류도 있었다(KR5194450018
+        # 실측). 표 테두리가 아예 안 그려진 문서는 셀로 읽을 수 없으니
+        # 그대로 좌표 결과를 쓴다.
+        cell_rows = return_rows_for_doc(doc_id, pdf, pages, known_classes)
+        if cell_rows and not _return_cells_lose_anything(results, cell_rows):
+            for r in cell_rows:
+                r["product_code"] = doc_id
+            results = cell_rows
+        else:
+            _RETURN_FALLBACK_DOCS.add(doc_id)
 
         # 요약표 기준으로 중복 제거/merge를 먼저 끝낸 뒤(그 결과가 상세표
         # 대조의 "정답지"가 된다) 뒤쪽 상세표 보강을 돌린다 - pdf 핸들이
@@ -1371,6 +1475,8 @@ def main():
     print(f"{len(all_rows)}개 행 ({docs_with_hits}개 문서) → {args.output}")
     print(f"  class_return 행: {len(class_rows)}건, 클래스코드 인식: {labeled}건")
     print(f"  benchmark(비교지수)/volatility(변동성) 행: {len(all_rows) - len(class_rows)}건")
+    fb = sorted(_RETURN_FALLBACK_DOCS)
+    print(f"  수익률표 좌표 방식 폴백 문서: {len(fb)}개 {fb}")
 
 
 if __name__ == "__main__":
