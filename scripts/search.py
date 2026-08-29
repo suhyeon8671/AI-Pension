@@ -72,6 +72,11 @@ LEXICAL_STOPWORDS = {
     "무엇", "뭔가요", "뭐야", "어떻게", "어떤", "얼마", "얼마나", "언제", "누가",
     "가능", "가능한가요", "인가요", "입니까", "있나요", "되나요", "하나요", "알려줘",
     "경우", "관련", "대해", "대한", "그리고", "하지만", "때문", "정도", "정말",
+    # 묻는 방식에 딸린 말들. 뜻은 없는데 원문에 잘 안 쓰여서(원문은 "70%"라고
+    # 쓰지 "70퍼센트"라고 안 쓴다) 되레 아주 드문 말이 되고, 드물다는 이유로
+    # 가장 무거운 점수를 받아 검색을 통째로 망친다. "DC형에서 위험자산은 최대
+    # 몇 퍼센트"에서 '퍼센트'가 딱 한 청크에 있다는 이유로 1등을 차지했다.
+    "퍼센트", "프로", "최대", "최소", "최근", "이상", "이하", "미만", "초과",
 }
 # 한글/영문/숫자가 섞인 덩어리를 한 낱말로 본다("DC형에서", "1,000만원").
 _TERM_RE = re.compile(r"[가-힣A-Za-z0-9][가-힣A-Za-z0-9,.]*")
@@ -120,9 +125,14 @@ def lexical_term_groups(query):
     groups, seen = [], set()
     for raw in _TERM_RE.findall(query or ""):
         raw = raw.strip(",.")
+        stem = _strip_particles(raw)
+        forms = (raw, stem)
+        # 조사를 뗀 형태가 불용어면 붙은 형태도 같은 말이다("퍼센트까지").
+        if any(f in LEXICAL_STOPWORDS for f in forms):
+            continue
         variants = []
-        for t in (raw, _strip_particles(raw)):
-            if len(t) < 3 or t in LEXICAL_STOPWORDS or t in seen:
+        for t in forms:
+            if len(t) < 3 or t in seen:
                 continue
             seen.add(t)
             variants.append(t)
