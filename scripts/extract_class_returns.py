@@ -992,18 +992,29 @@ def return_rows_for_doc(doc_id, pdf, pages, known_classes=None):
     # 클래스명이 여러 띠에 쪼개져 그려지면 같은 값 행이 라벨만 다르게
     # 두 번 잡히기도 한다(KR5123490013 실측). 값이 똑같은데 한쪽만 클래스
     # 코드를 찾은 경우 코드 있는 쪽만 남긴다.
+    # 주의: 값만으로 묶으면 안 된다. 아직 수익률이 없는 신규 클래스는
+    # 값이 전부 "-"라 서로 구분이 안 돼 C1/C2/C3가 한 행으로 뭉개진다
+    # (KR510902511M 실측). 코드가 다르면 다른 행이고, 값이 같은데 한쪽만
+    # 코드를 못 찾은 경우에만 코드 있는 쪽을 남긴다.
     keyed = {}
+    with_code = {(r["row_kind"], tuple(sorted((r.get("values") or {}).items())))
+                 for r in rows if r.get("class_code")}
     for r in rows:
-        k = (r["row_kind"], tuple(sorted((r.get("values") or {}).items())))
-        cur = keyed.get(k)
-        if cur is None or (cur.get("class_code") is None
-                           and r.get("class_code") is not None):
-            keyed[k] = r
+        vals_k = tuple(sorted((r.get("values") or {}).items()))
+        if r.get("class_code"):
+            k = (r["row_kind"], r["class_code"], vals_k)
+        elif r["row_kind"] == "class_return" and (r["row_kind"], vals_k) in with_code:
+            continue          # 같은 값을 코드까지 찾은 행이 이미 있다
+        else:
+            k = (r["row_kind"], None, vals_k)
+        keyed.setdefault(k, r)
     # 비교지수·변동성 행의 최초설정일은 클래스 행과 병합된 칸에 한 번만
     # 찍혀서 이어지는 페이지에선 비어 보인다. 바로 앞 행의 날짜를 잇는다.
     out, last_date = [], None
     for r in rows:
-        k = (r["row_kind"], tuple(sorted((r.get("values") or {}).items())))
+        vals_k = tuple(sorted((r.get("values") or {}).items()))
+        k = ((r["row_kind"], r["class_code"], vals_k) if r.get("class_code")
+             else (r["row_kind"], None, vals_k))
         if keyed.get(k) is not r:
             continue
         # 비교지수·변동성은 펀드 전체 기준이라 최초설정일도 펀드의 것
