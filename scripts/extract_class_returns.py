@@ -484,6 +484,406 @@ def find_return_rows_on_page(page, page_num, section="가", known_classes=None):
     return rows, section
 
 
+
+# ---------------------------------------------------------------------------
+# 셀 경계 기반 추출
+#
+# 위의 find_return_rows_on_page는 단어를 y좌표로 묶어 "줄"을 만들고, 그
+# 줄에서 값 토큰을 세어 행을 판별한다. 그래서 병합 셀이나 셀 안 줄바꿈이
+# 있으면 옆 칸 글자가 같은 줄로 섞이고, 문서마다 예외 처리가 계속 붙었다
+# (이 파일의 긴 주석들이 그 흔적이다). 표의 셀 경계는 PDF가 직접 그려 둔
+# 정보이므로 그걸 쓰면 그런 추측이 필요 없다. class_fees에서 같은 전환을
+# 먼저 했고 폴백 0으로 끝냈다 - 같은 방식을 여기에도 적용한다.
+# ---------------------------------------------------------------------------
+
+RETURN_PERIOD_RE = re.compile(r"^(?:최근)?(\d)년$")
+RETURN_LABEL_NAMES = ("종류", "클래스", "구분", "종류(클래스)")
+
+
+def _return_column_field(name):
+    """머리글 이름 → 필드. 못 알아보면 None."""
+    n = re.sub(r"\s+", "", name)
+    if not n:
+        return None
+    # 기간 범위를 열 이름과 같은 칸에 함께 찍는 문서가 있다
+    # (KR5194450018 실측: "최근 1년 ('24.01.17 ~'25.01.16)").
+    # 괄호 앞부분만 이름으로 본다.
+    if "(" in n and _return_column_field_base(n) is None:
+        n = n.split("(")[0]
+    return _return_column_field_base(n)
+
+
+def _return_column_field_base(n):
+    if "설정일이후" in n or n in ("설정후", "설정이후"):
+        return "since_inception"
+    if "최초설정일" in n or n in ("설정일", "최초설정"):
+        return "inception_date"
+    if n in RETURN_LABEL_NAMES or n.startswith("종류"):
+        return "label"
+    # 글자가 그려진 순서 때문에 "최근 1년"이 "최근 년 1"로 뒤집혀 추출되는
+    # 문서가 있다(KR555202013M 실측 - class_fees에서도 같은 현상을 봤다).
+    m = RETURN_PERIOD_RE.match(n) or re.match(r"^(?:최근)?년(\d)$", n)
+    if m:
+        return {"1": "1y", "2": "2y", "3": "3y", "5": "5y"}.get(m.group(1))
+    return None
+
+
+def _clean_val(v):
+    """칸 글자에서 값 부분만 남긴다. 값마다 "%"를 붙여 찍는 문서가 있다
+    (KR5114420027 실측: "5.89 %") - 그대로 두면 숫자로 안 보여 그 표가
+    통째로 빠진다."""
+    return v.replace(" ", "").rstrip("%")
+
+
+def _val(v):
+    v = _clean_val(v)
+    return bool(DECIMAL_RE.match(v) or NUM_RE.match(v) or DASH_RE.match(v))
+
+
+def _return_grid(page, inherited=None):
+    """이 페이지에서 "가.연평균수익률" 표를 셀 격자로 읽는다.
+    돌려주는 것: (field_by_col, data_rows, cells) 또는 None.
+
+    "나.연도별 수익률 추이" 표는 열 뜻이 달라(1~5년차 단년도) 절대 섞이면
+    안 되는데, 그 표에는 "설정일 이후" 칸이 없고 머리글이 연도(2024년 등)라
+    구분된다 - 설정일이후 칸이 있는 표만 연평균 표로 인정한다.
+
+    inherited: 바로 앞 페이지에서 잡은 (열매핑, 열x좌표). 표가 페이지를
+    넘어가면 이어지는 쪽엔 머리글이 반복되지 않는다(KR510902773M 실측:
+    3쪽에 클래스 행, 4쪽에 비교지수·변동성 행 / 45쪽 상세표는 머리글이
+    44쪽에 있다). 이 페이지에서 머리글을 못 찾았을 때만 물려받는다."""
+    words = page.extract_words(x_tolerance=2, keep_blank_chars=False)
+    out = []
+    header_carry = None
+    for t in page.find_tables():
+        cells = [c for c in t.cells if c]
+        if len(cells) < 8:
+            continue
+        raw_x0s = sorted({round(c[0], 1) for c in cells})
+        col_x0s = []
+        for x in raw_x0s:
+            if col_x0s and x - col_x0s[-1] <= 6:
+                continue
+            col_x0s.append(x)
+        if len(col_x0s) < 3:
+            continue
+
+        def col_of(x0):
+            return min(range(len(col_x0s)), key=lambda k: abs(col_x0s[k] - x0))
+
+        bands = sorted({(round(c[1], 1), round(c[3], 1)) for c in cells})
+        grid = []
+        for top, bottom in bands:
+            ent = {}
+            for (x0, ct, x1, cb) in [c for c in cells
+                                     if abs(c[1] - top) < 1 and abs(c[3] - bottom) < 1]:
+                ws = [w for w in words
+                      if x0 - 1 <= (w["x0"] + w["x1"]) / 2 <= x1 + 1
+                      and ct - 1 <= (w["top"] + w["bottom"]) / 2 <= cb + 1]
+                ws.sort(key=lambda w: (round(w["top"], 1), w["x0"]))
+                txt = " ".join(w["text"] for w in ws).strip()
+                if txt:
+                    ent[col_of(x0)] = txt
+            grid.append({"top": top, "bottom": bottom, "cells": ent})
+
+        # 페이지 전체가 표 하나로 잡히는 문서가 많다(보수표·수익률표·
+        # 운용전문인력표가 한 격자 안에 다 들어 있다). 그래서 "첫 데이터
+        # 행 앞이 머리글"이라는 규칙은 못 쓴다 - 대신 수익률 표 열 이름이
+        # 실제로 붙어 있는 띠를 격자 어디서든 찾아 그 아래를 데이터로 본다.
+        # 보수표의 비용예시 머리글도 "1년/2년/3년"이라 똑같이 걸리는데,
+        # 거기엔 "설정일 이후" 칸이 없다는 점으로 구분한다.
+        for gi, anchor in enumerate(grid):
+            fmap = {}
+            for ci, v in anchor["cells"].items():
+                f = _return_column_field(v)
+                if f and f not in fmap.values():
+                    fmap[ci] = f
+            if sum(1 for f in fmap.values() if f.endswith("y")) < 2:
+                continue
+            # "종류/최초설정일/설정일 이후"는 기간 라벨과 다른 띠에 그려지는
+            # 문서가 있다(KR555202013M 실측: 626.3띠와 637.4띠,
+            # KR5116501001 실측: 212.0띠와 227.4띠). 앵커 띠 근처(±30pt)에서
+            # 시작하는 띠들을 같은 머리글로 본다.
+            hb_bottom = anchor["bottom"]
+            for other in grid:
+                if abs(other["top"] - anchor["top"]) > 30 or other is anchor:
+                    continue
+                if other["bottom"] - other["top"] > 60:
+                    continue
+                got_any = False
+                for ci, v in other["cells"].items():
+                    f = _return_column_field(v)
+                    if f and f not in fmap.values() and ci not in fmap:
+                        fmap[ci] = f
+                        got_any = True
+                if got_any:
+                    hb_bottom = max(hb_bottom, other["bottom"])
+            cols_here, right_limit = col_x0s, max(c[2] for c in cells)
+            if "since_inception" not in fmap.values():
+                # 표 테두리 오른쪽 바깥에 "설정일 이후" 칸이 칸 선 없이
+                # 글자만 놓인 문서가 있다(KR5129420025 실측: 표는 x=487에서
+                # 끝나는데 머리글은 500, 값은 508에 있다). 머리글 줄 높이에
+                # 그 글자가 보이면 열을 하나 더 만든다.
+                head_ws = sorted((w for w in words
+                                  if w["x0"] > right_limit - 2
+                                  and anchor["top"] - 20 <= w["top"] <= hb_bottom + 5),
+                                 key=lambda w: w["x0"])
+                joined = re.sub(r"\s+", "", " ".join(w["text"] for w in head_ws))
+                if "설정일이후" not in joined and "설정이후" not in joined:
+                    continue
+                cols_here = col_x0s + [right_limit]
+                fmap[len(cols_here) - 1] = "since_inception"
+                right_limit = page.width
+
+            # 머리글 아래로 이어지는 값 행들. 각주·다른 표를 만나면 멈춘다.
+            period_cols = [c for c, f in fmap.items()
+                           if f.endswith("y") or f == "since_inception"]
+            # 표가 어디서 끝나는지는 "값 없는 띠 몇 개"로 세면 안 된다 -
+            # 격자에는 빈 띠와 클래스명 조각 띠가 잔뜩 섞여 있어서
+            # 금방 3개가 차버린다(KR5116501001 실측: 비교지수·변동성 행을
+            # 놓쳤다). 마지막으로 값이 나온 행에서 세로로 얼마나 떨어졌는지
+            # 로 본다.
+            def collect(cols):
+                got, last = [], None
+                for r in grid:
+                    if r["top"] < hb_bottom - 1:
+                        continue
+                    if sum(1 for c in cols if _val(r["cells"].get(c, ""))) >= 2:
+                        got.append(r)
+                        last = r["bottom"]
+                    elif last is not None and r["top"] - last > 60:
+                        break
+                return got
+
+            data_rows = collect(period_cols)
+            if not data_rows:
+                # 머리글만 있고 값 행은 통째로 다음 페이지에 있는 문서가
+                # 있다(KR510902773M 실측: 44쪽 맨 아래에 "가.연평균수익률"
+                # 머리글, 45쪽부터 클래스 행). 값 행이 없어도 열 구성은
+                # 다음 페이지가 물려받을 수 있게 남겨 둔다.
+                if header_carry is None:
+                    header_carry = (fmap, [], cells, col_x0s, words)
+                continue
+
+            # 머리글 칸과 값 칸의 x가 어긋나는 표가 있다(KR5113420012 실측:
+            # "최근 5년" 머리글은 7번 열인데 값은 6번 열에 있다). 값이 하나도
+            # 없는 칸은 옆의 빈 값 칸으로 옮긴다.
+            value_cols = {ci for r in data_rows for ci, v in r["cells"].items()
+                          if _val(v)}
+            for ci in sorted(fmap):
+                if fmap[ci] in ("label", "inception_date") or ci in value_cols:
+                    continue
+                for nb in (ci - 1, ci + 1):
+                    if nb in value_cols and nb not in fmap:
+                        fmap[nb] = fmap.pop(ci)
+                        break
+            # 옮긴 뒤 값 칸이 바뀌었을 수 있으니 행을 다시 고른다
+            # (값이 전부 "-"인 신규 클래스 행도 여기서 같이 들어온다).
+            period_cols = [c for c, f in fmap.items()
+                           if f.endswith("y") or f == "since_inception"]
+            rows2 = collect(period_cols) or data_rows
+
+            # 세로줄이 값 구간에서 끊겨 그 열의 칸이 아예 안 생기는 표가
+            # 있다(KR555202013M 실측: "설정일 이후" 값이 통째로 빠졌다).
+            # 열의 x범위와 행의 y범위는 표에서 이미 아니까 그 사각형을
+            # 직접 읽어 채운다.
+            table_x1 = right_limit
+            for r in rows2:
+                for ci in period_cols:
+                    if ci in r["cells"]:
+                        continue
+                    lo = cols_here[ci]
+                    # 다음 열이 이 표에서 실제로 쓰이지 않으면(칸도 안
+                    # 그려지고 매핑도 없으면) 그 자리까지가 이 열의 폭이다.
+                    # 머리글 칸은 496에서 시작하는데 값은 528에 찍히는
+                    # 문서가 있어(KR5127420034 실측: 설정일 이후 값이
+                    # 통째로 빠졌다) 폭을 좁게 잡으면 못 읽는다.
+                    used = {c for rr in rows2 for c in rr["cells"]} | set(fmap)
+                    hi = table_x1
+                    for j in range(ci + 1, len(cols_here)):
+                        if j in used:
+                            hi = cols_here[j]
+                            break
+                    ws = [w for w in words
+                          if lo - 1 <= (w["x0"] + w["x1"]) / 2 < hi
+                          and r["top"] - 1 <= (w["top"] + w["bottom"]) / 2 <= r["bottom"] + 1]
+                    if not ws:
+                        continue
+                    ws.sort(key=lambda w: (round(w["top"], 1), w["x0"]))
+                    txt = " ".join(w["text"] for w in ws).strip()
+                    if _val(txt):
+                        r["cells"][ci] = txt
+
+            out.append((fmap, rows2, cells, cols_here, words))
+
+        if out:
+            continue
+
+        # 이 표에서 머리글을 못 찾았으면 앞 페이지 열 구성을 물려받아 본다.
+        if not inherited:
+            continue
+        prev_fields, prev_cols = inherited
+        mapped, matched, best = {}, 0, {}
+        for ci, x in enumerate(col_x0s):
+            cand = [k for k in range(len(prev_cols)) if abs(prev_cols[k] - x) <= 8]
+            if not cand:
+                continue
+            matched += 1
+            # 앞 장 열 두 개가 똑같이 가까울 때 필드가 붙은 쪽을 먼저 본다
+            # (class_fees에서 부동소수점 동점으로 열을 잃은 적이 있다).
+            fielded = [k for k in cand if k in prev_fields]
+            if not fielded:
+                continue
+            near = min(fielded, key=lambda k: abs(prev_cols[k] - x))
+            dist = abs(prev_cols[near] - x)
+            if near not in best or dist < best[near][0]:
+                best[near] = (dist, ci)
+        for near, (_, ci) in best.items():
+            mapped[ci] = prev_fields[near]
+        pcols = [c for c, f in mapped.items()
+                 if f.endswith("y") or f == "since_inception"]
+        if matched < 3 or len(pcols) < 3:
+            continue
+        # 이어지는 표가 맞는지 행 단위로 확인한다 - 열 위치만 비슷한
+        # 다른 표(운용전문인력 등)에 매핑이 씌워지면 엉뚱한 행이 생긴다.
+        rows3, last = [], None
+        for r in grid:
+            if sum(1 for c in pcols if _val(r["cells"].get(c, ""))) >= max(2, len(pcols) - 1):
+                rows3.append(r)
+                last = r["bottom"]
+            elif last is not None and r["top"] - last > 60:
+                break
+        if rows3:
+            out.append((mapped, rows3, cells, col_x0s, words))
+    if out:
+        return out
+    return [header_carry] if header_carry else None
+
+
+def return_rows_for_doc(doc_id, pdf, pages, known_classes=None):
+    """요약표/상세표의 연평균수익률 표를 셀 격자로 읽어 레코드를 만든다."""
+    rows = []
+    inherited, prev_page = None, None
+    for page_num in pages:
+        if page_num < 1 or page_num > len(pdf.pages):
+            continue
+        page = pdf.pages[page_num - 1]
+        # 열 구성 이어받기는 "바로 다음 페이지"에서만 허용한다 - 떨어진
+        # 페이지의 무관한 표에 씌우면 엉뚱한 행이 생긴다.
+        got = _return_grid(page, inherited if prev_page == page_num - 1 else None)
+        if not got:
+            continue
+        inherited = (got[-1][0], got[-1][3])
+        prev_page = page_num
+        for field_by_col, data_rows, cells, col_x0s, words in got:
+            label_cols = [c for c, f in field_by_col.items() if f == "label"]
+            first_val = min((c for c, f in field_by_col.items()
+                             if f.endswith("y") or f == "since_inception"),
+                            default=len(col_x0s))
+            date_col = next((c for c, f in field_by_col.items()
+                             if f == "inception_date"), None)
+            for r in data_rows:
+                # 클래스명 칸이 여러 행에 걸쳐 병합돼 있으면 이 행 자신의
+                # 칸은 비어 있다 - 이 행을 세로로 품고 있는 왼쪽 칸을 쓴다.
+                label = " ".join(r["cells"][c] for c in sorted(label_cols)
+                                 if c in r["cells"]).strip()
+                if not label:
+                    # 클래스명이 값 행보다 잘게 쪼개진 여러 띠에 나뉘어
+                    # 그려지는 표가 많다(KR5116501001 실측: "수수료미징구-"
+                    # / "오프라인-" / "퇴직연금(C-P)(%)" 세 띠). 이 행의
+                    # y구간 안에서 첫 값 열보다 왼쪽에 있는 글자를 모은다.
+                    lim = col_x0s[first_val] - 2 if first_val < len(col_x0s) else 1e9
+                    ws = [w for w in words
+                          if (w["x0"] + w["x1"]) / 2 < lim
+                          and r["top"] - 1 <= (w["top"] + w["bottom"]) / 2 <= r["bottom"] + 1]
+                    ws.sort(key=lambda w: (round(w["top"], 1), w["x0"]))
+                    label = " ".join(w["text"] for w in ws).strip()
+
+                kind = row_kind(label)
+                class_code = None
+                if kind == "class_return":
+                    class_code = _return_label_code(label, known_classes)
+
+                values = {}
+                for ci, f in field_by_col.items():
+                    if not (f.endswith("y") or f == "since_inception"):
+                        continue
+                    v = _clean_val(r["cells"].get(ci, ""))
+                    if not v:
+                        continue
+                    if DECIMAL_RE.match(v) or NUM_RE.match(v):
+                        values[f] = v
+                    elif DASH_RE.match(v):
+                        values[f] = "-"
+                # 같은 격자에 붙어 있는 다른 표(운용전문인력 등)의 행이
+                # 값 한두 개만 걸쳐 잡히는 일이 있다 - 이 표가 쓰는 기간
+                # 칸이 대부분 채워진 행만 수익률 행으로 본다.
+                n_period = sum(1 for f in field_by_col.values()
+                               if f.endswith("y") or f == "since_inception")
+                if len(values) < max(2, int(n_period * 0.6)):
+                    continue
+
+                inception = None
+                if date_col is not None:
+                    raw = r["cells"].get(date_col, "")
+                    if not raw:
+                        # 최초설정일 칸이 여러 행에 걸쳐 병합된 경우
+                        mid = (r["top"] + r["bottom"]) / 2
+                        for c in cells:
+                            if abs(col_x0s[date_col] - c[0]) > 3:
+                                continue
+                            if c[1] - 1 <= mid <= c[3] + 1:
+                                ws = [w for w in words
+                                      if c[0] - 1 <= (w["x0"] + w["x1"]) / 2 <= c[2] + 1
+                                      and c[1] - 1 <= (w["top"] + w["bottom"]) / 2 <= c[3] + 1]
+                                raw = " ".join(w["text"] for w in ws)
+                                break
+                    dm = INCEPTION_DATE_RE.search(raw or "")
+                    inception = _normalize_date(dm.group()) if dm else None
+
+                rows.append({
+                    "row_kind": kind,
+                    "class_code": class_code,
+                    "inception_date": inception,
+                    "values": values,
+                    "page": page_num,
+                    "evidence": (label + " " + " ".join(
+                        v for _, v in sorted(r["cells"].items()))).strip(),
+                    "method": "cell_grid",
+                    "confidence": 1.0 if (class_code or kind != "class_return") else 0.5,
+                    "_top": r["top"],
+                })
+    return rows
+
+
+def col_of_lt(cell, col_x0s, first_val):
+    """셀이 첫 값 열보다 왼쪽에 있는지."""
+    return cell[0] < col_x0s[first_val] - 2 if first_val < len(col_x0s) else True
+
+
+def _return_label_code(label, known_classes):
+    """클래스명 칸 하나에서 클래스 코드를 뽑는다. 셀 기준이라 옆 행 이름이
+    섞여 들어올 일이 없어서 좌표 방식의 여러 예외 규칙이 필요 없다."""
+    if not label:
+        return None
+    flat = re.sub(r"\s+", "", label)
+    m = CLASS_CODE_RE.search(flat)
+    if m:
+        return m.group(1)
+    m2 = CLASS_CODE_NOPAREN_RE.search(label)
+    if m2:
+        return m2.group(1)
+    m3 = CLASS_CODE_JONGRYU_RE.search(flat)
+    if m3:
+        return m3.group(1)
+    if known_classes:
+        for code in sorted(known_classes, key=len, reverse=True):
+            if flat.endswith(code):
+                before = flat[: -len(code)]
+                if not before or not before[-1].isalnum():
+                    return code
+    return None
+
 def _apply_merged_cell_dates(page, words, rows):
     """'최초설정일' 칸이 여러 행에 걸쳐 병합된 경우, 날짜 텍스트는 병합된 셀
     안 어딘가(보통 시각적 중앙에 가까운 한 행) 한 번만 찍히고 나머지 행은
