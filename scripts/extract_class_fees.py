@@ -2179,8 +2179,12 @@ def _summary_grid(page, next_page=None, inherited=None):
             # 들어가는 열 구간. 문서마다 맞는 쪽이 달라(KR5152420028은 1번,
             # KR5113450111은 2번) 둘 다 시도하고 되는 쪽을 쓴다.
             def near_cols(x):
+                # 두 장의 격자가 통째로 조금 밀려 있어(KR5152420028 실측
+                # 약 5pt) 8pt로는 "1년"만 짝을 못 찾아 그 열이 통째로
+                # 빠졌다. 여기서는 조금 넉넉히 본다 - 잘못 붙으면 아래
+                # 채움 검사에서 이 조합 자체가 떨어진다.
                 return [ci for ci in range(len(col_x0s))
-                        if abs(x - col_x0s[ci]) <= 8]
+                        if abs(x - col_x0s[ci]) <= 12]
 
             def span_cols(x):
                 ci = bisect.bisect_right(col_x0s, x + 6) - 1
@@ -2253,59 +2257,40 @@ def _summary_grid(page, next_page=None, inherited=None):
             """헤더가 가리키는 열과 값이 실제로 들어 있는 열이 어긋난 것을
             바로잡는다. 헤더 이름으로 잡을 때든 앞 페이지에서 물려받을
             때든 같은 어긋남이 생기므로 두 경우 모두 이 함수를 쓴다."""
-            # (KR5129420025/KR5144450095 실측: "판매보수" 헤더는 7번 열인데
-            # 값은 6번 열에 있다 - 열 병합 허용치(6pt)를 넘게 벌어져서다.)
-            # 헤더가 가리키는 열에 값이 하나도 없고 바로 옆 열에 값이 있으면
-            # 그쪽으로 옮긴다(다른 필드가 이미 쓰는 열은 건드리지 않는다).
-            value_cols = {ci for r in grid[first_data:]
-                          for ci, v in r["cells"].items() if _isnum(v)}
-
+            # 어긋남 자체는 흔하다(KR5129420025/KR5144450095 실측:
+            # "판매보수" 헤더는 7번 열인데 값은 6번 열에 있다 - 열 병합
+            # 허용치(6pt)를 넘게 벌어져서다). 헤더가 가리키는 열에 값이
+            # 하나도 없고 바로 옆 열에 값이 있으면 그쪽으로 옮긴다.
             def move(ci, ok_cols):
                 for nb in (ci - 1, ci + 1):
                     if nb in ok_cols and nb not in field_map:
                         field_map[nb] = field_map.pop(ci)
-                        return nb
-                return ci
-
-            # 먼저 총보수 칸만 맞춘다. 이 칸이 어긋나 있으면 아래에서 진짜
-            # 보수 행을 못 골라 나머지 보정이 전부 엉뚱해진다.
-            tf_col = next((c for c, f in field_map.items() if f == "total_fee"), None)
-            if tf_col is not None and tf_col not in value_cols:
-                tf_col = move(tf_col, value_cols)
-
-            # 같은 격자 안에 수익률표·운용전문인력표가 이어 붙어 있는 문서가
-            # 있다(KR5153420022/KR5118420036 실측). 그 행들의 숫자까지
-            # 근거로 삼으면 "그 칸에도 값이 있다"고 착각해 필드를 엉뚱한
-            # 옆 칸으로 옮긴다. 총보수 칸에 값이 있는 행만 진짜 보수 행으로
-            # 보고, 그 행들이 실제로 쓰는 칸만 근거로 쓴다.
-            # 총보수 칸에 숫자가 있다는 것만으론 부족하다 - 수익률표 행에도
-            # 우연히 같은 칸에 숫자가 있다(KR5118420036 실측: 그 행들 때문에
-            # 동종유형이 반대쪽 옆 칸으로 끌려갔다). 잡아 둔 칸들이 한 행에
-            # 대부분 채워져 있어야 진짜 보수 행이다.
-            need_row = max(2, int(len(field_map) * 0.6))
+                        return
+            # 무엇을 "값이 있는 칸"으로 볼지가 핵심이다. 같은 격자 안에
+            # 수익률표·운용전문인력표가 이어 붙은 문서가 많아서
+            # (KR5153420022/KR5118420036 실측) 전체 행의 숫자를 근거로
+            # 삼으면 "그 칸에도 값이 있다"고 착각해 필드를 엉뚱한 옆 칸으로
+            # 옮긴다. 그렇다고 총보수 칸을 기준으로 보수 행을 고르면,
+            # 총보수 칸 자체가 어긋난 문서에선 아무것도 못 고친다
+            # (KR5118420006 실측: 이어지는 장의 세 클래스를 통째로 잃었다).
+            # 특정 필드에 기대지 말고 "잡아 둔 칸들이 가장 많이 채워진 행"을
+            # 보수 행으로 본다.
+            need_row = max(3, int(len(field_map) * 0.6))
             fee_rows = [r for r in grid[first_data:]
-                        if tf_col is not None and _isnum(r["cells"].get(tf_col, ""))
-                        and sum(1 for ci in field_map if ci in r["cells"]) >= need_row]
-            if not fee_rows:
-                # 보수 행을 아예 못 고르면 예전처럼 전체 행을 근거로 쓴다
-                for ci in sorted(field_map):
-                    if ci not in value_cols:
-                        move(ci, value_cols)
-                return
-            fee_cols = {ci for r in fee_rows for ci, v in r["cells"].items()
-                        if _isnum(v)}
-            # 원본이 "값 없음"을 "-"로 찍은 칸도 그 필드가 쓰는 칸이다
-            # (동종유형 비교가 없는 상품이 그렇다) - 숫자만 보면 그 칸을
-            # 빈 칸으로 오해해 필드를 엉뚱한 데로 옮기게 된다.
-            dash_cols = {ci for r in fee_rows for ci, v in r["cells"].items()
-                         if v.replace(" ", "") in ("-", "–", "—")}
+                        if sum(1 for ci in field_map if ci in r["cells"]) >= need_row]
+            if fee_rows:
+                ok = {ci for r in fee_rows for ci, v in r["cells"].items()
+                      if _isnum(v)}
+                # 원본이 "값 없음"을 "-"로 찍은 칸도 그 필드가 쓰는 칸이다
+                # (동종유형 비교가 없는 상품이 그렇다).
+                ok |= {ci for r in fee_rows for ci, v in r["cells"].items()
+                       if v.replace(" ", "") in DASHES}
+            else:
+                ok = {ci for r in grid[first_data:]
+                      for ci, v in r["cells"].items() if _isnum(v)}
             for ci in sorted(field_map):
-                if ci in fee_cols or ci in dash_cols:
-                    continue
-                for nb in (ci - 1, ci + 1):
-                    if nb in (fee_cols | dash_cols) and nb not in field_map:
-                        field_map[nb] = field_map.pop(ci)
-                        break
+                if ci not in ok:
+                    move(ci, ok)
 
         realign(field_by_col)
 
@@ -2695,6 +2680,11 @@ def _summary_cells_lose_anything(coord_rows, cell_rows):
         # 하나도 없는 것)은 재현 대상이 아니다 - 이걸 "잃었다"고 보면
         # 멀쩡한 문서가 폴백된다(KR5116501001 실측).
         if not any(ch.isalnum() for ch in code):
+            continue
+        # 좌표 방식이 수수료 설명 문구를 클래스명으로 잘못 읽은 행도
+        # 마찬가지다(KR514X450008 실측: "수수료선취 - 납입금액의"가
+        # 클래스로 잡혀 있다). 클래스명에 들어갈 수 없는 말이다.
+        if any(k in code for k in ("납입금액", "환매금액", "수수료", "이내")):
             continue
         n = cell.get(code)
         if n is None:
