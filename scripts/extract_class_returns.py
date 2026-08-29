@@ -500,6 +500,20 @@ RETURN_PERIOD_RE = re.compile(r"^(?:최근)?(\d)년$")
 RETURN_LABEL_NAMES = ("종류", "클래스", "구분", "종류(클래스)")
 
 
+def _is_multi_header(name):
+    """여러 칸의 이름이 한 셀에 다 들어가 있는 묶음 머리글인지 본다.
+    표 머리글 전체가 하나의 병합 셀로 잡히는 문서가 있는데
+    (KR5144420020 실측: "최근1년 최근2년 최근3년 최근5년 종류 최초설정일
+    설정일이후"가 한 칸), 그대로 두면 그 중 하나로 매칭돼 이름 칸이
+    "설정일 이후"로 잡히고 클래스명을 통째로 잃는다."""
+    n = re.sub(r"\s+", "", name)
+    hits = len(re.findall(r"(?:최근)?\d년", n))
+    for kw in ("설정일이후", "설정이후", "최초설정일", "종류"):
+        if kw in n:
+            hits += 1
+    return hits >= 2
+
+
 def _return_column_field(name):
     """머리글 이름 → 필드. 못 알아보면 None."""
     n = re.sub(r"\s+", "", name)
@@ -595,6 +609,8 @@ def _return_grid(page, inherited=None):
         for gi, anchor in enumerate(grid):
             fmap = {}
             for ci, v in anchor["cells"].items():
+                if _is_multi_header(v):
+                    continue
                 f = _return_column_field(v)
                 if f and f not in fmap.values():
                     fmap[ci] = f
@@ -614,6 +630,8 @@ def _return_grid(page, inherited=None):
                 if other["bottom"] - other["top"] > 60:
                     continue
                 for ci, v in other["cells"].items():
+                    if len(re.sub(r"\s+", "", v)) > 24 or _is_multi_header(v):
+                        continue
                     parts_by_col.setdefault(ci, []).append(v)
                     band_of.setdefault(ci, []).append(other["bottom"])
             for ci, parts in parts_by_col.items():
@@ -639,10 +657,23 @@ def _return_grid(page, inherited=None):
                                  key=lambda w: w["x0"])
                 joined = re.sub(r"\s+", "", " ".join(w["text"] for w in head_ws))
                 if "설정일이후" not in joined and "설정이후" not in joined:
-                    continue
-                cols_here = col_x0s + [right_limit]
-                fmap[len(cols_here) - 1] = "since_inception"
-                right_limit = page.width
+                    # "설정일 이후" 칸이 병합 머리글 안에만 있어 따로 안
+                    # 잡히는 문서가 있다(KR5144420020 실측). 이때는
+                    # "최초설정일" 칸이 있는지로 수익률 표를 가린다 -
+                    # 보수표의 비용예시(1년/2년/3년/5년/10년)에는 최초설정일
+                    # 칸이 없어서 이 조건으로 확실히 구분된다.
+                    if not ("inception_date" in fmap.values()
+                            and sum(1 for f in fmap.values() if f.endswith("y")) >= 3
+                            and not any(re.sub(r"\s+", "", v) == "10년"
+                                        for ps in parts_by_col.values()
+                                        for v in ps)):
+                        continue
+                    cols_here = col_x0s
+                else:
+                    cols_here = col_x0s + [right_limit]
+                    fmap[len(cols_here) - 1] = "since_inception"
+                    right_limit = page.width
+
 
             # 머리글 아래로 이어지는 값 행들. 각주·다른 표를 만나면 멈춘다.
             period_cols = [c for c, f in fmap.items()
@@ -687,6 +718,19 @@ def _return_grid(page, inherited=None):
             period_cols = [c for c, f in fmap.items()
                            if f.endswith("y") or f == "since_inception"]
             rows2 = collect(period_cols)
+            # "설정일 이후" 칸 이름이 병합 머리글 안에만 있어 따로 안 잡히는
+            # 문서가 있다(KR5144420020 실측). 이 표에서 설정일이후는 항상
+            # 5년 칸 오른쪽 첫 값 칸이므로 그 자리로 채운다.
+            if rows2 and "since_inception" not in fmap.values():
+                ymax = max((c for c, f in fmap.items() if f.endswith("y")),
+                           default=None)
+                vcols = sorted({ci for r in rows2 for ci, v in r["cells"].items()
+                                if _val(v) and ci not in fmap
+                                and ymax is not None and ci > ymax})
+                if vcols:
+                    fmap[vcols[0]] = "since_inception"
+                    period_cols.append(vcols[0])
+                    rows2 = collect(period_cols)
             if not rows2:
                 # 머리글만 있고 값 행은 통째로 다음 페이지에 있는 문서가
                 # 있다(KR510902773M 실측: 44쪽 맨 아래에 "가.연평균수익률"
@@ -771,6 +815,17 @@ def _return_grid(page, inherited=None):
             elif last is not None and r["top"] - last > 60:
                 break
         if rows3:
+            # 이어받은 열 구성에 "설정일 이후"가 없으면(앞 장에서 그 칸
+            # 이름이 병합 머리글 안에만 있었던 경우) 5년 칸 오른쪽 첫 값
+            # 칸으로 채운다(KR5144420020 실측).
+            if "since_inception" not in mapped.values():
+                ymax = max((c for c, f in mapped.items() if f.endswith("y")),
+                           default=None)
+                vcols = sorted({ci for r in rows3 for ci, v in r["cells"].items()
+                                if _val(v) and ci not in mapped
+                                and ymax is not None and ci > ymax})
+                if vcols:
+                    mapped[vcols[0]] = "since_inception"
             out.append((mapped, rows3, cells, col_x0s, words))
     if out:
         return out
