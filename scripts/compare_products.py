@@ -56,10 +56,18 @@ def _fetch_best_class_fee(conn, code, class_code=None):
     return conn.execute(sql, params).fetchone()
 
 
+# 수익률 값이 하나라도 있는 행만 쓴다. 예전엔 confidence만 보고 골라서
+# 값이 전부 비어 있는 행(클래스만 있고 수익률은 안 실린 행)이 뽑혔고,
+# 답변에 "최근1년 수익률(C1클래스) None%"가 그대로 나갔다.
+_RETURN_HAS_VALUE = ("(return_1y IS NOT NULL OR return_3y IS NOT NULL "
+                     "OR return_since_inception IS NOT NULL)")
+
+
 def _fetch_best_class_return(conn, code, class_code=None):
     sql = (
         "SELECT class_code, return_1y, return_3y, return_since_inception, confidence "
-        "FROM class_returns WHERE product_code = ? AND row_kind = 'class_return'"
+        "FROM class_returns WHERE product_code = ? AND row_kind = 'class_return' "
+        "AND " + _RETURN_HAS_VALUE
     )
     params = [code]
     if class_code:
@@ -67,6 +75,44 @@ def _fetch_best_class_return(conn, code, class_code=None):
         params.append(class_code)
     sql += " ORDER BY confidence DESC LIMIT 1"
     return conn.execute(sql, params).fetchone()
+
+
+def _fee_classes(conn, code):
+    return {r[0] for r in conn.execute(
+        "SELECT class_code FROM class_fees "
+        "WHERE product_code = ? AND total_fee IS NOT NULL", (code,))}
+
+
+def _return_classes(conn, code):
+    return {r[0] for r in conn.execute(
+        "SELECT class_code FROM class_returns WHERE product_code = ? "
+        "AND row_kind = 'class_return' AND " + _RETURN_HAS_VALUE, (code,))}
+
+
+def _rep_class_key(c):
+    """대표로 보여줄 클래스 고르는 순서. A(창구 판매) -> C -> 나머지."""
+    c = c or ""
+    return (0 if c == "A" else 1 if c == "C" else 2, len(c), c)
+
+
+def _common_class(conn, codes, fields):
+    """비교 대상 전부가 갖고 있는 클래스 하나. 없으면 None.
+
+    클래스마다 보수가 크게 달라서(A 1.47% vs A-e 1.12%), 상품마다 다른
+    클래스를 대표로 뽑아 나란히 놓으면 상품 차이가 아니라 클래스 차이를
+    보여주게 된다. 가능하면 같은 클래스끼리 견준다."""
+    common = None
+    for code in codes:
+        s = _fee_classes(conn, code) if "fee" in fields else None
+        if "return" in fields:
+            r = _return_classes(conn, code)
+            s = r if s is None else (s & r)
+        if not s:
+            return None
+        common = s if common is None else (common & s)
+        if not common:
+            return None
+    return min(common, key=_rep_class_key) if common else None
 
 
 def compare_products(product_codes, db_path=DEFAULT_DB_PATH, fields=None):
@@ -80,6 +126,8 @@ def compare_products(product_codes, db_path=DEFAULT_DB_PATH, fields=None):
 
     lines = []
     evidence = []
+    common = _common_class(conn, product_codes, fields)
+    used_classes = set()
     for code in product_codes:
         product = _fetch_product(conn, code)
         if not product:
@@ -98,25 +146,41 @@ def compare_products(product_codes, db_path=DEFAULT_DB_PATH, fields=None):
         # 결과가 혼란스러워진다. 수익률 표는 보통 대표 클래스 하나만 실어서
         # (총보수 표는 클래스별로 다 있는 것과 달리) 더 희소하므로, 수익률이
         # 있는 클래스를 먼저 정하고 총보수를 그 클래스에 맞춰 조회한다.
-        rep_class = None
+        rep_class = common
         ret = None
         if "return" in fields:
-            ret = _fetch_best_class_return(conn, code)
+            ret = (_fetch_best_class_return(conn, code, class_code=rep_class)
+                   if rep_class else None) or _fetch_best_class_return(conn, code)
             if ret:
-                rep_class = ret["class_code"]
+                rep_class = rep_class or ret["class_code"]
 
         if "fee" in fields:
             fee = _fetch_best_class_fee(conn, code, class_code=rep_class) or _fetch_best_class_fee(conn, code)
             if fee:
                 rep_class = rep_class or fee["class_code"]
+                used_classes.add(fee["class_code"])
                 parts.append(f"총보수({fee['class_code']}클래스) {fee['total_fee']}%")
                 evidence.append({"product_code": code, "type": "class_fees", "class_code": fee["class_code"]})
 
         if ret:
-            parts.append(f"최근1년 수익률({ret['class_code']}클래스) {ret['return_1y']}%")
+            used_classes.add(ret["class_code"])
+            got = [(lbl, ret[col]) for lbl, col in
+                   (("최근1년", "return_1y"), ("최근3년", "return_3y"),
+                    ("설정후", "return_since_inception"))
+                   if ret[col] is not None]
+            if got:
+                parts.append(f"수익률({ret['class_code']}클래스) "
+                             + ", ".join(f"{lbl} {v}%" for lbl, v in got))
             evidence.append({"product_code": code, "type": "class_returns", "class_code": ret["class_code"]})
 
         lines.append(" | ".join(parts))
+
+    # 같은 클래스로 못 맞췄으면 그 사실을 말한다. 클래스가 다르면 숫자를
+    # 그대로 견주는 게 틀린 비교가 되기 때문이다.
+    if len(used_classes) > 1:
+        lines.append("※ 상품마다 실린 클래스가 달라 서로 다른 클래스의 값입니다"
+                     f"({', '.join(sorted(used_classes))}). 클래스에 따라 보수가"
+                     " 달라지므로 같은 클래스끼리 비교해야 정확합니다.")
 
     conn.close()
     return "\n".join(lines), evidence

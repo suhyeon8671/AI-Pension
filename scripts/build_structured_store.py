@@ -57,6 +57,45 @@ CREATE TRIGGER IF NOT EXISTS tables_ai AFTER INSERT ON tables BEGIN
 END;
 """
 
+# 청크 본문 위의 글자 단위 검색 색인.
+#
+# 왜 필요한가: 의미 검색은 문자 n-gram TF-IDF를 256차원으로 줄여 쓰는데,
+# 그 과정에서 "기타소득세", "사전지정운용방법" 같은 정확한 용어의 신호가
+# 뭉개진다. 검증 세트를 돌려 보니 답이 코퍼스에 분명히 있는데도(기타소득세
+# 10곳, 사전지정운용 3곳) 엉뚱한 FAQ 청크가 1등으로 올라왔다. 연금 질문은
+# 제도 이름·세율·한도 같은 정확한 말이 답을 가르는 경우가 많아서, 의미
+# 검색만으로는 부족하고 글자 그대로 찾는 검색이 함께 있어야 한다.
+#
+# 토크나이저로 trigram을 쓰는 이유: 기본 unicode61은 공백으로만 끊어서
+# "기타소득세는"이 "기타소득세"로 안 걸린다. 형태소 분석기 없이 한국어
+# 부분 문자열을 잡으려면 trigram이 가장 간단하다.
+CHUNK_SCHEMA = """
+CREATE TABLE IF NOT EXISTS chunks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chunk_id TEXT,
+    doc_type TEXT NOT NULL,
+    doc_id TEXT NOT NULL,
+    source_doc TEXT,
+    product_code TEXT,
+    page INTEGER,
+    text TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_chunks_doc_type ON chunks(doc_type);
+CREATE INDEX IF NOT EXISTS idx_chunks_product_code ON chunks(product_code);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+    text,
+    content='chunks',
+    content_rowid='id',
+    tokenize='trigram'
+);
+
+CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
+    INSERT INTO chunks_fts(rowid, text) VALUES (new.id, new.text);
+END;
+"""
+
 
 def rows_to_text(data):
     """표의 각 행을 ' | '로 이어붙이고 행끼리는 줄바꿈으로 구분한 검색용 텍스트."""
@@ -96,11 +135,42 @@ def iter_table_records():
                 }
 
 
+def iter_chunk_records():
+    for doc_type in ("institution", "products"):
+        d = os.path.join(EXTRACTED_DIR, doc_type)
+        if not os.path.isdir(d):
+            continue
+        for name in sorted(os.listdir(d)):
+            if not name.endswith("_chunks.json"):
+                continue
+            with open(os.path.join(d, name), "r", encoding="utf-8") as f:
+                chunks = json.load(f)
+            for c in chunks:
+                text = (c.get("text") or "").strip()
+                if not text:
+                    continue
+                yield {
+                    "chunk_id": c.get("chunk_id"),
+                    "doc_type": c.get("doc_type", doc_type),
+                    "doc_id": c.get("doc_id", name.replace("_chunks.json", "")),
+                    "source_doc": c.get("source_doc"),
+                    "product_code": c.get("product_code"),
+                    "page": c.get("page"),
+                    "text": text,
+                }
+
+
 def build(db_path):
-    if os.path.exists(db_path):
-        os.remove(db_path)
+    # 예전엔 파일을 통째로 지우고 시작했는데, 같은 파일에 상품 사실
+    # 테이블(product_master/class_fees/...)을 쓰는 build_product_facts_db.py가
+    # 생기면서 이 스크립트를 나중에 돌리면 그쪽을 다 날려 버렸다.
+    # 자기가 만드는 테이블만 지운다.
     conn = sqlite3.connect(db_path)
+    conn.executescript(
+        "DROP TABLE IF EXISTS tables_fts; DROP TABLE IF EXISTS tables;"
+        "DROP TABLE IF EXISTS chunks_fts; DROP TABLE IF EXISTS chunks;")
     conn.executescript(SCHEMA)
+    conn.executescript(CHUNK_SCHEMA)
 
     n = 0
     for rec in iter_table_records():
@@ -116,9 +186,22 @@ def build(db_path):
         )
         n += 1
 
+    m = 0
+    for rec in iter_chunk_records():
+        conn.execute(
+            """
+            INSERT INTO chunks
+                (chunk_id, doc_type, doc_id, source_doc, product_code, page, text)
+            VALUES (:chunk_id, :doc_type, :doc_id, :source_doc, :product_code,
+                    :page, :text)
+            """,
+            rec,
+        )
+        m += 1
+
     conn.commit()
     conn.close()
-    print(f"{n}개 표 레코드 → {db_path}")
+    print(f"{n}개 표 레코드, {m}개 청크 → {db_path}")
 
 
 def main():

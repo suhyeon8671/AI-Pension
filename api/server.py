@@ -54,16 +54,22 @@ MAX_TABLE_ROWS_SHOWN = 3
 CONTEXT_CHUNK_CHAR_LIMIT = 350
 
 
+def _rank_score(hit):
+    """router가 매긴 최종 순위 점수. 의미 검색과 글자 검색을 순위로 합친
+    rrf가 있으면 그걸 쓴다 - 코사인 유사도(score)로 다시 줄 세우면 글자
+    검색으로만 올라온 청크가 도로 뒤로 밀려 합친 의미가 없어진다."""
+    return hit.get("rrf", hit.get("score") or 0.0)
+
+
 def _dedupe_by_page(hits):
     """같은 (doc_id, page)에서 나온 청크가 여러 개면 가장 점수 높은 것만 남긴다.
     한 페이지 안의 인접 청크들이 겹치는 내용을 반복해서 토큰을 낭비하는 걸 막는다."""
     best = {}
     for hit in hits:
         key = (hit.get("doc_id"), hit.get("page"))
-        if key not in best or hit["score"] > best[key]["score"]:
+        if key not in best or _rank_score(hit) > _rank_score(best[key]):
             best[key] = hit
-    # 원래 점수 순서를 유지
-    return sorted(best.values(), key=lambda h: h["score"], reverse=True)
+    return sorted(best.values(), key=_rank_score, reverse=True)
 
 
 def format_retrieved_context(route_result: dict) -> str:
@@ -137,8 +143,15 @@ def generate_answer(query: str, route_result: dict) -> str:
     )
 
 
-@app.get("/answer")
-def answer(question_id: str, question: str):
+def answer_payload(question_id: str, question: str) -> dict:
+    """질의 하나에 대한 응답 본문을 만든다.
+
+    /answer 핸들러에서 떼어낸 이유: 답변 품질을 검증하려면 서버를 띄우지
+    않고도 실제 답변 경로를 그대로 호출할 수 있어야 한다(scripts/eval_answers.py).
+    검증이 실제와 다른 코드를 지나가면 검증이 아니다.
+
+    route 필드는 어느 경로로 답했는지(comparison/single_product/rag)를
+    남긴다. 응답 스펙에 없는 필드라 /answer에서는 빼고 내보낸다."""
     # 상품을 이름으로도 찾는다. 예전엔 질의에 상품코드(KR...)가 문자
     # 그대로 있을 때만 인식해서, "미래에셋장기성장포커스 총보수 얼마야?"
     # 같은 실제 질문이 구조화 DB에 못 닿고 텍스트 검색으로 빠졌다.
@@ -160,8 +173,9 @@ def answer(question_id: str, question: str):
                 "실제 LLM 호출이 아니라 조회 결과를 그대로 보여주는 임시 로직임"
             ),
             "answer": f"[임시 답변 — HyperCLOVA X 연동 전 조회 결과]\n{summary}",
+            "route": "comparison",
         }
-        return JSONResponse(content=body)
+        return body
 
     # 상품 하나에 대한 정량 질문(총보수/수익률/위험등급/규모)은 구조화
     # DB에서 바로 답한다. 텍스트 청크로 답하면 숫자가 청크 경계에 잘리거나
@@ -187,19 +201,31 @@ def answer(question_id: str, question: str):
                     "실제 LLM 호출이 아니라 조회 결과를 그대로 보여주는 임시 로직임"
                 ),
                 "answer": f"[임시 답변 — HyperCLOVA X 연동 전 조회 결과]\n{summary}",
+                "route": "single_product",
             }
-            return JSONResponse(content=body)
+            return body
 
     from router import route_search  # 벡터 검색은 여기서만 필요하다
 
-    route_result = route_search(question, k=5)
-    body = {
+    # k=5로는 후보가 너무 얕다. 청크가 2만 개가 넘는데 검색기마다 5개씩만
+    # 받으면 순위 합산(RRF)이 고를 게 없다. 검증 세트에서 k를 10으로 올리자
+    # 정답이 든 청크가 상위 6개 안에 들어오는 질문이 늘었다. 답변에 실제로
+    # 넣는 청크 수는 MAX_CONTEXT_CHUNKS로 여전히 6개라 토큰은 안 늘어난다.
+    route_result = route_search(question, k=10)
+    return {
         "question_id": question_id,
         "question": question,
         "retrieved_context": format_retrieved_context(route_result),
         "think_trace": format_think_trace(question, route_result),
         "answer": generate_answer(question, route_result),
+        "route": "rag",
     }
+
+
+@app.get("/answer")
+def answer(question_id: str, question: str):
+    body = dict(answer_payload(question_id, question))
+    body.pop("route", None)  # 주최측 응답 스펙에 없는 필드라 빼고 내보낸다
     return JSONResponse(content=body)
 
 

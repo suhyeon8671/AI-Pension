@@ -17,7 +17,7 @@ import argparse
 import json
 import re
 
-from search import semantic_search, table_search
+from search import semantic_search, lexical_search, table_search
 
 # ---------------------------------------------------------------------------
 # 키워드 규칙 (HCX 의도분류로 교체 전까지의 임시 휴리스틱)
@@ -111,6 +111,11 @@ def classify(query: str) -> dict:
 # tfidf/LSA 코사인 유사도 기준 임시값 — 실제 질의로 튜닝된 값은 아니라 조정 여지 있음.
 RELEVANCE_RETRY_THRESHOLD = 0.30
 
+# RRF(reciprocal rank fusion)의 완충 상수. 60은 이 방식에서 흔히 쓰는 값으로,
+# 1등과 2등의 점수 차이를 너무 벌리지 않아 한쪽 검색이 헛짚어도 다른 쪽이
+# 만회할 수 있게 한다.
+RRF_K = 60
+
 
 def route_search(query: str, k: int = 5) -> dict:
     """분류 결과에 따라 semantic_search / table_search를 호출하고 결과를 합쳐서 반환.
@@ -131,15 +136,41 @@ def route_search(query: str, k: int = 5) -> dict:
     classification = classify(query)
 
     def _search(doc_types):
-        hits = []
+        """의미 검색과 글자 검색을 각각 돌린 뒤 순위로 합친다.
+
+        의미 검색만 쓰면 "연금저축 중도해지하면 세금이 어떻게 되나요?"에
+        ISA 전환 FAQ가 1등으로 올라온다(검증 세트에서 잡힘). 정답인
+        "기타소득세 16.5%" 청크는 코퍼스에 있는데도 TF-IDF를 256차원으로
+        줄이는 과정에서 그 용어의 신호가 뭉개져 밀려난다.
+
+        두 점수는 척도가 달라서(코사인 유사도 vs bm25) 직접 더할 수 없다.
+        각자의 순위만 가지고 1/(60+순위)를 더하는 방식(RRF)을 쓴다 - 어느
+        한쪽에서만 1등이어도 위로 올라오고, 양쪽에서 다 높으면 더 위로 간다."""
+        pooled = {}
         for doc_type in doc_types:
             product_code = classification["product_codes"][0] if (
                 doc_type == "products" and classification["product_codes"]
             ) else None
-            hits.extend(
-                semantic_search(query, k=k, doc_type=doc_type, product_code=product_code)
-            )
-        hits.sort(key=lambda h: h["score"], reverse=True)
+            sem = semantic_search(query, k=k, doc_type=doc_type, product_code=product_code)
+            lex = lexical_search(query, k=k, doc_type=doc_type, product_code=product_code)
+            for ranked in (sem, lex):
+                for rank, hit in enumerate(ranked):
+                    key = (hit.get("doc_id"), hit.get("page"), hit.get("chunk_id"))
+                    cur = pooled.get(key)
+                    if cur is None:
+                        cur = dict(hit)
+                        cur.setdefault("score", 0.0)
+                        cur["rrf"] = 0.0
+                        pooled[key] = cur
+                    else:
+                        # 의미 검색 쪽 유사도는 살려 둔다(재검색 판단에 쓴다)
+                        if hit.get("score") is not None:
+                            cur["score"] = max(cur.get("score") or 0.0, hit["score"])
+                        if hit.get("bm25") is not None:
+                            cur["bm25"] = hit["bm25"]
+                    cur["rrf"] += 1.0 / (RRF_K + rank + 1)
+
+        hits = sorted(pooled.values(), key=lambda h: h["rrf"], reverse=True)
         return hits
 
     doc_types = []
@@ -152,13 +183,18 @@ def route_search(query: str, k: int = 5) -> dict:
 
     retried = False
     both_types = {"institution", "products"}
-    top_score = semantic_hits[0]["score"] if semantic_hits else 0.0
+    # 순위 합산(RRF) 뒤에는 1등이 글자 검색으로만 올라온 청크일 수 있어서
+    # hits[0]의 유사도만 보면 안 된다. 결과 전체의 최고 유사도로 판단한다.
+    def _top_score(hits):
+        return max((h.get("score") or 0.0) for h in hits) if hits else 0.0
+
+    top_score = _top_score(semantic_hits)
     if top_score < RELEVANCE_RETRY_THRESHOLD and set(doc_types) != both_types:
         retried = True
         doc_types = ["institution", "products"]
         retry_hits = _search(doc_types)
         # 재시도 결과가 원래 결과보다 나을 때만 채택 (더 나쁘면 원래 결과 유지)
-        if retry_hits and (not semantic_hits or retry_hits[0]["score"] > top_score):
+        if retry_hits and _top_score(retry_hits) > top_score:
             semantic_hits = retry_hits
 
     table_hits = []

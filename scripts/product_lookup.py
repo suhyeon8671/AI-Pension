@@ -23,12 +23,26 @@ PRODUCT_CODE_RE = re.compile(r"KR[0-9A-Z]{10}", re.IGNORECASE)
 
 # 상품 종류를 나타내는 상투어. 이 말들만으로 이뤄진 일치는 상품을
 # 가리키지 못한다("증권투자신탁"은 100개 상품 대부분에 들어 있다).
+# 뒤쪽 줄은 제도 질문에 흔히 나오는 말들이다 - "퇴직연금 중도인출은
+# 어떤 경우에 가능한가요?"가 상품명에 '퇴직연금'이 든 펀드로 매칭돼
+# 제도 질문이 상품 비교로 새는 걸 막는다.
 GENERIC_WORDS = (
     "증권", "자투자신탁", "모투자신탁", "투자신탁", "투자회사", "집합투자기구",
     "주식형", "채권형", "혼합형", "주식", "채권", "혼합", "재간접", "파생형",
     "인덱스", "전환형", "단위형", "추가형", "개방형", "폐쇄형", "종류형",
-    "연금저축", "연금", "펀드", "호",
+    "국공채", "단기채", "제", "호",
+    "퇴직연금", "개인연금", "연금저축", "연금", "펀드", "적립금",
+    "확정급여", "확정기여", "금융투자협회", "펀드코드", "명칭",
 )
+
+# 짧은 조각을 이만큼 넘는 상품이 함께 갖고 있으면 상품을 가리키지
+# 못한다. "퇴직연금"(상품 4개), "미래에셋"(여러 개)처럼 상투어 목록에
+# 없어도 여럿이 공유하는 짧은 말은 식별력이 없다.
+MAX_SHARED_PRODUCTS = 3
+# 다만 긴 조각은 여럿이 공유해도 버리지 않는다. "한국투자골드플랜연금"은
+# 형제 펀드 4개가 나눠 갖지만 사용자가 실제로 부른 상품 이름이다 - 버리면
+# 아무것도 못 찾고, 남겨 두면 아래 echo 점수로 (채권)/(주식)을 가릴 수 있다.
+SHARED_PIECE_MAX_LEN = 8
 
 # "A클래스" / "종류C-e" / "클래스 C-P" 처럼 클래스를 지목하는 표현
 CLASS_IN_QUERY_RE = re.compile(
@@ -74,6 +88,17 @@ def find_products(question, db_path=DEFAULT_DB_PATH, limit=4):
     부르든 겹치는 만큼 점수가 된다. 다만 그 겹친 부분이 상투어뿐이면
     상품을 못 가리므로 버린다.
 
+    후보를 추리는 규칙은 세 가지다.
+
+    1. 겹친 조각이 상투어뿐이면 버린다(GENERIC_WORDS).
+    2. 같은 조각을 여러 상품이 갖고 있으면 버린다. "퇴직연금"은 상품
+       4개에 들어 있어서, 그 말만 겹쳤다면 어느 하나를 가리킬 수 없다.
+    3. 질문의 같은 자리에 걸린 후보끼리는 하나만 남긴다. "미래에셋
+       프리미엄크레딧알파"는 "...크레딧초단기"와도 겹치는데, 둘 다
+       질문의 같은 글자를 두고 다투는 것이므로 상품 2개를 물은 게
+       아니다(예전엔 이걸 비교 질문으로 잘못 봤다). 반대로 "A와 B
+       비교해줘"는 서로 다른 자리에 걸리므로 둘 다 남는다.
+
     돌려주는 것: [(product_code, product_name, 겹친 글자수)]"""
     global _CACHE
     if _CACHE is None:
@@ -88,23 +113,38 @@ def find_products(question, db_path=DEFAULT_DB_PATH, limit=4):
     q = _norm(question)
     if len(q) < 3:
         return []
-    best = {}
+
+    cand = []
     for code, name, nname in _CACHE:
-        m = difflib.SequenceMatcher(None, q, nname, autojunk=False)\
-            .find_longest_match(0, len(q), 0, len(nname))
+        sm = difflib.SequenceMatcher(None, q, nname, autojunk=False)
+        m = sm.find_longest_match(0, len(q), 0, len(nname))
         if m.size < 4:
             continue
         piece = q[m.a:m.a + m.size]
         if _is_generic(piece):
             continue
-        if code not in best or m.size > best[code][2]:
-            best[code] = (code, name, m.size)
-    out = sorted(best.values(), key=lambda h: h[2], reverse=True)
-    # 1등과 많이 차이 나는 후보는 잡음이다(상투어 일부만 겹친 것)
-    if out:
-        top = out[0][2]
-        out = [h for h in out if h[2] >= max(4, top - 2)]
-    return out[:limit]
+        if (len(piece) < SHARED_PIECE_MAX_LEN
+                and sum(1 for _, _, n2 in _CACHE if piece in n2) > MAX_SHARED_PRODUCTS):
+            continue
+        # 같은 길이로 비긴 후보를 가를 때 쓴다: 이름 중 질문에 메아리친
+        # 글자가 얼마나 되는지. "골드플랜 연금 채권형"이면 '채권'까지
+        # 겹치는 (채권) 상품이 (국공채) 상품을 이긴다.
+        echo = sum(b.size for b in sm.get_matching_blocks() if b.size >= 2)
+        cand.append((m.size, echo, m.a, m.a + m.size, code, name))
+
+    cand.sort(key=lambda c: (-c[0], -c[1], c[4]))
+    out, spans = [], []
+    for size, _echo, a, b, code, name in cand:
+        if any(a < sb and sa < b for sa, sb in spans):
+            continue
+        spans.append((a, b))
+        out.append((a, code, name, size))
+        if len(out) >= limit:
+            break
+    # 사용자가 말한 순서대로 돌려준다. 점수 순으로 주면 "A랑 B 비교해줘"의
+    # 답이 B부터 나와서 질문과 어긋나 읽힌다.
+    out.sort()
+    return [(code, name, size) for _a, code, name, size in out]
 
 
 def find_class_code(question):
