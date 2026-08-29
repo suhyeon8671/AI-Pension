@@ -144,7 +144,10 @@ def _row_class_code(row):
         A | 수수료선취-오프라인 | 납입금액의 0.10% 이내 | 없음 | 없음
 
     첫 칸만 보면 뒤엣것을 통째로 놓친다(상품 42개가 이 모양이었다)."""
-    cells = [c for c in (row or [])[:3] if (c or "").strip()]
+    # 앞에서 3칸이 아니라 "값이 있는 앞 3칸"을 본다. 빈 칸이 사이에 끼는
+    # 표가 많아서(['A','','','수수료선취-오프라인',...]) 앞 3칸만 보면
+    # 라벨 칸이 범위 밖으로 밀린다.
+    cells = [c for c in (row or []) if (c or "").strip()][:3]
     if not cells:
         return None
     found = _parse(cells[0])
@@ -162,8 +165,9 @@ def _parse_table(rows):
     mapping, header_end = _header_map(rows)
     if not mapping or "redemption_fee" not in mapping.values():
         return {}
-    # 열 이름이 첫 칸(클래스 칸)에만 걸린 표는 수수료 표가 아니다.
-    if set(mapping) == {0}:
+    # 진짜 수수료 표는 열이 여럿이다. 환매수수료 하나만 걸렸다면 연혁표
+    # ("2015.11.02 | 환매수수료 삭제")를 오인한 것이다.
+    if len(mapping) < 2 or set(mapping) == {0}:
         return {}
 
     order = [name for _j, name in sorted(mapping.items())]
@@ -202,9 +206,46 @@ def _parse_table(rows):
 # "환매수수료 나오나요?"에 답할 수 있다.
 RE_REDEMPTION_SENTENCE = re.compile(
     r"이\s*(?:투자신탁|집합투자기구|펀드)[^.\n]{0,80}?환매수수료[^.\n]{0,80}?"
-    r"(?:부과하지\s*않습니다|받지\s*아니합니다|부과합니다|부과하며)[^.\n]{0,40}")
+    r"(?:부과|징구|발생)하지\s*(?:않습니다|아니합니다)"
+    r"|이\s*(?:투자신탁|집합투자기구|펀드)[^.\n]{0,80}?환매수수료[^.\n]{0,80}?"
+    r"(?:받지\s*아니합니다|부과합니다|부과하며)[^.\n]{0,40}")
+# "(3) 환매수수료 - 해당사항 없음"처럼 절 제목 뒤에 값만 적는 문서도 있다.
+RE_REDEMPTION_NONE = re.compile(
+    r"환매수수료\s*[-–—:]?\s*(해당사항\s*없음|해당\s*없음|없음|미부과)")
 # 연혁표("환매수수료 삭제")나 용어집 정의는 걸러야 한다.
 REDEMPTION_NOISE = ("삭제", "변경", "특정기간 이내에 펀드를 환매")
+
+
+# 표에 "환매수수료 | 없음"처럼 한 줄로 적어 둔 문서가 25개 있다. 다만
+# 같은 모양으로 용어집 정의도 들어 있어서("펀드를 일정 기간 가입하지 않고
+# 환매할 시 투자자에게 부과되는 비용으로...") 길이와 내용으로 가른다.
+RE_REDEMPTION_VALUE = re.compile(r"\d+\s*(?:일|개월|년)|이익금|%")
+MAX_NOTE_CELL = 30
+
+
+def _redemption_cell_note(conn, code):
+    for (dj,) in conn.execute(
+            "SELECT data_json FROM tables WHERE doc_id = ? "
+            "AND row_text LIKE '%환매수수료%' ORDER BY page", (code,)):
+        try:
+            rows = json.loads(dj)
+        except (ValueError, TypeError):
+            continue
+        for row in rows:
+            cells = [(x or "").strip() for x in row]
+            for i, x in enumerate(cells):
+                if _squash(x) != "환매수수료":
+                    continue
+                for y in cells[i + 1:]:
+                    if not y:
+                        continue
+                    v = " ".join(y.split())
+                    if len(v) > MAX_NOTE_CELL:
+                        break  # 용어집 정의 등 긴 문장은 값이 아니다
+                    if _squash(v) in NONE_MARKS or RE_REDEMPTION_VALUE.search(v):
+                        return v
+                    break
+    return None
 
 
 def product_redemption_note(conn, code):
@@ -218,7 +259,10 @@ def product_redemption_note(conn, code):
             if any(n in sent for n in REDEMPTION_NOISE):
                 continue
             return sent
-    return None
+        m = RE_REDEMPTION_NONE.search(flat)
+        if m:
+            return f"환매수수료 {m.group(1)}"
+    return _redemption_cell_note(conn, code)
 
 
 def extract(db_path=DEFAULT_DB_PATH):
