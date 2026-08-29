@@ -146,6 +146,25 @@ CREATE TABLE class_meaning (
     PRIMARY KEY (product_code, class_code)
 );
 CREATE INDEX IF NOT EXISTS idx_class_meaning_product ON class_meaning(product_code);
+
+-- 투자자가 직접 부담하는 수수료와 가입자격 (extract_class_charges.py).
+-- 값을 숫자로 줄이지 않고 문장을 그대로 담는다. "90일미만 이익금의 30%.
+-- 다만 2013년1월17일 이후 환매 청구하는 경우에는 부과하지 않음"을 숫자로
+-- 줄이면 안 떼는 수수료를 뗀다고 답하게 된다.
+-- "없음"은 문서가 없다고 적은 것이고, NULL은 우리가 모르는 것이다.
+DROP TABLE IF EXISTS class_charges;
+CREATE TABLE class_charges (
+    product_code TEXT NOT NULL,
+    class_code TEXT NOT NULL,
+    eligibility TEXT,       -- "제한 없음" / "온라인 투자자" / "1년이상 종류C1가입자"
+    front_load_fee TEXT,    -- 선취판매수수료
+    back_load_fee TEXT,     -- 후취판매수수료
+    redemption_fee TEXT,    -- 환매수수료
+    switch_fee TEXT,        -- 전환수수료
+    page INTEGER,
+    PRIMARY KEY (product_code, class_code)
+);
+CREATE INDEX IF NOT EXISTS idx_class_charges_product ON class_charges(product_code);
 """
 
 
@@ -350,6 +369,28 @@ def load_class_meaning(conn, path):
     return n
 
 
+def load_class_charges(conn, path):
+    if not os.path.exists(path):
+        return 0
+    with open(path, "r", encoding="utf-8") as f:
+        records = json.load(f)
+    n = 0
+    for r in records:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO class_charges
+                (product_code, class_code, eligibility, front_load_fee,
+                 back_load_fee, redemption_fee, switch_fee, page)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (r["product_code"], r["class_code"], r.get("eligibility"),
+             r.get("front_load_fee"), r.get("back_load_fee"),
+             r.get("redemption_fee"), r.get("switch_fee"), r.get("page")),
+        )
+        n += 1
+    return n
+
+
 def main():
     parser = argparse.ArgumentParser(description="상품 팩트 3종을 SQLite로 적재")
     parser.add_argument("--db", default=DEFAULT_DB_PATH)
@@ -360,6 +401,8 @@ def main():
     parser.add_argument("--fund-aum", default=os.path.join(REPO_ROOT, "fund_aum.json"))
     parser.add_argument("--class-meaning",
                         default=os.path.join(REPO_ROOT, "class_meaning.json"))
+    parser.add_argument("--class-charges",
+                        default=os.path.join(REPO_ROOT, "class_charges.json"))
     args = parser.parse_args()
 
     conn = sqlite3.connect(args.db)
@@ -371,12 +414,13 @@ def main():
     n4 = load_manager_info(conn, args.manager_info)
     n5 = load_fund_aum(conn, args.fund_aum)
     n6 = load_class_meaning(conn, args.class_meaning)
+    n7 = load_class_charges(conn, args.class_charges)
 
     conn.commit()
     conn.close()
     print(
         f"product_master {n1}건, class_fees {n2}건, class_returns {n3}건, "
-        f"manager_info(참고용) {n4}건, fund_aum {n5}건, class_meaning {n6}건 → {args.db}"
+        f"manager_info(참고용) {n4}건, fund_aum {n5}건, class_meaning {n6}건, class_charges {n7}건 → {args.db}"
     )
 
 
