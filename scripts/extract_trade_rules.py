@@ -27,6 +27,7 @@
 """
 
 import argparse
+import glob
 import json
 import os
 import re
@@ -66,8 +67,14 @@ def _is_complete(body):
     return bool(RE_HAS_TIME.search(body) and RE_HAS_DAYS.search(body))
 
 
+# 단을 갈라 읽으면 줄이 바뀐 자리에 공백이 생긴다("제3영 업일에").
+# 흔한 모양만 되붙인다.
+RE_WRAPPED_DAY = re.compile(r"제\s*(\d+)\s*영\s+업일")
+
+
 def _flat(text):
-    return " ".join((text or "").split())
+    out = " ".join((text or "").split())
+    return RE_WRAPPED_DAY.sub(r"제\1영업일", out)
 
 
 def _section(text, patterns):
@@ -119,6 +126,71 @@ def _from_cells(rows):
     return out
 
 
+# 매입/환매를 좌우 2단으로 싣되 표로도 안 잡히는 문서가 8개 있다(KR5127 계열).
+# 글자만 보면 두 단이 줄 단위로 번갈아 나오고 한쪽이 두 줄로 쪼개져서,
+# 어느 줄이 어느 단의 이어지는 부분인지 짐작할 수가 없다. 짐작으로 붙였더니
+# "제3영" + "4영업일에" = "제3영4영업일에" 같은 엉터리가 나왔다.
+#
+# 좌표를 보면 답이 분명하다. 매입은 x 112~260, 환매는 x 383~540에 있다.
+# "환매방법" 라벨의 x를 경계로 삼아 두 단을 갈라 읽는다.
+LABEL_X = {"매입방법": "매입기준가", "환매방법": "환매기준가"}
+# 좌표로 단을 갈라 읽으면 위아래 다른 절(투자위험 설명 등)도 딸려 온다.
+# 시각 조건으로 시작해서 "매입" 또는 "대금 지급"으로 끝나는 대목만 추린다.
+RE_RULE_SPAN = re.compile(
+    r"\d+\s*시(?:\s*\d+\s*분)?\s*(?:이전|경과\s*후|이후)\s*:?.{0,70}?"
+    r"(?:으로\s*매입|대금\s*지급)")
+# 라벨 줄에서 위아래로 이만큼 안에 있는 글자만 본다(다른 절을 삼키지 않게).
+COLUMN_ROW_WINDOW = 80
+
+
+def _from_pdf_columns(pdf_path):
+    """2단으로 놓인 매입/환매 규칙을 x좌표로 갈라 읽는다."""
+    import pdfplumber
+
+    out = {}
+    with pdfplumber.open(pdf_path) as pdf:
+        for pno, page in enumerate(pdf.pages, start=1):
+            text = page.extract_text() or ""
+            if "매입방법" not in text or "환매방법" not in text:
+                continue
+            words = page.extract_words()
+            labels = {}
+            for w in words:
+                key = w["text"].replace(" ", "")
+                if key in LABEL_X and key not in labels:
+                    labels[key] = w
+            if len(labels) < 2:
+                continue
+            split_x = labels["환매방법"]["x0"]
+            base_top = labels["매입방법"]["top"]
+
+            cols = {"매입기준가": [], "환매기준가": []}
+            for w in words:
+                if abs(w["top"] - base_top) > COLUMN_ROW_WINDOW:
+                    continue
+                if w["text"].replace(" ", "") in LABEL_X:
+                    continue
+                kind = "매입기준가" if w["x0"] < split_x else "환매기준가"
+                cols[kind].append(w)
+
+            for kind, ws in cols.items():
+                rows = {}
+                for w in ws:
+                    rows.setdefault(round(w["top"]), []).append(w)
+                body = " ".join(
+                    " ".join(x["text"] for x in sorted(v, key=lambda x: x["x0"]))
+                    for _t, v in sorted(rows.items()))
+                spans = RE_RULE_SPAN.findall(_flat(body))
+                if not spans:
+                    continue
+                body = " / ".join(_flat(x) for x in spans)
+                if _is_complete(body) and kind not in out:
+                    out[kind] = (body[:MAX_SECTION_CHARS], pno)
+            if len(out) == len(LABEL_X):
+                break
+    return out
+
+
 def extract(db_path=DEFAULT_DB_PATH):
     conn = sqlite3.connect(db_path)
     codes = [r[0] for r in conn.execute(
@@ -152,6 +224,19 @@ def extract(db_path=DEFAULT_DB_PATH):
                 for kind, body in _from_cells(rows).items():
                     if kind not in found:
                         found[kind] = (body, page)
+                if len(found) == len(SECTIONS):
+                    break
+
+        if len(found) < len(SECTIONS):
+            pdfs = glob.glob(os.path.join(
+                REPO_ROOT, "data", "products", code, "*.pdf"))
+            for pdf_path in pdfs:
+                try:
+                    for kind, (body, page) in _from_pdf_columns(pdf_path).items():
+                        if kind not in found:
+                            found[kind] = (body, page)
+                except Exception:
+                    pass  # PDF를 못 읽으면 그냥 없는 대로 둔다
                 if len(found) == len(SECTIONS):
                     break
 
