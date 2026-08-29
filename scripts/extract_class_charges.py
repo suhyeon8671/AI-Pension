@@ -72,9 +72,18 @@ HEADER_WORDS = {"선취판매수수료", "후취판매수수료", "환매수수�
                 "가입자격", "구분", "수수료율", "매입시", "환매시"}
 
 
+# 코드만 덩그러니 든 칸("A", "C-Pe")과 이름표가 든 칸을 알아보기 위한 모양.
+RE_BARE_CODE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-]{0,12}$")
+RE_HAS_LABEL = re.compile(r"수수료(선취|미징구|후취)-")
+
+
 def _clean(v):
     v = " ".join((v or "").split())
     if not v or _squash(v) in HEADER_WORDS:
+        return None
+    # 클래스 이름표가 수수료 칸으로 새어 드는 표가 있다(칸이 밀린 경우).
+    # "선취판매수수료: 수수료선취-오프라인" 같은 말이 안 되는 답이 나갔다.
+    if RE_HAS_LABEL.search(_squash(v)):
         return None
     return "없음" if _squash(v) in NONE_MARKS else v
 
@@ -125,11 +134,6 @@ def _header_map(rows):
                 used.add(j)
                 break
     return mapping, anchor + 1
-
-
-# 코드만 덩그러니 든 칸("A", "C-Pe")을 알아보기 위한 모양.
-RE_BARE_CODE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-]{0,12}$")
-RE_HAS_LABEL = re.compile(r"수수료(선취|미징구|후취)-")
 
 
 def _row_class_code(row):
