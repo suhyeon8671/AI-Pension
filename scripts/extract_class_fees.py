@@ -2196,6 +2196,9 @@ def _summary_column_field(name):
 # 날짜 표기가 문서마다 다르다. "작성기준일: 2025.05.16."과
 # "4. 작성 기준일  2025년 01월 17일"이 둘 다 쓰인다. 년/월 구분자를
 # 안 받아서 상품 34개가 기준일 없이 나갔다.
+# 작성기준일을 마저 찾아볼 앞쪽 페이지 수(표지, 요약정보가 여기 있다).
+AS_OF_SCAN_PAGES = 6
+
 AS_OF_RE = re.compile(
     r"(?:작성)?기준일\s*[:：]?\s*(\d{4})\s*[.\-년]\s*(\d{1,2})\s*[.\-월]\s*(\d{1,2})")
 # 보수가 기간별로 나뉜 상품은 "언제 바뀌는지"가 답변의 핵심인데, 그게
@@ -3293,6 +3296,16 @@ def main():
         # 상세표 보강으로 생긴 행에도 같이 붙인다(없으면 그 행만 숫자가
         # "언제 기준"인지 모르는 상태가 된다).
         doc_as_of = next((r.get("as_of") for r in rows if r.get("as_of")), None)
+        if doc_as_of is None:
+            # 요약표가 있는 페이지만 훑어서, 작성기준일이 표지나 요약정보
+            # 쪽에만 찍힌 문서(6개)를 통째로 놓치고 있었다. 못 찾았을 때만
+            # 앞쪽 페이지를 마저 본다.
+            for path in glob.glob(os.path.join(DATA_DIR, doc_id, "*.pdf"))[:1]:
+                with pdfplumber.open(path) as doc_pdf:
+                    for page in doc_pdf.pages[:AS_OF_SCAN_PAGES]:
+                        doc_as_of = _page_as_of(page.extract_text() or "")
+                        if doc_as_of:
+                            break
         for r in rows:
             if doc_as_of:
                 r.setdefault("as_of", doc_as_of)
