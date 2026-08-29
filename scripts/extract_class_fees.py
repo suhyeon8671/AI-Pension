@@ -1977,6 +1977,7 @@ def _label_class_code(label):
 # 글자 코드가 전혀 다르다(KR5111450067 실측: U+F09E - 총보수·비용 열이
 # 통째로 안 잡혔다).
 FOOTNOTE_RE = re.compile(r"^\(?주\s*\d*\)")
+DASHES = ("-", "\u2013", "\u2014", "\u2212")
 SUMMARY_DOT_RE = re.compile("[\u318d\u00b7\uff65\u2219\u25aa\u2022\u30fb\u22c5\u2027\uf000-\uf0ff]")
 
 
@@ -1989,7 +1990,11 @@ def _summary_column_field(name):
     n = _norm_header(name)
     if not n:
         return None
-    if "동종유형" in n:
+    # "동종"과 "유형"이 다른 칸/다른 페이지로 쪼개져 "유형총보수"만 남는
+    # 문서가 있다(KR5152420028 실측: 머리글이 페이지 경계에서 잘렸다).
+    # 아래 총보수 규칙이 "...총보수"로 끝난다는 이유로 이걸 먼저 집어가
+    # 동종유형 총보수가 진짜 총보수 자리에 들어갔다.
+    if "동종유형" in n or ("유형" in n and "총보수" in n):
         return "peer_avg_fee"
     # "합성총보수,비용"처럼 가운뎃점 자리에 쉼표를 쓰는 문서가 있다
     # (KR5122420005 실측 - 그대로 두면 이 칸을 못 알아보고, 옆의 비용예시
@@ -2019,6 +2024,8 @@ def _summary_grid(page, next_page=None, inherited=None):
     돌려주는 것: (field_by_col, data_rows) 또는 None."""
     words = page.extract_words(x_tolerance=2, keep_blank_chars=False)
     header_carry = None
+    parts_carry = None
+    parts_score = 0
     for t in page.find_tables():
         tbox = t.bbox          # 아래에서 t를 다른 뜻으로 다시 쓰므로 먼저 잡아둔다
         cells = [c for c in t.cells if c]
@@ -2117,18 +2124,51 @@ def _summary_grid(page, next_page=None, inherited=None):
                 if any(k in flat for k in ("투자시", "단위", "예시", "투자자가", "투자기간")):
                     continue
                 header_names.setdefault(ci, []).append(v)
-        field_by_col = {}
+        def map_headers(names):
+            out_map = {}
+            for ci, parts in names.items():
+                # 같은 칸 이름이 헤더 두 줄에 겹쳐 그려진 표가 있다
+                # (KR5157420003 실측: "2년"이 두 띠에 다 잡혀 "2년2년"이
+                # 됐다). 이어 붙인 이름이 안 맞으면 중복을 걷어낸 이름으로
+                # 다시 본다.
+                uniq = list(dict.fromkeys(parts))
+                for cand in ("".join(parts), "".join(uniq)):
+                    f = _summary_column_field(cand)
+                    if f and f not in out_map.values():
+                        out_map[ci] = f
+                        break
+            return out_map
+
         inherited_need = 0
-        for ci, parts in header_names.items():
-            # 같은 칸 이름이 헤더 두 줄에 겹쳐 그려진 표가 있다
-            # (KR5157420003 실측: "2년"이 두 띠에 다 잡혀 "2년2년"이 됐다).
-            # 이어 붙인 이름이 안 맞으면 중복을 걷어낸 이름으로 다시 본다.
-            uniq = list(dict.fromkeys(parts))
-            for cand in ("".join(parts), "".join(uniq)):
-                f = _summary_column_field(cand)
-                if f and f not in field_by_col.values():
-                    field_by_col[ci] = f
-                    break
+        field_by_col = map_headers(header_names)
+
+        # 표 머리글이 페이지 경계에서 위아래로 잘리는 문서가 있다
+        # (KR5152420028/KR5113450111 실측: 앞 장 맨 아래에 "판매/총보수/
+        # 동종/총보수·", 다음 장 맨 위에 "수수료/보수/유형총보수/비용"이
+        # 나뉘어 찍힌다). 어느 쪽만 봐도 열 이름이 완성되지 않으니, 이 장
+        # 머리글만으로 안 될 때에 한해 앞 장 조각을 x위치로 맞춰 앞에
+        # 이어 붙여 본다(되면 그때만 쓴다).
+        prev_parts = inherited[2] if inherited and len(inherited) > 2 else None
+        if prev_parts and header_names and \
+                not {"total_fee", "distribution_fee"} <= set(field_by_col.values()):
+            joined_names = {ci: list(ps) for ci, ps in header_names.items()}
+            for ci in range(len(col_x0s)):
+                head = [t for x, ps in prev_parts
+                        if abs(x - col_x0s[ci]) <= 8 for t in ps]
+                if head:
+                    joined_names[ci] = head + joined_names.get(ci, [])
+            merged = map_headers(joined_names)
+            # 앞 장 조각을 붙였더니 이름이 완성됐다고 해서 이 표가 그 표의
+            # 연장이라는 뜻은 아니다(KR5118420062 실측: 다음 장 수익률표에
+            # 씌워져 "비교지수(%)"가 클래스로 잡혔다). 잡힌 칸들이 한 행에
+            # 대부분 실제로 채워져 있어야 받아들인다.
+            need_m = max(3, int(len(merged) * 0.7))
+            if {"total_fee", "distribution_fee"} <= set(merged.values()) and \
+                    any(sum(1 for ci in merged if ci in r["cells"]) >= need_m
+                        for r in grid[first_data:]):
+                field_by_col = merged
+                header_names = joined_names
+                inherited_need = need_m
 
         # 세로줄이 값 구간에서 끊겨 있어 데이터 행에 그 열의 칸이 아예
         # 안 생기는 표가 있다(KR5127420034 실측: 헤더엔 "10년" 칸이 있는데
@@ -2240,7 +2280,7 @@ def _summary_grid(page, next_page=None, inherited=None):
         # 표와 같은 모양이면(열 개수·x좌표가 거의 같으면) 그대로 물려받는다.
         fields = set(field_by_col.values())
         if not {"total_fee", "distribution_fee"} <= fields and inherited:
-            prev_fields, prev_cols = inherited
+            prev_fields, prev_cols = inherited[0], inherited[1]
             # 이어지는 페이지에선 맨 왼쪽 클래스명 열이 표 인식에서
             # 빠지기도 해서 열 개수가 달라진다(KR5113470030 실측: 5페이지
             # 13열 → 6페이지 11열). 개수를 맞추라고 요구하지 말고, 각
@@ -2274,7 +2314,10 @@ def _summary_grid(page, next_page=None, inherited=None):
             # "비교지수(%)"와 "1981 8"이 클래스로 잡히고, 수익률 3.22가
             # 진짜 C의 총보수 0.45를 덮어썼다). 진짜 이어지는 표라면 앞
             # 장에서 쓰던 칸들이 한 행에 대부분 다시 채워져 있어야 한다.
-            need = max(3, int(len(mapped) * 0.7))
+            # 한 클래스의 값이 두 띠로 쪼개지는 표가 있어(KR5147430065
+            # 실측: 이름 칸이 두 행에 걸쳐 있어 보수와 비용예시가 다른
+            # 띠에 잡힌다) 비율을 높이면 진짜 연속 표까지 떨어진다.
+            need = max(3, int(len(mapped) * 0.5))
             same_shape = any(sum(1 for ci in mapped if ci in r["cells"]) >= need
                              for r in grid[first_data:])
             if enough and same_shape and \
@@ -2282,6 +2325,18 @@ def _summary_grid(page, next_page=None, inherited=None):
                 field_by_col = mapped
                 fields = set(field_by_col.values())
                 inherited_need = need
+        my_parts = [(col_x0s[ci], ps) for ci, ps in header_names.items()
+                    if ci < len(col_x0s)]
+        # 이름이 완성되지 않은 머리글이라도 조각은 남겨 둔다 - 머리글이
+        # 페이지 경계에서 위아래로 잘린 문서에선 앞 장 조각이 있어야
+        # 다음 장에서 이름이 완성된다(KR5152420028/KR5113450111 실측).
+        # 페이지에 표가 여럿이면 요약표 머리글을 가진 표를 골라야 한다
+        # (첫 표는 투자위험등급 표라 조각을 넘겨도 쓸모가 없다). 요약표
+        # 열 이름으로 해석되는 칸이 가장 많은 표를 남긴다.
+        score = len(map_headers(header_names))
+        if my_parts and score and score > parts_score:
+            parts_score = score
+            parts_carry = ({}, col_x0s, my_parts)
         if not {"total_fee", "distribution_fee"} <= fields:
             continue
         # 이어받은 열 구성으로 확정된 뒤에도, 안 그려진 칸을 채우고 한 칸씩
@@ -2320,6 +2375,24 @@ def _summary_grid(page, next_page=None, inherited=None):
             # 이미 코드가 읽히는 라벨은 넓히지 않는다 - 마지막 행에서
             # 표 끝까지 훑다가 각주("(주1) 1,000만원 지불하게 되는...")를
             # 끌어와 코드를 못 찾게 되는 사고가 있었다(KR5125450023 실측).
+            if _label_class_code(label) is None:
+                # 클래스명 칸 하나가 값 행 여러 개에 걸쳐 세로로 병합된
+                # 표가 있다(KR5147430065 실측: 클래스 A의 보수가 운용전환일
+                # 앞뒤로 두 행인데 이름 칸은 하나다 - 행 y구간만 보면
+                # "수수료선취-"까지만 잡혀 코드를 못 찾았다). 이 행을
+                # 세로로 품고 있는 왼쪽 칸의 글자를 이름으로 본다.
+                mid = (r["top"] + r["bottom"]) / 2
+                span = [c for c in cells
+                        if c[0] < first_field_x - 2 and c[1] - 1 <= mid <= c[3] + 1]
+                if span:
+                    ws = [w for w in words
+                          if any(c[0] - 1 <= (w["x0"] + w["x1"]) / 2 <= c[2] + 1
+                                 and c[1] - 1 <= (w["top"] + w["bottom"]) / 2 <= c[3] + 1
+                                 for c in span)]
+                    ws.sort(key=lambda w: (round(w["top"], 1), w["x0"]))
+                    cand = " ".join(w["text"] for w in ws).strip()
+                    if _label_class_code(cand) is not None:
+                        label = cand
             if _label_class_code(label) is None:
                 # 클래스명이 값 행보다 세로로 길게 이어지는 문서가 있다
                 # (KR5113470030 실측: 값 행 구간만 보면 "수수료미 징구-오"
@@ -2373,12 +2446,14 @@ def _summary_grid(page, next_page=None, inherited=None):
                             label = cand
             out.append({"label": label, "cells": r["cells"]})
         if out:
-            return field_by_col, out, col_x0s
+            return field_by_col, out, col_x0s, my_parts
         if header_only and header_carry is None and \
                 {"total_fee", "distribution_fee"} <= set(field_by_col.values()):
-            header_carry = (field_by_col, col_x0s)
+            header_carry = (field_by_col, col_x0s, my_parts)
     if header_carry:
-        return header_carry[0], [], header_carry[1]
+        return header_carry[0], [], header_carry[1], header_carry[2]
+    if parts_carry:
+        return parts_carry[0], [], parts_carry[1], parts_carry[2]
     return None
 
 
@@ -2403,8 +2478,8 @@ def summary_rows_for_doc(doc_id, pdf, pages):
         got = _summary_grid(pdf.pages[page_num - 1], nxt, use_inherited)
         if not got:
             continue
-        field_by_col, grid_rows, col_x0s = got
-        inherited = (field_by_col, col_x0s)
+        field_by_col, grid_rows, col_x0s, hdr_parts = got
+        inherited = (field_by_col, col_x0s, hdr_parts)
         prev_page = page_num
         for r in grid_rows:
             label = r["label"]
@@ -2414,7 +2489,11 @@ def summary_rows_for_doc(doc_id, pdf, pages):
                 # 클래스가 하나뿐이라 코드 표기 자체가 없는 문서가 있다
                 # (KR5123365001 실측: "투자신탁" 라벨 하나) - 코드를 지어
                 # 내지 않고 원본 라벨을 그대로 이름으로 쓴다.
-                code = flat or None
+                # 각주까지 딸려온 라벨을 그대로 이름으로 쓰면
+                # "투자신탁투자비용주1)'1,000만원..."이 된다
+                # (KR5123365001 실측). 각주 표시 앞까지만 쓴다.
+                cut = re.split(r"\(?주\s*\d*\)", label)[0]
+                code = cut.replace(" ", "")[:20] or flat or None
             if not code:
                 continue
 
@@ -2426,6 +2505,30 @@ def summary_rows_for_doc(doc_id, pdf, pages):
 
             total_fee = vals.get("total_fee")
             if total_fee is None:
+                continue
+            # 같은 페이지의 수익률표·운용전문인력표가 요약표의 연장으로
+            # 잘못 잡히면 "비교지수(%)"나 운용역 이름이 클래스가 된다
+            # (KR5118420062/KR5118201004 실측). 클래스 이름에는 절대
+            # 나오지 않는 말이 들어간 행은 버린다.
+            if any(k in flat for k in ("비교지수", "수익률변동성", "투자실적",
+                                       "설정일이후", "운용전문", "연평균")):
+                continue
+            # 보수율은 %라서 두 자릿수를 넘지 않는다. 운용규모(96,365)나
+            # 운용역 경력(8) 같은 숫자가 들어오면 그 행은 보수 행이 아니다.
+            def _pct_ok(v):
+                if v is None:
+                    return True
+                t = v.replace(" ", "").rstrip("%")
+                if t in DASHES:
+                    return True
+                try:
+                    return float(t.replace(",", "")) <= 10
+                except ValueError:
+                    return False
+
+            if not all(_pct_ok(vals.get(f)) for f in
+                       ("total_fee", "distribution_fee", "peer_avg_fee",
+                        "total_fee_and_cost")):
                 continue
             cost = {}
             for k in SUMMARY_COST_KEYS:
@@ -2502,7 +2605,22 @@ def summary_rows_for_doc(doc_id, pdf, pages):
                 "product_code": doc_id,
                 **({"source_corrections": corrections} if corrections else {}),
             })
-    return rows
+    # 한 클래스의 보수가 기간별로 두 행에 나뉜 문서가 있다(KR5147430065
+    # 실측: 클래스 A가 "최초설정일~운용전환일 전일"과 "운용전환일~해지일"
+    # 두 행이고 이름 칸은 하나로 병합돼 있다). 클래스당 한 레코드를 내되
+    # 나머지 기간을 버리지는 않고 additional_fee_rows로 남긴다.
+    out, seen = [], {}
+    for r in rows:
+        code = r["class_code"]
+        if code in seen:
+            seen[code].setdefault("additional_fee_rows", []).append(
+                {k: r[k] for k in ("total_fee", "distribution_fee", "peer_avg_fee",
+                                   "total_fee_and_cost", "cost_projection_per_10m",
+                                   "evidence") if r.get(k)})
+            continue
+        seen[code] = r
+        out.append(r)
+    return out
 
 
 def _summary_cells_lose_anything(coord_rows, cell_rows):
