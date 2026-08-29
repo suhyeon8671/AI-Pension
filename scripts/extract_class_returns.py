@@ -895,6 +895,8 @@ def return_rows_for_doc(doc_id, pdf, pages, known_classes=None):
                             default=len(col_x0s))
             date_col = next((c for c, f in field_by_col.items()
                              if f == "inception_date"), None)
+            period_set = {c for c, f in field_by_col.items()
+                          if f.endswith("y") or f == "since_inception"}
             for r in data_rows:
                 # 클래스명 칸이 여러 행에 걸쳐 병합돼 있으면 이 행 자신의
                 # 칸은 비어 있다 - 이 행을 세로로 품고 있는 왼쪽 칸을 쓴다.
@@ -963,6 +965,17 @@ def return_rows_for_doc(doc_id, pdf, pages, known_classes=None):
                                 break
                     dm = INCEPTION_DATE_RE.search(raw or "")
                     inception = _normalize_date(dm.group()) if dm else None
+                if inception is None:
+                    # 최초설정일 칸이 따로 안 잡히는 표가 있다
+                    # (KR5123490013 실측: 날짜가 클래스명 칸에 같이 들어
+                    # 있다). 값 칸이 아닌 칸에서 날짜꼴을 찾는다.
+                    for ci, v in r["cells"].items():
+                        if ci in period_set:
+                            continue
+                        dm = INCEPTION_DATE_RE.search(v)
+                        if dm:
+                            inception = _normalize_date(dm.group())
+                            break
 
                 rows.append({
                     "row_kind": kind,
@@ -976,7 +989,34 @@ def return_rows_for_doc(doc_id, pdf, pages, known_classes=None):
                     "confidence": 1.0 if (class_code or kind != "class_return") else 0.5,
                     "_top": r["top"],
                 })
-    return rows
+    # 클래스명이 여러 띠에 쪼개져 그려지면 같은 값 행이 라벨만 다르게
+    # 두 번 잡히기도 한다(KR5123490013 실측). 값이 똑같은데 한쪽만 클래스
+    # 코드를 찾은 경우 코드 있는 쪽만 남긴다.
+    keyed = {}
+    for r in rows:
+        k = (r["row_kind"], tuple(sorted((r.get("values") or {}).items())))
+        cur = keyed.get(k)
+        if cur is None or (cur.get("class_code") is None
+                           and r.get("class_code") is not None):
+            keyed[k] = r
+    # 비교지수·변동성 행의 최초설정일은 클래스 행과 병합된 칸에 한 번만
+    # 찍혀서 이어지는 페이지에선 비어 보인다. 바로 앞 행의 날짜를 잇는다.
+    out, last_date = [], None
+    for r in rows:
+        k = (r["row_kind"], tuple(sorted((r.get("values") or {}).items())))
+        if keyed.get(k) is not r:
+            continue
+        # 비교지수·변동성은 펀드 전체 기준이라 최초설정일도 펀드의 것
+        # (표에서 가장 처음 나오는 클래스의 설정일)이다. 마지막 클래스
+        # 것을 쓰면 나중에 만들어진 클래스 날짜가 붙는다(KR5153450009
+        # 실측: 2006-01-04이어야 하는데 2017-10-24가 붙었다).
+        if r["row_kind"] == "class_return" and r.get("inception_date") \
+                and last_date is None:
+            last_date = r["inception_date"]
+        elif r["row_kind"] in ("benchmark", "volatility") and not r.get("inception_date"):
+            r["inception_date"] = last_date
+        out.append(r)
+    return out
 
 
 def col_of_lt(cell, col_x0s, first_val):
