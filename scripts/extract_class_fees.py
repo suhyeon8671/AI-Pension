@@ -2084,6 +2084,31 @@ def _summary_column_field(name):
     return None
 
 
+AS_OF_RE = re.compile(r"(?:작성)?기준일\s*[:：]?\s*(\d{4})\s*[.\-]\s*(\d{1,2})\s*[.\-]\s*(\d{1,2})")
+# 보수가 기간별로 나뉜 상품은 "언제 바뀌는지"가 답변의 핵심인데, 그게
+# 날짜가 아니라 조건인 경우가 있다(KR5147430065 실측: "목표기준가격
+# (종류A 누적기준가격 1,060원 이상)에 도달하여 운용전환이 이루어질 경우").
+# 날짜가 문서 어디에도 없으므로 조건 문장을 그대로 남겨야 "전환됐나요"
+# 같은 질문에 근거를 들어 답할 수 있다.
+# 전환 조건 문장만 정확히 집는다. 느슨하게 잡으면 펀드명 줄
+# ("(운용전환일 이후) KCGI코리아목표전환형...")이나 비용예시 각주
+# ("목표기준가격을 도달하지 못한 경우를 가정하여 5%로 하였습니다")를
+# 조건으로 착각한다 - 조건 문장은 "목표기준가격 ... 도달 ... 운용전환"
+# 세 조각이 이 순서로 다 들어 있다.
+FEE_PERIOD_COND_RE = re.compile(
+    r"목표기준가격[^.\n]*?도달[^.\n]*?운용전환[^.\n]*")
+
+
+def _page_as_of(text):
+    m = AS_OF_RE.search(text.replace(" ", "") if "기준일" in text.replace(" ", "") else text)
+    if not m:
+        m = AS_OF_RE.search(text)
+    if not m:
+        return None
+    y, mo, d = m.groups()
+    return f"{y}-{int(mo):02d}-{int(d):02d}"
+
+
 def _summary_grid(page, next_page=None, inherited=None):
     """요약표를 셀 격자로 읽는다. 이 페이지에서 "클래스종류/총보수/판매보수"
     헤더를 가진 표만 고른다(같은 페이지의 운용전문인력 표 등과 구분).
@@ -2650,6 +2675,8 @@ def summary_rows_for_doc(doc_id, pdf, pages):
     rows = []
     inherited = None
     prev_page = None
+    as_of = None
+    doc_condition = None
     for page_num in pages:
         if page_num < 1 or page_num > len(pdf.pages):
             continue
@@ -2658,6 +2685,14 @@ def summary_rows_for_doc(doc_id, pdf, pages):
         # 페이지의 무관한 표에까지 요약표 열 매핑을 씌우면 엉뚱한 행이
         # 클래스로 잡힌다(KR5122420005 실측: 5행이어야 하는데 7행이 됨).
         use_inherited = inherited if prev_page == page_num - 1 else None
+        page_text = pdf.pages[page_num - 1].extract_text() or ""
+        # 작성기준일은 보통 첫 요약 페이지에만 찍힌다 - 문서 안에서 한 번
+        # 찾으면 이어지는 페이지의 행에도 같이 붙인다.
+        as_of = _page_as_of(page_text) or as_of
+        if doc_condition is None:
+            pm = FEE_PERIOD_COND_RE.search(page_text)
+            if pm:
+                doc_condition = " ".join(pm.group().split()).lstrip("ㆍ·- ")
         got = _summary_grid(pdf.pages[page_num - 1], nxt, use_inherited)
         if not got:
             continue
@@ -2806,12 +2841,34 @@ def summary_rows_for_doc(doc_id, pdf, pages):
             for v in r["cells"].values():
                 flat_v = v.replace(" ", "")
                 if "전환일" in flat_v and ("까지" in flat_v or "부터" in flat_v):
-                    period = " ".join(v.split())
+                    # 칸 안에서 줄바꿈되며 단어가 쪼개진다("최초설정일부"
+                    # / "터" / "운용전환일"). 한 글자짜리 조각은 앞말에
+                    # 붙여 읽는다 - 원문 띄어쓰기를 살리면서 복원된다.
+                    toks = v.split()
+                    parts = []
+                    for tk in toks:
+                        if parts and len(tk) == 1:
+                            parts[-1] += tk
+                        else:
+                            parts.append(tk)
+                    period = " ".join(parts)
                     break
+            # 기간이 나뉜 상품은 "언제 바뀌는지"가 답변의 핵심인데, 그게
+            # 날짜가 아니라 조건인 경우가 있다(KR5147430065 실측: 전환일이
+            # 문서 57쪽 어디에도 날짜로 없고 "목표기준가격 도달 시"라는
+            # 조건뿐이다). 조건 문장과 작성기준일을 남겨야 "지금 전환됐나요"
+            # 같은 질문에 "작성기준일 기준으로는 전환 전이고, 조건은 이것"
+            # 이라고 근거를 들어 답할 수 있다.
+            if period and doc_condition:
+                condition = doc_condition
+            else:
+                condition = None
 
             rows.append({
                 "class_code": code,
                 **({"fee_period": period} if period else {}),
+                **({"fee_period_condition": condition} if condition else {}),
+                **({"as_of": as_of} if as_of else {}),
                 "sales_commission_desc": desc,
                 "total_fee": total_fee.replace(" ", "").rstrip("%"),
                 "distribution_fee": clean("distribution_fee"),
