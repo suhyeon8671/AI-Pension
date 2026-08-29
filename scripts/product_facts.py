@@ -30,7 +30,10 @@ INTENT_KEYWORDS = {
     "aum": ("설정액", "순자산", "규모", "자산총액", "얼마나 큰"),
     "cost_projection": ("비용예시", "1,000만원", "1000만원", "천만원", "투자하면"),
     "redemption": ("환매", "해지", "중도해지", "팔면", "빼면", "인출"),
-    "eligibility": ("가입", "살 수 있", "매수", "담을 수", "연금저축계좌", "IRP"),
+    # "매수"만 넣으면 "환매수수료"의 가운데 글자에 걸린다("환매수수료"
+    # -> 환+매수+수료). 붙는 말까지 넣어 구분한다.
+    "eligibility": ("가입할", "가입 가능", "가입자격", "살 수 있", "매수할", "매수 가능",
+                    "담을 수", "연금저축계좌로", "IRP로", "IRP에서"),
 }
 
 
@@ -218,7 +221,15 @@ def product_facts(code, class_code=None, intents=None, db_path=DEFAULT_DB_PATH):
             # "다만 ... 부과하지 않음"이 붙는다).
             got = [(cc, c) for cc, c in sorted(charges.items())
                    if c.get("redemption_fee")]
-            if not got:
+            note = conn.execute(
+                "SELECT redemption_note FROM product_charges WHERE product_code = ?",
+                (code,)).fetchone()
+            if not got and note and note["redemption_note"]:
+                # 클래스별 표가 없어도 펀드 전체에 대해 적어 둔 문장이 있으면
+                # 그게 답이다. "모릅니다"로 답할 이유가 없다.
+                lines.append(f"  [환매수수료] {note['redemption_note']}.")
+                ev.append({"table": "product_charges", "product_code": code})
+            elif not got:
                 lines.append("  [환매수수료] 문서에서 확인하지 못했습니다.")
             elif len({c["redemption_fee"] for _cc, c in got}) == 1:
                 lines.append(f"  [환매수수료] {got[0][1]['redemption_fee']}")
@@ -235,7 +246,26 @@ def product_facts(code, class_code=None, intents=None, db_path=DEFAULT_DB_PATH):
             got = [(cc, c) for cc, c in sorted(charges.items())
                    if c.get("eligibility")]
             if not got:
-                lines.append("  [가입자격] 문서에서 확인하지 못했습니다.")
+                # 가입자격 열은 문서 27개에만 있다. 없으면 이름표의 계좌
+                # 종류로 답한다 - "연금저축 · 온라인"이면 연금저축 계좌로
+                # 살 수 있다는 뜻이고, 그게 질문에 대한 답이다.
+                by_account = {}
+                for cc, m in sorted(meaning.items()):
+                    if m.get("account_type") and m.get("retail"):
+                        by_account.setdefault(
+                            m["description"].split(" · ")[0], []).append(cc)
+                if by_account:
+                    lines.append("  [가입 가능한 계좌]")
+                    for account, ccs in by_account.items():
+                        lines.append(f"    - {account}: {', '.join(ccs)} 클래스")
+                        ev.append({"table": "class_meaning", "product_code": code,
+                                   "class_code": ccs[0]})
+                    if not any(a for a in by_account
+                               if "연금" in a):
+                        lines.append("    ※ 연금 계좌 전용 클래스는 없습니다.")
+                else:
+                    lines.append("  [가입자격] 이 펀드에는 연금저축·퇴직연금 전용 "
+                                 "클래스가 문서에 표시되어 있지 않습니다.")
             else:
                 lines.append("  [가입자격]")
                 for cc, c in got:

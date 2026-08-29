@@ -37,6 +37,7 @@
 import argparse
 import json
 import os
+import re
 import sqlite3
 
 from extract_class_meaning import _parse, _squash
@@ -44,6 +45,7 @@ from extract_class_meaning import _parse, _squash
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB_PATH = os.path.join(REPO_ROOT, "structured_store.db")
 OUTPUT_JSON = os.path.join(REPO_ROOT, "class_charges.json")
+OUTPUT_PRODUCT_JSON = os.path.join(REPO_ROOT, "product_charges.json")
 
 # 열 이름 -> 우리가 쓸 이름. 헤더가 두 줄로 쪼개져 있어서(구분/가입자격/수수료율
 # 밑에 선취판매수수료/후취판매수수료/환매수수료/전환수수료) 열마다 위아래를
@@ -125,14 +127,34 @@ def _header_map(rows):
     return mapping, anchor + 1
 
 
-def _row_class_code(cell):
-    """첫 칸에서 클래스 코드를 읽는다.
+# 코드만 덩그러니 든 칸("A", "C-Pe")을 알아보기 위한 모양.
+RE_BARE_CODE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-]{0,12}$")
+RE_HAS_LABEL = re.compile(r"수수료(선취|미징구|후취)-")
 
-    "종류A\\n수수료선취-\\n오프라인" 이나 "수수료미징구-오프라인-퇴직연금(C)"
-    같은 모양이라, class_meaning에서 쓰는 이름표 파서를 그대로 쓴다."""
-    found = _parse(cell or "")
+
+def _row_class_code(row):
+    """행 앞부분에서 클래스 코드를 읽는다.
+
+    표 모양이 두 갈래다. 첫 칸에 이름표가 통째로 든 것,
+
+        수수료미징구-오프라인-퇴직연금(C) | 90일미만 이익금의 30% | ...
+
+    그리고 코드와 이름표가 두 칸으로 나뉜 것.
+
+        A | 수수료선취-오프라인 | 납입금액의 0.10% 이내 | 없음 | 없음
+
+    첫 칸만 보면 뒤엣것을 통째로 놓친다(상품 42개가 이 모양이었다)."""
+    cells = [c for c in (row or [])[:3] if (c or "").strip()]
+    if not cells:
+        return None
+    found = _parse(cells[0])
     if len(found) == 1:
         return next(iter(found))
+    # 코드 칸과 이름표 칸이 나뉜 경우
+    head = _squash(cells[0])
+    if len(cells) > 1 and RE_BARE_CODE.match(head) and RE_HAS_LABEL.search(
+            _squash(cells[1])):
+        return head
     return None
 
 
@@ -149,7 +171,7 @@ def _parse_table(rows):
     for row in rows[header_end:]:
         if not row:
             continue
-        code = _row_class_code(row[0])
+        code = _row_class_code(row)
         if not code or code in out:
             continue
 
@@ -172,6 +194,31 @@ def _parse_table(rows):
         if rec:
             out[code] = rec
     return out
+
+
+# 펀드 전체에 대해 환매수수료를 어떻게 하는지 적은 문장.
+# "(8) 환매수수료 / 이 투자신탁은 환매수수료를 부과하지 않습니다." 처럼
+# 절 하나로 적어 두는 문서가 많다. 클래스별 표가 없어도 이 문장이면
+# "환매수수료 나오나요?"에 답할 수 있다.
+RE_REDEMPTION_SENTENCE = re.compile(
+    r"이\s*(?:투자신탁|집합투자기구|펀드)[^.\n]{0,80}?환매수수료[^.\n]{0,80}?"
+    r"(?:부과하지\s*않습니다|받지\s*아니합니다|부과합니다|부과하며)[^.\n]{0,40}")
+# 연혁표("환매수수료 삭제")나 용어집 정의는 걸러야 한다.
+REDEMPTION_NOISE = ("삭제", "변경", "특정기간 이내에 펀드를 환매")
+
+
+def product_redemption_note(conn, code):
+    """펀드 전체에 적용되는 환매수수료 문장. 없으면 None."""
+    for (text,) in conn.execute(
+            "SELECT text FROM chunks WHERE doc_id = ? AND text LIKE '%환매수수료%' "
+            "ORDER BY page", (code,)):
+        flat = " ".join(text.split())
+        for m in RE_REDEMPTION_SENTENCE.finditer(flat):
+            sent = m.group(0).strip()
+            if any(n in sent for n in REDEMPTION_NOISE):
+                continue
+            return sent
+    return None
 
 
 def extract(db_path=DEFAULT_DB_PATH):
@@ -204,6 +251,19 @@ def extract(db_path=DEFAULT_DB_PATH):
                 "switch_fee": rec.get("switch_fee"),
                 "page": pages.get(cc),
             })
+    conn.close()
+    return out
+
+
+def extract_product_notes(db_path=DEFAULT_DB_PATH):
+    conn = sqlite3.connect(db_path)
+    out = []
+    for (code,) in conn.execute(
+            "SELECT DISTINCT product_code FROM class_fees "
+            "WHERE product_code IS NOT NULL"):
+        note = product_redemption_note(conn, code)
+        if note:
+            out.append({"product_code": code, "redemption_note": note})
     conn.close()
     return out
 
@@ -247,7 +307,11 @@ def main():
         return
     with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
         json.dump(rows, f, ensure_ascii=False, indent=2)
-    print(f"→ {OUTPUT_JSON}")
+    notes = extract_product_notes(args.db)
+    with open(OUTPUT_PRODUCT_JSON, "w", encoding="utf-8") as f:
+        json.dump(notes, f, ensure_ascii=False, indent=2)
+    print(f"펀드 전체 환매수수료 문장 {len(notes)}건")
+    print(f"→ {OUTPUT_JSON}, {OUTPUT_PRODUCT_JSON}")
 
 
 if __name__ == "__main__":

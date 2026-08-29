@@ -165,6 +165,14 @@ CREATE TABLE class_charges (
     PRIMARY KEY (product_code, class_code)
 );
 CREATE INDEX IF NOT EXISTS idx_class_charges_product ON class_charges(product_code);
+
+-- 펀드 전체에 적용되는 환매수수료 문장. 클래스별 표가 없는 문서라도
+-- "이 투자신탁은 환매수수료를 부과하지 않습니다" 한 줄이면 답이 된다.
+DROP TABLE IF EXISTS product_charges;
+CREATE TABLE product_charges (
+    product_code TEXT PRIMARY KEY,
+    redemption_note TEXT
+);
 """
 
 
@@ -391,6 +399,20 @@ def load_class_charges(conn, path):
     return n
 
 
+def load_product_charges(conn, path):
+    if not os.path.exists(path):
+        return 0
+    with open(path, "r", encoding="utf-8") as f:
+        records = json.load(f)
+    n = 0
+    for r in records:
+        conn.execute(
+            "INSERT OR REPLACE INTO product_charges (product_code, redemption_note)"
+            " VALUES (?, ?)", (r["product_code"], r.get("redemption_note")))
+        n += 1
+    return n
+
+
 def main():
     parser = argparse.ArgumentParser(description="상품 팩트 3종을 SQLite로 적재")
     parser.add_argument("--db", default=DEFAULT_DB_PATH)
@@ -403,6 +425,8 @@ def main():
                         default=os.path.join(REPO_ROOT, "class_meaning.json"))
     parser.add_argument("--class-charges",
                         default=os.path.join(REPO_ROOT, "class_charges.json"))
+    parser.add_argument("--product-charges",
+                        default=os.path.join(REPO_ROOT, "product_charges.json"))
     args = parser.parse_args()
 
     conn = sqlite3.connect(args.db)
@@ -415,12 +439,13 @@ def main():
     n5 = load_fund_aum(conn, args.fund_aum)
     n6 = load_class_meaning(conn, args.class_meaning)
     n7 = load_class_charges(conn, args.class_charges)
+    n8 = load_product_charges(conn, args.product_charges)
 
     conn.commit()
     conn.close()
     print(
         f"product_master {n1}건, class_fees {n2}건, class_returns {n3}건, "
-        f"manager_info(참고용) {n4}건, fund_aum {n5}건, class_meaning {n6}건, class_charges {n7}건 → {args.db}"
+        f"manager_info(참고용) {n4}건, fund_aum {n5}건, class_meaning {n6}건, class_charges {n7}건, product_charges {n8}건 → {args.db}"
     )
 
 
