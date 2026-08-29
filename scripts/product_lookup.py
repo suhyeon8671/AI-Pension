@@ -35,14 +35,21 @@ GENERIC_WORDS = (
     "확정급여", "확정기여", "금융투자협회", "펀드코드", "명칭",
 )
 
-# 짧은 조각을 이만큼 넘는 상품이 함께 갖고 있으면 상품을 가리키지
-# 못한다. "퇴직연금"(상품 4개), "미래에셋"(여러 개)처럼 상투어 목록에
-# 없어도 여럿이 공유하는 짧은 말은 식별력이 없다.
-MAX_SHARED_PRODUCTS = 3
+# 짧은 조각을 이만큼 넘는 상품이 함께 갖고 있으면 상품을 가리키지 못한다.
+# "미래에셋"(수십 개), "퇴직연금"(4개)처럼 상투어 목록에 없어도 여럿이
+# 나눠 갖는 짧은 말은 식별력이 없다. 반대로 "솔로몬"(4개)이나 "한국투자
+# 골드플랜연금"(4개)은 형제 펀드끼리만 나눠 갖는 진짜 이름이라 살려야
+# 해서, 경계를 그 위에 둔다.
+MAX_SHARED_PRODUCTS = 5
 # 다만 긴 조각은 여럿이 공유해도 버리지 않는다. "한국투자골드플랜연금"은
 # 형제 펀드 4개가 나눠 갖지만 사용자가 실제로 부른 상품 이름이다 - 버리면
 # 아무것도 못 찾고, 남겨 두면 아래 echo 점수로 (채권)/(주식)을 가릴 수 있다.
 SHARED_PIECE_MAX_LEN = 8
+# 겹친 글자가 이만큼은 돼야 상품을 짚었다고 본다.
+MIN_MATCH_SCORE = 4
+# 이미 다른 후보가 설명한 자리 말고 새로 설명하는 글자가 이만큼은 있어야
+# "상품을 하나 더 물은 것"으로 친다.
+MIN_NEW_CHARS = 2
 
 # "A클래스" / "종류C-e" / "클래스 C-P" 처럼 클래스를 지목하는 표현
 CLASS_IN_QUERY_RE = re.compile(
@@ -75,6 +82,87 @@ def load_products(db_path=DEFAULT_DB_PATH):
 
 
 _CACHE = None
+_BACKGROUND_CACHE = {}
+
+
+def _common_pieces(q, nname, min_size=2):
+    """질문과 상품명에 함께 나오는 조각들을 순서에 매이지 않고 모은다.
+
+    difflib이 주는 matching_blocks는 순서가 어긋나면 못 쓴다. 사람은
+    이름의 말 순서를 바꿔 부르기 때문에("솔로몬 국공채 단기" <-> 원래
+    이름 "솔로몬단기국공채") 그 제약이 그대로 실패가 된다. 긴 조각부터
+    떼어 내고 남은 자리에서 또 찾는 식으로, 순서와 상관없이 겹치는 만큼
+    모은다."""
+    sm = difflib.SequenceMatcher(None, q, nname, autojunk=False)
+    qsegs, nsegs = [(0, len(q))], [(0, len(nname))]
+    pieces = []
+    while qsegs and nsegs:
+        best = None
+        for qi, (qa, qb) in enumerate(qsegs):
+            for ni, (na, nb) in enumerate(nsegs):
+                m = sm.find_longest_match(qa, qb, na, nb)
+                if m.size >= min_size and (best is None or m.size > best[0].size):
+                    best = (m, qi, ni)
+        if best is None:
+            break
+        m, qi, ni = best
+        pieces.append((m.a, m.a + m.size, q[m.a:m.a + m.size]))
+        qa, qb = qsegs.pop(qi)
+        na, nb = nsegs.pop(ni)
+        for s, e in ((qa, m.a), (m.a + m.size, qb)):
+            if e - s >= min_size:
+                qsegs.append((s, e))
+        for s, e in ((na, m.b), (m.b + m.size, nb)):
+            if e - s >= min_size:
+                nsegs.append((s, e))
+    return pieces
+
+
+def _piece_is_background(piece):
+    """상품을 짚어 주지 못하는 조각인가.
+
+    두 가지다. (1) 상품 종류를 나타내는 상투어("채권", "국공채"),
+    (2) 너무 많은 상품이 나눠 갖는 말("미래에셋"). 순서에 매이지 않고
+    조각을 모으다 보니 이런 말이 여기저기서 조금씩 붙어 점수가 오르는
+    일이 생겼다 - "미래에셋차세대Fun인덱스 위험등급" 질문에 엉뚱한
+    펀드가 '미래에셋'(4) + '등급'(2)으로 따라 올라왔다."""
+    if _is_generic(piece):
+        return True
+    # 숫자만으로 된 조각은 상품을 못 짚는다. "1,000만원 투자하면"의
+    # '100'이 'KRX100' 펀드에 걸려 엉뚱한 상품이 따라붙은 적이 있다.
+    if piece.isdigit():
+        return True
+    if len(piece) >= SHARED_PIECE_MAX_LEN:
+        return False  # 긴 말은 여럿이 나눠 가져도 진짜 이름이다
+    n = _BACKGROUND_CACHE.get(piece)
+    if n is None:
+        n = sum(1 for _, _, nn in _CACHE if piece in nn)
+        _BACKGROUND_CACHE[piece] = n
+    return n > MAX_SHARED_PRODUCTS
+
+
+def _match_blocks(q, nname):
+    """겹치는 조각들 -> (상품을 짚는 조각, 그러지 못하는 조각).
+
+    뒤쪽도 버리지는 않는다. 형제 펀드를 가르는 데는 쓸모가 있어서
+    (골드플랜 연금 (채권) vs (국공채)) 동점 처리에 쓴다."""
+    solid, background = [], []
+    for a, b, piece in _common_pieces(q, nname):
+        (background if _piece_is_background(piece) else solid).append(
+            (a, b, piece))
+    solid.sort()
+    background.sort()
+    return solid, background
+
+
+def _new_chars(blocks, covered):
+    """이 후보가 질문에서 새로 설명하는 글자 수(이미 설명된 자리는 뺀다)."""
+    n = 0
+    for a, b, _piece in blocks:
+        for i in range(a, b):
+            if not any(sa <= i < sb for sa, sb in covered):
+                n += 1
+    return n
 
 
 def find_products(question, db_path=DEFAULT_DB_PATH, limit=4):
@@ -83,21 +171,26 @@ def find_products(question, db_path=DEFAULT_DB_PATH, limit=4):
     처음엔 상품명에서 상투어("증권자투자신탁1호(주식)")를 지운 "핵심
     이름"이 질문에 통째로 들어 있는지로 맞췄는데, 상투어 목록에 있는
     "전환형"이 "목표전환형"의 일부라 잘려 나가는 등 단어를 깎는 방식
-    자체가 취약했다(KCGI코리아목표전환형 -> KCGI코리아목표). 그래서
-    질문과 상품명의 "가장 긴 공통 문자열"로 바꿨다 - 어디를 어떻게
-    부르든 겹치는 만큼 점수가 된다. 다만 그 겹친 부분이 상투어뿐이면
-    상품을 못 가리므로 버린다.
+    자체가 취약했다(KCGI코리아목표전환형 -> KCGI코리아목표).
+
+    다음엔 "가장 긴 공통 문자열" 하나로 점수를 매겼는데, 사람은 이름의
+    말 순서를 바꿔 부른다. "솔로몬 국공채 단기"는 원래 이름
+    "솔로몬단기국공채"와 통째로는 3글자('솔로몬')밖에 안 겹쳐서 아예
+    못 찾았다. 그래서 지금은 겹치는 조각을 전부 모아 그 합으로 센다
+    ('솔로몬' + '국공채' + '단기' = 8).
 
     후보를 추리는 규칙은 세 가지다.
 
-    1. 겹친 조각이 상투어뿐이면 버린다(GENERIC_WORDS).
-    2. 같은 조각을 여러 상품이 갖고 있으면 버린다. "퇴직연금"은 상품
-       4개에 들어 있어서, 그 말만 겹쳤다면 어느 하나를 가리킬 수 없다.
-    3. 질문의 같은 자리에 걸린 후보끼리는 하나만 남긴다. "미래에셋
-       프리미엄크레딧알파"는 "...크레딧초단기"와도 겹치는데, 둘 다
-       질문의 같은 글자를 두고 다투는 것이므로 상품 2개를 물은 게
-       아니다(예전엔 이걸 비교 질문으로 잘못 봤다). 반대로 "A와 B
-       비교해줘"는 서로 다른 자리에 걸리므로 둘 다 남는다.
+    1. 상품을 못 짚는 조각은 점수로 세지 않는다 - 상품 종류를 나타내는
+       상투어("채권")와, 너무 많은 상품이 나눠 갖는 말("미래에셋").
+    2. 남은 점수가 모자라거나 3글자 넘는 조각이 하나도 없으면 버린다.
+       2글자짜리가 우연히 몇 개 겹친 것으로는 상품을 짚었다고 못 한다.
+    3. 질문에서 새로 설명하는 데가 없는 후보는 버린다. "미래에셋
+       프리미엄크레딧알파" 질문에 "...크레딧초단기"가 같이 걸리지만,
+       그 후보가 짚는 글자는 이미 1등이 다 짚은 자리라 상품을 하나 더
+       물은 게 아니다. 반대로 "솔로몬 국공채 단기ㆍ중장기ㆍ장기"는
+       후보마다 '단기'/'중장기'/'장기'라는 제 몫의 자리가 있으므로
+       셋 다 남는다.
 
     돌려주는 것: [(product_code, product_name, 겹친 글자수)]"""
     global _CACHE
@@ -116,29 +209,40 @@ def find_products(question, db_path=DEFAULT_DB_PATH, limit=4):
 
     cand = []
     for code, name, nname in _CACHE:
-        sm = difflib.SequenceMatcher(None, q, nname, autojunk=False)
-        m = sm.find_longest_match(0, len(q), 0, len(nname))
-        if m.size < 4:
+        blocks, background = _match_blocks(q, nname)
+        if not blocks:
             continue
-        piece = q[m.a:m.a + m.size]
-        if _is_generic(piece):
+        score = sum(b - a for a, b, _ in blocks)
+        # 3글자 이상 되는 "상품을 짚는" 조각이 하나는 있어야 한다. 2글자
+        # 짜리나 배경어만 겹친 건 우연이다("미래에셋" + "등급").
+        if max(b - a for a, b, _ in blocks) < 3:
             continue
-        if (len(piece) < SHARED_PIECE_MAX_LEN
-                and sum(1 for _, _, n2 in _CACHE if piece in n2) > MAX_SHARED_PRODUCTS):
+        # 배경어도 겹친 자리로는 쳐 준다. 카탈로그 전체로 보면 흔한 말이라도
+        # ("단기", "장기") 형제 펀드를 가르는 건 바로 그 말이다.
+        all_blocks = sorted(blocks + background)
+        echo = sum(b - a for a, b, _ in all_blocks)
+        if echo < MIN_MATCH_SCORE:
             continue
-        # 같은 길이로 비긴 후보를 가를 때 쓴다: 이름 중 질문에 메아리친
-        # 글자가 얼마나 되는지. "골드플랜 연금 채권형"이면 '채권'까지
-        # 겹치는 (채권) 상품이 (국공채) 상품을 이긴다.
-        echo = sum(b.size for b in sm.get_matching_blocks() if b.size >= 2)
-        cand.append((m.size, echo, m.a, m.a + m.size, code, name))
+        cand.append((score, echo, code, name, all_blocks))
 
-    cand.sort(key=lambda c: (-c[0], -c[1], c[4]))
-    out, spans = [], []
-    for size, _echo, a, b, code, name in cand:
-        if any(a < sb and sa < b for sa, sb in spans):
-            continue
-        spans.append((a, b))
-        out.append((a, code, name, size))
+    cand.sort(key=lambda c: (-c[0], -c[1], c[2]))
+    out, covered = [], []
+    norm_by_code = {c: nn for c, _n, nn in _CACHE}
+    for score, _echo, code, name, blocks in cand:
+        if _new_chars(blocks, covered) < MIN_NEW_CHARS:
+            # 앞선 후보가 이미 짚은 자리만 짚었다. 다만 형제 펀드는 이름
+            # 앞부분을 나눠 갖기 때문에("솔로몬 국공채" + 단기/중장기/장기)
+            # 겹친 자리를 가리고 다시 맞춰 본다 - 질문의 다른 자리에 제 몫이
+            # 있으면 그건 진짜로 하나 더 물은 것이다.
+            masked = "".join(
+                "\x00" if any(sa <= i < sb for sa, sb in covered) else ch
+                for i, ch in enumerate(q))
+            retry = list(_common_pieces(masked, norm_by_code[code]))
+            if sum(b - a for a, b, _ in retry) < MIN_NEW_CHARS:
+                continue
+            blocks = sorted(retry)
+        covered.extend((a, b) for a, b, _ in blocks)
+        out.append((blocks[0][0], code, name, score))
         if len(out) >= limit:
             break
     # 사용자가 말한 순서대로 돌려준다. 점수 순으로 주면 "A랑 B 비교해줘"의
