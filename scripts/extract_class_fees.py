@@ -2142,7 +2142,7 @@ def _summary_grid(page, next_page=None, inherited=None):
                 flat = v.replace(" ", "")
                 if len(flat) > 24:
                     continue
-                if any(k in flat for k in ("투자시", "단위", "예시", "투자자가", "투자기간")):
+                if any(k in flat for k in ("투자시", "단위", "예시", "투자자가", "투자기간", "천원")):
                     continue
                 if _is_group_header(flat):
                     continue
@@ -2393,9 +2393,12 @@ def _summary_grid(page, next_page=None, inherited=None):
         label_col = max(0, min(field_by_col) - 1) if field_by_col else 0
         first_field_x = col_x0s[min(field_by_col)] if field_by_col else 1e9
         label_ws = [w for w in words if (w["x0"] + w["x1"]) / 2 < first_field_x - 2]
+        # 소수 2개 이상을 요구하면 판매보수·동종유형이 "-"인 클래스가
+        # 통째로 빠진다(KR5194450018 실측: 랩 전용 W클래스는 소수가
+        # 총보수 하나뿐이라 행 자체가 버려졌다). 정수(비용예시)까지
+        # 숫자로 세되 개수를 올려 잡는다.
         real_rows = [r for r in data_rows
-                     if sum(1 for v in r["cells"].values()
-                            if DECIMAL_RE.match(v.replace(" ", "").rstrip("%"))) >= 2]
+                     if sum(1 for v in r["cells"].values() if _isnum(v)) >= 3]
         # 열 구성을 앞 장에서 물려받은 경우엔 이 표가 정말 그 표의 연장인지
         # 행 단위로 다시 본다. 표 전체로만 보면 수익률표·운용전문인력표에도
         # 매핑이 씌워져 "비교지수(%)"나 "운용책임...전문인력"이 클래스로
