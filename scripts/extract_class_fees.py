@@ -2314,13 +2314,22 @@ def _summary_grid(page, next_page=None, inherited=None):
             matched_cols = 0
             best = {}
             for ci, x in enumerate(col_x0s):
-                near = min(range(len(prev_cols)),
-                           key=lambda k: abs(prev_cols[k] - x))
-                dist = abs(prev_cols[near] - x)
-                if dist > 8:
+                cand = [k for k in range(len(prev_cols))
+                        if abs(prev_cols[k] - x) <= 8]
+                if not cand:
                     continue
                 matched_cols += 1
-                if near in prev_fields and (near not in best or dist < best[near][0]):
+                # 앞 장 열 두 개가 똑같이 가까울 때 그냥 최근접을 쓰면
+                # 부동소수점 오차로 필드가 없는 쪽이 뽑혀 그 필드가 통째로
+                # 사라진다(KR518101012M 실측: 5.400000000000006 대
+                # 5.399999999999977 차이로 동종유형 열을 잃었다).
+                # 필드가 붙어 있는 열을 먼저 본다.
+                fielded = [k for k in cand if k in prev_fields]
+                if not fielded:
+                    continue
+                near = min(fielded, key=lambda k: abs(prev_cols[k] - x))
+                dist = abs(prev_cols[near] - x)
+                if near not in best or dist < best[near][0]:
                     best[near] = (dist, ci)
             for near, (_, ci) in best.items():
                 mapped[ci] = prev_fields[near]
