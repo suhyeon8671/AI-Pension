@@ -2725,9 +2725,27 @@ def summary_rows_for_doc(doc_id, pdf, pages):
             prev_cost = None
             for k in SUMMARY_COST_KEYS:
                 v = vals.get(f"cost_{k}")
-                if v:
-                    cost[k] = _pick_cost_number(v, prev_cost)
-                    prev_cost = cost[k]
+                if not v:
+                    continue
+                picked = _pick_cost_number(v, prev_cost)
+                # 비용예시는 천원 단위 정수다. 소수가 들어오면 그 칸은
+                # 비용예시가 아니라 다른 표(수익률)의 값이다
+                # (KR5118201004 실측: 수익률 4.88이 1년 비용예시 자리에
+                # 들어와 그 행이 보수 행처럼 보였다).
+                if not picked.replace(",", "").isdigit():
+                    continue
+                cost[k] = picked
+                prev_cost = picked
+
+            # 같은 클래스의 "투자실적 추이" 행이 보수 행으로 잡히는 일이
+            # 있다(KR5118201004 실측: "수수료미징구-오프라인(A)(%)
+            # 2005.04.27 3.52 4.64 4.88 2.88" - 수익률인데 총보수·동종유형
+            # 자리에 들어갔다). 보수표 행에는 판매보수든 총보수·비용이든
+            # 비용예시든 하나는 반드시 있는데 수익률 행에는 없다.
+            if (vals.get("distribution_fee") is None
+                    and vals.get("total_fee_and_cost") is None
+                    and not cost):
+                continue
 
             raw_comm = vals.get("sales_commission_desc")
             if raw_comm is None:
@@ -2780,8 +2798,20 @@ def summary_rows_for_doc(doc_id, pdf, pages):
                     return fixed
                 return v
 
+            # 보수 적용 기간이 나뉜 표가 있다(KR5147430065 실측: 클래스
+            # A가 "최초설정일~운용전환일 전일"과 "운용전환일~해지일" 두
+            # 행). 어느 기간의 값인지 알아야 답변할 때 고를 수 있으므로
+            # 그 문구를 그대로 남긴다.
+            period = None
+            for v in r["cells"].values():
+                flat_v = v.replace(" ", "")
+                if "전환일" in flat_v and ("까지" in flat_v or "부터" in flat_v):
+                    period = " ".join(v.split())
+                    break
+
             rows.append({
                 "class_code": code,
+                **({"fee_period": period} if period else {}),
                 "sales_commission_desc": desc,
                 "total_fee": total_fee.replace(" ", "").rstrip("%"),
                 "distribution_fee": clean("distribution_fee"),
@@ -2828,6 +2858,8 @@ def summary_rows_for_doc(doc_id, pdf, pages):
                 extra[f] = v
         if extra:
             extra["evidence"] = r.get("evidence")
+            if r.get("fee_period"):
+                extra["fee_period"] = r["fee_period"]
             keep.setdefault("additional_fee_rows", []).append(extra)
     return out
 
