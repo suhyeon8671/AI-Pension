@@ -1981,7 +1981,7 @@ def _label_class_code(label):
 # 나오기도 한다(KR5144420020 실측: 쪼개진 쪽을 못 걸러 마지막 클래스의
 # 이름이 각주 전체를 삼켰고, 그 안의 "투자실적/연평균" 때문에 수익률표
 # 행으로 오해받아 통째로 버려졌다).
-FOOTNOTE_RE = re.compile(r"^\(?주\s*\d*\)?$")
+FOOTNOTE_RE = re.compile(r"^\(?주\s*\d*(\)|$)")
 DASHES = ("-", "\u2013", "\u2014", "\u2212")
 SUMMARY_DOT_RE = re.compile("[\u318d\u00b7\uff65\u2219\u25aa\u2022\u30fb\u22c5\u2027\uf000-\uf0ff]")
 
@@ -2594,6 +2594,39 @@ def _summary_grid(page, next_page=None, inherited=None):
                         cand = (label + " " + " ".join(w["text"] for w in head)).strip()
                         if _label_class_code(cand) is not None:
                             label = cand
+            # 판매수수료 문구도 페이지 경계에서 끊긴다(KR514X450008 실측:
+            # "납입금액의"에서 장이 끝나고 "0.5%이내"가 다음 장 맨 위에
+            # 있다). 문구가 "...금액의"로 끝나면 아직 안 끝난 것이므로
+            # 그 칸의 x범위로 다음 장 첫머리를 이어 읽는다.
+            cm_col = next((c for c, f in field_by_col.items()
+                           if f == "sales_commission_desc"), None)
+            if (cm_col is not None and i == len(real_rows) - 1
+                    and next_page is not None
+                    and r["cells"].get(cm_col, "").replace(" ", "").endswith("금액의")):
+                lo = col_x0s[cm_col]
+                hi = (col_x0s[cm_col + 1] if cm_col + 1 < len(col_x0s) else table_x1)
+                nws = next_page.extract_words(x_tolerance=2, keep_blank_chars=False)
+                if nws:
+                    top0 = min(w["top"] for w in nws)
+                    add = [w for w in nws
+                           if w["top"] <= top0 + 20
+                           and lo - 1 <= (w["x0"] + w["x1"]) / 2 < hi]
+                    add.sort(key=lambda w: (round(w["top"], 1), w["x0"]))
+                    if add:
+                        r["cells"][cm_col] = (r["cells"][cm_col] + " "
+                                              + " ".join(w["text"] for w in add))
+            # 라벨이 각주까지 삼킨 채로 넘어오는 경우가 있다(격자상 이름
+            # 칸이 각주를 포함하는 큰 칸일 때). 그대로 두면 각주 속 다른
+            # 클래스 표기가 뒤에 있어 코드를 그쪽으로 뺏긴다
+            # (KR5152420028 실측: Ce가 각주 속 "종류 C형"에 밀려 C가 됐다).
+            # 코드를 이미 찾은 뒤에 나오는 각주 표시부터 잘라낸다.
+            parts = []
+            for t in label.split():
+                if parts and _label_class_code(" ".join(parts)) is not None \
+                        and (t == "-" or FOOTNOTE_RE.match(t)):
+                    break
+                parts.append(t)
+            label = " ".join(parts).strip() or label
             out.append({"label": label, "cells": r["cells"]})
         if out:
             return field_by_col, out, col_x0s, my_parts
