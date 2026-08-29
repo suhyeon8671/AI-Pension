@@ -2415,24 +2415,6 @@ def _summary_grid(page, next_page=None, inherited=None):
             # 표 끝까지 훑다가 각주("(주1) 1,000만원 지불하게 되는...")를
             # 끌어와 코드를 못 찾게 되는 사고가 있었다(KR5125450023 실측).
             if _label_class_code(label) is None:
-                # 클래스명 칸 하나가 값 행 여러 개에 걸쳐 세로로 병합된
-                # 표가 있다(KR5147430065 실측: 클래스 A의 보수가 운용전환일
-                # 앞뒤로 두 행인데 이름 칸은 하나다 - 행 y구간만 보면
-                # "수수료선취-"까지만 잡혀 코드를 못 찾았다). 이 행을
-                # 세로로 품고 있는 왼쪽 칸의 글자를 이름으로 본다.
-                mid = (r["top"] + r["bottom"]) / 2
-                span = [c for c in cells
-                        if c[0] < first_field_x - 2 and c[1] - 1 <= mid <= c[3] + 1]
-                if span:
-                    ws = [w for w in words
-                          if any(c[0] - 1 <= (w["x0"] + w["x1"]) / 2 <= c[2] + 1
-                                 and c[1] - 1 <= (w["top"] + w["bottom"]) / 2 <= c[3] + 1
-                                 for c in span)]
-                    ws.sort(key=lambda w: (round(w["top"], 1), w["x0"]))
-                    cand = " ".join(w["text"] for w in ws).strip()
-                    if _label_class_code(cand) is not None:
-                        label = cand
-            if _label_class_code(label) is None:
                 # 클래스명이 값 행보다 세로로 길게 이어지는 문서가 있다
                 # (KR5113470030 실측: 값 행 구간만 보면 "수수료미 징구-오"
                 # 처럼 잘려 클래스 코드를 못 찾는다). 이 행 시작부터 다음
@@ -2467,6 +2449,33 @@ def _summary_grid(page, next_page=None, inherited=None):
                             break
                         parts.append(t)
                     label = " ".join(parts).strip() or label
+            if _label_class_code(label) is None:
+                # 클래스명 칸 하나가 값 행 여러 개에 걸쳐 세로로 병합된
+                # 표가 있다(KR5147430065 실측: 클래스 A의 보수가 운용전환일
+                # 앞뒤로 두 행인데 이름 칸은 하나다 - 행 y구간만 보면
+                # "수수료선취-"까지만 잡혀 코드를 못 찾았다). 이 행을
+                # 세로로 품고 있는 왼쪽 칸의 글자를 이름으로 본다.
+                mid = (r["top"] + r["bottom"]) / 2
+                # 표 전체를 덮는 큰 칸("투자비용" 구획 칸 등)도 이 조건에
+                # 걸리는데, 그걸 쓰면 모든 행이 같은 라벨(=클래스명 전부)을
+                # 받아 마지막 코드 하나로 뭉개진다(KR5123490016 실측:
+                # 4개 클래스가 Ce 하나가 됐다). 작은 칸부터 보고, 코드가
+                # 읽히는 첫 칸에서 멈춘다.
+                span = sorted(
+                    (c for c in cells
+                     if c[0] < first_field_x - 2 and c[1] - 1 <= mid <= c[3] + 1),
+                    key=lambda c: (c[3] - c[1]) * (c[2] - c[0]))
+                for c in span:
+                    ws = [w for w in words
+                          if c[0] - 1 <= (w["x0"] + w["x1"]) / 2 <= c[2] + 1
+                          and c[1] - 1 <= (w["top"] + w["bottom"]) / 2 <= c[3] + 1]
+                    if not ws:
+                        continue
+                    ws.sort(key=lambda w: (round(w["top"], 1), w["x0"]))
+                    cand = " ".join(w["text"] for w in ws).strip()
+                    if _label_class_code(cand) is not None:
+                        label = cand
+                        break
             if _label_class_code(label) is None and i == len(real_rows) - 1 and next_page is not None:
                 # 클래스명이 페이지 경계를 넘어가는 문서가 있다
                 # (KR5116501001 실측: "수수료미징구- 온라인-"에서 페이지가
@@ -2564,9 +2573,14 @@ def summary_rows_for_doc(doc_id, pdf, pages):
                 if t in DASHES:
                     return True
                 try:
-                    return float(t.replace(",", "")) <= 10
+                    if float(t.replace(",", "")) <= 10:
+                        return True
                 except ValueError:
                     return False
+                # 소수점 자리에 쉼표를 찍은 원본 오타(1,807 = 1.807)는
+                # 아래 fix_comma_decimal이 되돌리므로 여기서 버리면 안 된다
+                mm = re.fullmatch(r"(\d),(\d{3})", t)
+                return bool(mm) and float(f"{mm.group(1)}.{mm.group(2)}") <= 10
 
             if not all(_pct_ok(vals.get(f)) for f in
                        ("total_fee", "distribution_fee", "peer_avg_fee",
