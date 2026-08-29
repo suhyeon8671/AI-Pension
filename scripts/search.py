@@ -78,6 +78,24 @@ LEXICAL_STOPWORDS = {
     # 몇 퍼센트"에서 '퍼센트'가 딱 한 청크에 있다는 이유로 1등을 차지했다.
     "퍼센트", "프로", "최대", "최소", "최근", "이상", "이하", "미만", "초과",
 }
+# 고객이 쓰는 말 -> 문서가 쓰는 말.
+#
+# 고객은 "세금"이라 하고 투자설명서는 "소득세/과세/세율"이라고 쓴다. 글자
+# 그대로 찾는 검색은 이 차이를 못 넘는다. 검증 세트의 "연금저축을
+# 중도해지하면 세금이 어떻게 되나요?"가 정답 청크(기타소득세 16.5%)를
+# 8등에 놓고 있었는데, 그 청크에는 "세금"이라는 말이 아예 없고 "소득세",
+# "세율"만 있었다.
+#
+# 답을 미리 넣는 게 아니라 같은 뜻의 말을 넓히는 것이다. 원래 질문의
+# 낱말보다 가볍게 쳐서(EXPANSION_WEIGHT) 질문에 없던 말이 질문에 있는
+# 말을 이기지 못하게 한다.
+# 실제로 검증한 것만 넣는다. 처음엔 해지->중도인출, 받는->수령 같은 것도
+# 넣었는데 엉뚱한 청크를 끌어올려 되레 나빠졌다. 넓히는 건 공짜가 아니다.
+DOMAIN_EXPANSIONS = {
+    "세금": ("소득세", "과세", "세율"),
+}
+EXPANSION_WEIGHT = 0.5
+
 # 한글/영문/숫자가 섞인 덩어리를 한 낱말로 본다("DC형에서", "1,000만원").
 _TERM_RE = re.compile(r"[가-힣A-Za-z0-9][가-힣A-Za-z0-9,.]*")
 
@@ -123,6 +141,7 @@ def lexical_term_groups(query):
 
     trigram 색인은 3글자 미만을 못 찾으므로 3글자 이상만 남긴다."""
     groups, seen = [], set()
+    expansions = []
     for raw in _TERM_RE.findall(query or ""):
         raw = raw.strip(",.")
         stem = _strip_particles(raw)
@@ -138,7 +157,24 @@ def lexical_term_groups(query):
             variants.append(t)
         if variants:
             groups.append(variants)
-    return groups
+        # 문서가 쓰는 말로 넓힌다. 2글자 알맹이("세금")는 색인에서 못 찾아
+        # 버려지므로, 조사를 다 뗀 형태로도 찾아본다.
+        bare = raw
+        for pcl in _PARTICLES:
+            if bare.endswith(pcl) and len(bare) > len(pcl):
+                bare = bare[: -len(pcl)]
+                break
+        for key in (raw, stem, bare):
+            for syn in DOMAIN_EXPANSIONS.get(key, ()):
+                if syn not in seen:
+                    seen.add(syn)
+                    expansions.append([syn])
+    return groups + expansions
+
+
+def _is_expansion(variants, query):
+    """이 묶음이 질문에 없던 말(넓힌 말)인지."""
+    return not any(v in (query or "") for v in variants)
 
 
 def lexical_terms(query):
@@ -175,10 +211,18 @@ def lexical_search(query, k=5, doc_type=None, product_code=None, db_path=DEFAULT
         for variants in groups:
             found = []
             for t in variants:
+                # trigram 색인은 3글자 미만을 못 찾는다. 그런 말("과세",
+                # "세율")도 줄 세우기에는 쓸모가 있으므로, 찾는 데는 안 쓰고
+                # 글자 그대로 세어 점수에만 반영한다.
                 try:
-                    df = conn.execute(
-                        "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH ?",
-                        [f'"{t}"']).fetchone()[0]
+                    if len(t) >= 3:
+                        df = conn.execute(
+                            "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH ?",
+                            [f'"{t}"']).fetchone()[0]
+                    else:
+                        df = conn.execute(
+                            "SELECT COUNT(*) FROM chunks WHERE text LIKE ?",
+                            [f"%{t}%"]).fetchone()[0]
                 except sqlite3.OperationalError:
                     continue
                 if df:
@@ -186,15 +230,37 @@ def lexical_search(query, k=5, doc_type=None, product_code=None, db_path=DEFAULT
             if not found:
                 continue
             t, df, w = min(found, key=lambda f: f[2])
-            weighted.append((w, [f[0] for f in found]))
-            # 너무 흔한 말은 찾는 대상에서 뺀다(가중치 계산에는 그대로 쓴다).
-            if df <= total * COMMON_TERM_RATIO:
-                query_terms.extend(f[0] for f in found)
+            # 너무 흔한 말은 점수에서도 뺀다. 찾는 대상에서는 빼면서
+            # 점수는 주고 있었는데 앞뒤가 안 맞는다 - "연금저축"(코퍼스의
+            # 6.3%)만 걸린 청크가 그 2.82점으로 "중도해지"(6.07)가 든
+            # 정답 청크를 밀어냈다.
+            if df > total * COMMON_TERM_RATIO:
+                continue
+            names = [f[0] for f in found]
+            if _is_expansion(names, query):
+                w *= EXPANSION_WEIGHT
+            weighted.append((w, names))
+            query_terms.extend(n for n in names if len(n) >= 3)
         if not weighted:
-            return []
-        if not query_terms:
-            # 다 흔하면 그중 가장 드문 묶음만 쓴다
-            query_terms = max(weighted, key=lambda g: g[0])[1]
+            # 다 흔한 말뿐이면 그중 가장 드문 묶음 하나로라도 찾는다.
+            for variants in groups:
+                found = []
+                for t in variants:
+                    try:
+                        df = conn.execute(
+                            "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH ?",
+                            [f'"{t}"']).fetchone()[0]
+                    except sqlite3.OperationalError:
+                        continue
+                    if df:
+                        found.append((t, df, math.log(1 + total / df)))
+                if found:
+                    _t, _df, w = min(found, key=lambda f: f[2])
+                    weighted.append((w, [f[0] for f in found]))
+            if not weighted:
+                return []
+            best = max(weighted, key=lambda g: g[0])
+            weighted, query_terms = [best], list(best[1])
 
         # 낱말 묶음마다 따로 찾아서 후보를 모은다.
         #
