@@ -31,6 +31,7 @@ import argparse
 import glob
 import json
 import os
+import bisect
 import re
 
 import pdfplumber
@@ -1985,6 +1986,22 @@ def _norm_header(s):
     return SUMMARY_DOT_RE.sub("·", s.replace(" ", ""))
 
 
+def _is_group_header(name):
+    """여러 칸을 아우르는 묶음 머리글인지 본다. 아래 칸들의 이름이 한 셀에
+    다 들어가 있는 표가 있는데(KR5194450018 실측: "판매 수수료 총 보수
+    판매보수"가 한 칸), 그대로 두면 그 중 하나로 매칭돼 판매수수료 칸이
+    판매보수로 잡힌다. 서로 다른 필드 이름이 둘 이상 들어 있으면 묶음
+    머리글로 본다("동종유형 총보수"나 "총보수·비용"처럼 그 자체가 한
+    이름인 것은 먼저 지우고 센다)."""
+    t = _norm_header(name)
+    for whole in ("동종유형총보수", "동종유형", "합성총보수·비용",
+                  "총보수·비용", "총보수비용", "총보수,비용"):
+        t = t.replace(whole, "|")
+    hits = t.count("|") + sum(t.count(k) for k in
+                              ("판매수수료", "판매보수", "총보수"))
+    return hits >= 2
+
+
 def _summary_column_field(name):
     """헤더 이름 → 필드. 못 알아보면 None. 긴 이름부터 본다."""
     n = _norm_header(name)
@@ -2029,7 +2046,11 @@ def _summary_grid(page, next_page=None, inherited=None):
     for t in page.find_tables():
         tbox = t.bbox          # 아래에서 t를 다른 뜻으로 다시 쓰므로 먼저 잡아둔다
         cells = [c for c in t.cells if c]
-        if len(cells) < 20:
+        # 앞 장에서 이어지는 표는 한두 행짜리라 칸이 얼마 안 된다
+        # (KR518101012M 실측: C-e 한 행뿐인 표가 19칸이라 통째로 버려졌다).
+        # 이어받을 열 구성이 있을 때만 기준을 낮춘다 - 뒤의 이어받기
+        # 검사(열 x일치·행 채움)가 엉뚱한 작은 표를 걸러 준다.
+        if len(cells) < (8 if inherited else 20):
             continue
         raw_x0s = sorted({round(c[0], 1) for c in cells})
         col_x0s = []
@@ -2123,6 +2144,8 @@ def _summary_grid(page, next_page=None, inherited=None):
                     continue
                 if any(k in flat for k in ("투자시", "단위", "예시", "투자자가", "투자기간")):
                     continue
+                if _is_group_header(flat):
+                    continue
                 header_names.setdefault(ci, []).append(v)
         def map_headers(names):
             out_map = {}
@@ -2151,24 +2174,37 @@ def _summary_grid(page, next_page=None, inherited=None):
         prev_parts = inherited[2] if inherited and len(inherited) > 2 else None
         if prev_parts and header_names and \
                 not {"total_fee", "distribution_fee"} <= set(field_by_col.values()):
-            joined_names = {ci: list(ps) for ci, ps in header_names.items()}
-            for ci in range(len(col_x0s)):
-                head = [t for x, ps in prev_parts
-                        if abs(x - col_x0s[ci]) <= 8 for t in ps]
-                if head:
-                    joined_names[ci] = head + joined_names.get(ci, [])
-            merged = map_headers(joined_names)
-            # 앞 장 조각을 붙였더니 이름이 완성됐다고 해서 이 표가 그 표의
-            # 연장이라는 뜻은 아니다(KR5118420062 실측: 다음 장 수익률표에
-            # 씌워져 "비교지수(%)"가 클래스로 잡혔다). 잡힌 칸들이 한 행에
-            # 대부분 실제로 채워져 있어야 받아들인다.
-            need_m = max(3, int(len(merged) * 0.7))
-            if {"total_fee", "distribution_fee"} <= set(merged.values()) and \
-                    any(sum(1 for ci in merged if ci in r["cells"]) >= need_m
-                        for r in grid[first_data:]):
-                field_by_col = merged
-                header_names = joined_names
-                inherited_need = need_m
+            # 두 장의 격자가 조금씩 어긋나 있어서 조각을 어느 열에 붙일지
+            # 두 가지로 본다: (1) x가 가장 가까운 열, (2) 그 조각이 실제로
+            # 들어가는 열 구간. 문서마다 맞는 쪽이 달라(KR5152420028은 1번,
+            # KR5113450111은 2번) 둘 다 시도하고 되는 쪽을 쓴다.
+            def near_cols(x):
+                return [ci for ci in range(len(col_x0s))
+                        if abs(x - col_x0s[ci]) <= 8]
+
+            def span_cols(x):
+                ci = bisect.bisect_right(col_x0s, x + 6) - 1
+                return [ci] if ci >= 0 else []
+
+            best = None
+            for pick in (near_cols, span_cols):
+                joined_names = {ci: list(ps) for ci, ps in header_names.items()}
+                for x, ps in prev_parts:
+                    for ci in pick(x):
+                        joined_names[ci] = list(ps) + joined_names.get(ci, [])
+                merged = map_headers(joined_names)
+                # 앞 장 조각을 붙였더니 이름이 완성됐다고 해서 이 표가 그
+                # 표의 연장이라는 뜻은 아니다(KR5118420062 실측: 다음 장
+                # 수익률표에 씌워져 "비교지수(%)"가 클래스로 잡혔다).
+                # 잡힌 칸들이 한 행에 실제로 채워져 있어야 받아들인다.
+                need_m = max(3, int(len(merged) * 0.7))
+                if {"total_fee", "distribution_fee"} <= set(merged.values()) and \
+                        any(sum(1 for ci in merged if ci in r["cells"]) >= need_m
+                            for r in grid[first_data:]):
+                    if best is None or len(merged) > len(best[0]):
+                        best = (merged, joined_names, need_m)
+            if best:
+                field_by_col, header_names, inherited_need = best
 
         # 세로줄이 값 구간에서 끊겨 있어 데이터 행에 그 열의 칸이 아예
         # 안 생기는 표가 있다(KR5127420034 실측: 헤더엔 "10년" 칸이 있는데
@@ -2492,8 +2528,11 @@ def summary_rows_for_doc(doc_id, pdf, pages):
                 # 각주까지 딸려온 라벨을 그대로 이름으로 쓰면
                 # "투자신탁투자비용주1)'1,000만원..."이 된다
                 # (KR5123365001 실측). 각주 표시 앞까지만 쓴다.
-                cut = re.split(r"\(?주\s*\d*\)", label)[0]
-                code = cut.replace(" ", "")[:20] or flat or None
+                cut = re.split(r"\(?주\s*\d*\)", label)[0].replace(" ", "")
+                # 표 왼쪽의 구획 이름("투자비용")까지 라벨에 딸려온다
+                for sec in ("투자비용", "분류", "투자목적및투자전략"):
+                    cut = cut.replace(sec, "")
+                code = cut[:20] or flat or None
             if not code:
                 continue
 
