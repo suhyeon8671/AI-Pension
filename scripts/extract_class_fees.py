@@ -3285,7 +3285,13 @@ def main():
         # 따져야 한다. 보강 함수 안에서 하면 그 함수가 일찍 return하는
         # 문서(클래스가 1개뿐이라 대조 기준이 없는 KR5123365001 등)가
         # 빠지므로 여기서 한다.
+        # 작성기준일은 문서 하나에 하나다 - 요약표 행에서만 찾히므로
+        # 상세표 보강으로 생긴 행에도 같이 붙인다(없으면 그 행만 숫자가
+        # "언제 기준"인지 모르는 상태가 된다).
+        doc_as_of = next((r.get("as_of") for r in rows if r.get("as_of")), None)
         for r in rows:
+            if doc_as_of:
+                r.setdefault("as_of", doc_as_of)
             r.setdefault("source_pages", [r["page"]])
             r.setdefault("field_source_pages", {})
         all_rows.extend(rows)

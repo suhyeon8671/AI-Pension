@@ -65,6 +65,14 @@ CREATE TABLE class_fees (
     cost_3y INTEGER,
     cost_5y INTEGER,
     cost_10y INTEGER,
+    -- 보수는 시점에 따라 바뀌는 값이라 "언제 기준"인지 없이 숫자만
+    -- 내보내면 틀린 답이 된다(간이투자설명서 자체가 작성기준일을 찍는다).
+    as_of TEXT,
+    -- 운용전환일 전/후로 보수가 나뉘는 상품(목표전환형)의 전환 후 값.
+    -- 전환일이 날짜가 아니라 "목표기준가격 도달"이라는 조건이라
+    -- conversion_trigger_nav_price(원)와 함께 본다.
+    total_fee_after_conversion REAL,
+    conversion_trigger_nav_price INTEGER,
     page INTEGER,
     confidence REAL
 );
@@ -177,8 +185,10 @@ def load_class_fees(conn, path):
             INSERT INTO class_fees
                 (product_code, class_code, sales_commission_desc, total_fee,
                  distribution_fee, peer_avg_fee, total_fee_and_cost,
-                 cost_1y, cost_2y, cost_3y, cost_5y, cost_10y, page, confidence)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 cost_1y, cost_2y, cost_3y, cost_5y, cost_10y,
+                 as_of, total_fee_after_conversion, conversion_trigger_nav_price,
+                 page, confidence)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 r["product_code"],
@@ -193,6 +203,9 @@ def load_class_fees(conn, path):
                 to_int(cp.get("3y")),
                 to_int(cp.get("5y")),
                 to_int(cp.get("10y")),
+                r.get("as_of"),
+                to_float(r.get("total_fee_after_conversion")),
+                r.get("conversion_trigger_nav_price"),
                 r["page"],
                 r["confidence"],
             ),
