@@ -263,6 +263,59 @@ def check_class_code_consistency(conn, rep):
             "보수표에만 실린 클래스는 수수료를 말할 때 통째로 빠진다")
 
 
+def check_source_conflicts(conn, rep):
+    """같은 문서의 두 표가 같은 값을 다르게 적은 곳을 센다.
+
+    간이투자설명서는 같은 값을 앞쪽 요약표와 뒤쪽 상세표에 두 번 싣는다.
+    총보수·판매보수는 어긋난 적이 없어서 "이 표가 이 상품의 보수표인가"를
+    가리는 데 쓰지만, 총보수·비용은 두 곳이 다른 문서가 있다.
+
+        KR5110501016 종류A
+        3쪽(요약표)  0.31 = 총보수 + 0.01 (전 클래스 일괄)
+        27쪽(상세표) 0.30 = 총보수 + 그 클래스 기타비용("-")
+
+    어느 쪽이 맞다고 판정할 근거가 없어서 둘 다 담는다. 여기서 세는 건
+    "고쳐야 할 오류"가 아니라 "문서가 두 곳에서 다르게 말하는 자리"다 -
+    답변에 그 값을 쓸 때 한 표 안에서만 뽑고 있는지 지켜보기 위한 것.
+
+    다만 총보수와 판매보수가 갈리면 그건 다른 얘기다. 이 둘이 갈리면
+    상세표를 잘못 읽은 것이므로 실패로 센다."""
+    rows = _rows(conn, "SELECT * FROM class_fee_sources")
+    by_key = collections.defaultdict(dict)
+    for r in rows:
+        by_key[(r["product_code"], r["class_code"], r["field"])][r["source"]] = r
+
+    soft, hard = [], []
+    for (pc, cc, field), bysrc in sorted(by_key.items()):
+        if len(bysrc) < 2:
+            continue
+        vals = {s: (r["value"] or "").strip() for s, r in bysrc.items()}
+        # 자릿수 표기만 다른 건 다른 값이 아니다("0.05"와 "0.050",
+        # "0.2350"과 "0.235"). 숫자로 견준다. 둘 다 "-"면 "문서가 없다고
+        # 적은 것"이라 이것도 같은 값이다.
+        nums = []
+        for v in vals.values():
+            try:
+                nums.append(float(v))
+            except ValueError:
+                nums.append(v)
+        if all(isinstance(n, float) for n in nums):
+            if max(nums) - min(nums) <= EPS:
+                continue
+        elif len(set(nums)) < 2:
+            continue
+        where = " / ".join(f"{s} {vals[s]}(p{bysrc[s]['page']})"
+                           for s in sorted(bysrc))
+        line = f"{pc} {cc} {field}: {where}"
+        (hard if field in ("total_fee", "distribution_fee") else soft).append(line)
+
+    rep.add("총보수·판매보수를 두 표가 다르게 적음", len(hard), len(by_key), hard,
+            "이 둘은 어긋난 적이 없는 값이다 - 갈리면 상세표를 잘못 읽은 것")
+    rep.add("두 표가 다르게 적은 값(총보수·비용 등)", len(soft), len(by_key), soft,
+            "문서가 두 곳에서 다르게 말하는 자리다. 고칠 게 아니라 "
+            "답변에 쓸 때 한 표 안에서만 뽑으면 된다", info=True)
+
+
 def check_as_of(conn, rep):
     bad = []
     rows = _rows(conn, "SELECT DISTINCT product_code, as_of FROM class_fees")
@@ -346,7 +399,7 @@ def main():
     rep = Report()
     for fn in (check_fee_internal, check_avg_vs_yearly, check_retail_vs_eligibility,
                check_lookalike_codes, check_class_code_consistency,
-               check_as_of, check_trade_rules,
+               check_source_conflicts, check_as_of, check_trade_rules,
                check_yearly_periods, check_returns_range):
         fn(conn, rep)
     conn.close()

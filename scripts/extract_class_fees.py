@@ -1470,6 +1470,127 @@ def _detail_fee_grids(pdf):
     return results
 
 
+_CLASS_LABELS_BY_DOC = None
+
+
+def _class_labels_for_doc(doc_id):
+    """이 상품 클래스들의 이름표(수수료방식·판매경로·계좌종류·속성).
+    class_meaning.json이 아직 없으면 조용히 빈 결과 - 있으면 좋고 없어도
+    기존 동작 그대로다(_known_classes_for_doc과 같은 관례)."""
+    global _CLASS_LABELS_BY_DOC
+    if _CLASS_LABELS_BY_DOC is None:
+        _CLASS_LABELS_BY_DOC = {}
+        fp = os.path.join(REPO_ROOT, "class_meaning.json")
+        if os.path.exists(fp):
+            with open(fp, "r", encoding="utf-8") as f:
+                for r in json.load(f):
+                    if r.get("class_code"):
+                        _CLASS_LABELS_BY_DOC.setdefault(r["product_code"], {})[
+                            r["class_code"]] = (
+                                r.get("fee_type"), r.get("channel"),
+                                r.get("account_type"),
+                                tuple(r.get("attributes") or ()))
+    return _CLASS_LABELS_BY_DOC.get(doc_id, {})
+
+
+def _spelling_key(code):
+    """붙임표·대소문자·괄호만 지운 열쇠. "같은 클래스다"가 아니라
+    "따져 볼 후보다"라는 뜻이다 - 같은지는 이름표가 정한다."""
+    return re.sub(r"\(.*?\)", "", code or "").replace("-", "").upper()
+
+
+FEE_SOURCE_FIELDS = ("total_fee", "distribution_fee",
+                     "peer_avg_fee", "total_fee_and_cost")
+
+
+def _record_source(row, source, page, values):
+    """이 값이 문서의 어느 표에서 왔는지 남긴다.
+
+    간이투자설명서는 같은 값을 앞쪽 요약표와 뒤쪽 상세표에 두 번 싣는데,
+    총보수·비용은 두 곳이 어긋나는 문서가 있다(KR5110501016 종류A:
+    3쪽 0.31 / 27쪽 0.30). 어느 쪽이 맞다고 판정할 근거가 없어서 한
+    쪽을 골라 담으면 그건 문서에 없는 판단을 우리가 하는 것이고, 고객이
+    다른 쪽 페이지를 열면 틀린 답이 된다. 둘 다 남긴다."""
+    seen = {(s["field"], s["source"])
+            for s in row.setdefault("value_sources", [])}
+    for field in FEE_SOURCE_FIELDS:
+        value = values.get(field)
+        if value is None or (field, source) in seen:
+            continue
+        row["value_sources"].append({
+            "field": field, "source": source,
+            "value": str(value), "page": page,
+        })
+
+
+DETAIL_COL_NAMES = {
+    "total_fee_and_cost": ("총보수비용", "총보수·비용", "총보수ㆍ비용"),
+    "peer_avg_fee": ("동종유형",),
+}
+
+
+def _column_by_name(label_by_col, field):
+    """값으로 열을 못 찾은 필드를 칸 이름으로 찾아본다.
+
+    이름만 보고 열을 정하는 건 위험하다 - "동종유형총보수"를 "총보수"로
+    잘못 읽어서 24개 문서가 어긋난 것처럼 보인 적이 있다. 그래서 이건
+    표를 채택할지 정하는 총보수·판매보수엔 절대 쓰지 않는다. 이미 그
+    두 열로 검증이 끝난 표에서, 두 표가 값을 다르게 적어 열을 특정하지
+    못한 두 필드에만 쓴다(안 그러면 상세표에 멀쩡히 있는 총보수·비용을
+    "-"로 담게 된다 - 정작 두 값을 남기려던 그 값이다).
+
+    "합성총보수비용"은 피투자 집합투자기구 보수까지 더한 다른 값이라
+    총보수·비용으로 보면 안 된다."""
+    for ci, name in enumerate(label_by_col):
+        n = (name or "").replace(" ", "")
+        if not any(w in n for w in DETAIL_COL_NAMES[field]):
+            continue
+        if field == "total_fee_and_cost" and "합성" in n:
+            continue
+        return ci
+    return None
+
+
+def _detail_total_fee(cols, total_col, total_sum_cols):
+    """상세표 행에서 총보수를 읽는다(단일 칸이거나 앞쪽 칸들의 합)."""
+    if total_col is not None:
+        return cols.get(total_col)
+    if total_sum_cols and all(c in cols for c in total_sum_cols):
+        return f"{sum(float(cols[c]) for c in total_sum_cols):.4f}"
+    return None
+
+
+def _same_class_in_summary(code, known, labels):
+    """상세표의 이 코드가 요약표의 어느 클래스와 같은 클래스인가.
+
+    같은 문서 안에서 요약표는 "A-e", 상세표는 "Ae"로 적는 일이 있다
+    (KR5110501016 실측). 그대로 두면 한 클래스가 class_fees에 두 행으로
+    들어가서, 수수료를 물으면 같은 클래스가 두 번 나온다.
+
+    그렇다고 표기가 비슷하다고 합치면 안 된다. 붙임표만 다른데 실제로는
+    다른 클래스인 짝이 있다(KR5114420027: C-P는 개인연금, Cp(퇴직연금)은
+    퇴직연금). 문서가 적어 둔 이름표가 완전히 같을 때만 같은 클래스로
+    본다 - 후보가 둘 이상이면 어느 쪽인지 못 정하므로 손대지 않는다."""
+    if not code or code in known:
+        return code
+    mine = labels.get(code)
+    if mine is None:
+        return code
+    key = _spelling_key(code)
+    twins = [k for k in known
+             if _spelling_key(k) == key and labels.get(k) == mine]
+    return twins[0] if len(twins) == 1 else code
+
+
+def _same_columns(prev_x0s, x0s, tol=8):
+    """두 페이지의 표가 같은 열 구성인가. 열 개수가 같고 각 열의 왼쪽
+    x좌표가 서로 tol 안에 있으면 이어지는 표로 본다. 페이지마다 표가
+    몇 pt씩 밀려 그려지는 문서가 있어 정확히 같기를 요구하면 안 된다."""
+    if len(prev_x0s) != len(x0s):
+        return False
+    return all(abs(a - b) <= tol for a, b in zip(prev_x0s, x0s))
+
+
 def enrich_with_detail_fee_table(doc_id, existing_rows):
     """요약표(앞쪽)엔 없고 "나.집합투자기구에 부과되는 보수 및 비용"류
     상세표에만 있는 클래스를 보강한다(KR5122420005 실측: 요약표엔 5개
@@ -1479,6 +1600,12 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
     않고, 이미 확인된(요약표에서 뽑힌) 클래스 값과 대조해서 이 문서
     안에서만 통하는 매핑을 매번 다시 찾는다 - 검증 안 되면(요약표 클래스가
     2개 미만이거나 값이 안 맞으면) 아무것도 안 채우고 조용히 넘어간다."""
+    # 여기 들어오는 행은 전부 앞쪽 요약표에서 뽑은 것이다. 이 값들이 어느
+    # 표에서 왔는지 먼저 남겨 둔다(아래에서 상세표 값을 덧붙인다).
+    for r in existing_rows:
+        _record_source(r, "요약표", r.get("page"),
+                       {f: r.get(f) for f in FEE_SOURCE_FIELDS})
+
     known = {r["class_code"]: r for r in existing_rows if r.get("class_code")}
     if len(known) < 2:
         return existing_rows
@@ -1493,8 +1620,10 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
     if not pdf_candidates:
         return existing_rows
 
+    labels = _class_labels_for_doc(doc_id)
     new_rows = []
     with pdfplumber.open(pdf_candidates[0]) as pdf:
+        carry = None  # 앞 페이지에서 검증된 열 구성(표가 페이지를 넘어갈 때 씀)
         for page_num, header_rows, grid_rows, col_x0s in _detail_fee_grids(pdf):
             # 칸 이름: 헤더 행들에서 열별로 이어붙인다(셀이 열을 알려주니
             # 좌표로 묶을 필요가 없다 - 예전엔 문서 제목/묶음 헤더가
@@ -1521,6 +1650,7 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
                     if mm:
                         code = mm[-1].group(1)
                         break
+                code = _same_class_in_summary(code, known, labels)
                 cols = {}
                 for ci, v in r["cells"].items():
                     if ci == 0:
@@ -1535,8 +1665,21 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
             n_cols = len(col_x0s)
 
             ref_rows = [r for r in raw_rows if r["class_code"] in known]
+            inherited = None
             if len(ref_rows) < 2:
-                continue
+                # 표가 페이지를 넘어가면 뒷장엔 요약표에 있는 클래스가 한
+                # 개도 없을 수 있다(KR5110501016 실측: 28쪽에 S-P, Crp,
+                # Crp-e, C-F, C-I, C-I2 - 요약표에 없는 클래스만 이어진다).
+                # 대조할 기준이 없다고 버리면 그 클래스들을 통째로 잃는데,
+                # 하필 퇴직연금 클래스가 거기 있다. 바로 앞 페이지에서
+                # 검증된 열 구성을 물려받는다(class_returns에서 쓴 것과
+                # 같은 방식). 앞 페이지가 아니거나 열 구성이 다르면
+                # 물려받지 않는다 - 무관한 표에 매핑을 씌우면 엉뚱한 행이
+                # 생긴다.
+                inherited = carry if (carry and carry["page"] == page_num - 1
+                                      and _same_columns(carry["col_x0s"], col_x0s)) else None
+                if inherited is None:
+                    continue
 
             # distribution_fee/peer_avg_fee/total_fee_and_cost: 특정 컬럼
             # 위치 하나가, 값이 있는 참조 행들에서 전부 일치하는지 테스트
@@ -1553,9 +1696,14 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
                         return col
                 return None
 
-            dist_col = find_column("distribution_fee")
-            peer_col = find_column("peer_avg_fee")
-            cost_col = find_column("total_fee_and_cost")
+            if inherited:
+                dist_col = inherited["dist_col"]
+                peer_col = inherited["peer_col"]
+                cost_col = inherited["cost_col"]
+            else:
+                dist_col = find_column("distribution_fee")
+                peer_col = find_column("peer_avg_fee")
+                cost_col = find_column("total_fee_and_cost")
 
             # total_fee: 단일 컬럼으로 안 맞으면 왼쪽부터 N개 합으로 시도
             # (관측: 항상 "관리 성격" 앞쪽 컬럼들의 합 - README 참고).
@@ -1567,10 +1715,10 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
             # 부터 N개"로 잡아야 한다.
             value_cols = sorted(
                 {c for r in ref_rows for c in r["cols"] if c != 0})
-            total_col = find_column("total_fee")
-            total_sum_n = None
-            total_sum_cols = None
-            if total_col is None:
+            total_col = inherited["total_col"] if inherited else find_column("total_fee")
+            total_sum_n = inherited["total_sum_n"] if inherited else None
+            total_sum_cols = inherited["total_sum_cols"] if inherited else None
+            if total_col is None and not inherited:
                 for n in range(2, min(6, len(value_cols)) + 1):
                     span = value_cols[:n]
                     complete_refs = [r for r in ref_rows if all(c in r["cols"] for c in span)]
@@ -1591,13 +1739,57 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
             # 자체가 이 필드를 클래스별로 안 보여줌"으로 보고, 새로 채우는
             # 행도 똑같이 "-"로 둔다(거짓으로 숫자를 지어내지 않되, 행
             # 전체를 놓치지도 않는다).
-            peer_all_dash = all(known[r["class_code"]]["peer_avg_fee"] == "-" for r in ref_rows)
-            if dist_col is None or cost_col is None:
-                continue
-            if peer_col is None and not peer_all_dash:
-                continue
+
+            # 이 페이지를 쓸지는 총보수와 판매보수 두 열로만 정한다.
+            #
+            # 요약표는 "정답지"가 아니라 "어느 칸이 무슨 값인지 알아내는
+            # 자"다. 상세표는 문서마다 칸 이름도 개수도 달라서(신탁업자보수
+            # / 수탁회사보수) 이름만 보고는 어느 칸이 총보수인지 못 정한다 -
+            # 요약표 값과 맞는 칸을 찾는 게 유일하게 확실한 방법이다.
+            #
+            # 그런데 여기서 한 걸음 더 나가 "네 필드가 다 맞아야 이 표를
+            # 쓴다"고 요구하고 있었다. 그러면 안 된다. 총보수·비용은 같은
+            # 문서 안에서 두 표가 다르게 적는 값이기 때문이다.
+            #
+            #   KR5110501016 실측
+            #   요약표(3쪽) : 총보수·비용 = 총보수 + 0.01  (전 클래스 일괄)
+            #   상세표(27쪽): 총보수·비용 = 총보수 + 그 클래스 기타비용
+            #                 (A는 기타비용이 "-"라 0.30, 요약표는 0.31)
+            #
+            # 값이 다른 건 상세표가 틀려서가 아니라 기준이 달라서다. 그걸
+            # 오류로 보고 페이지를 버리는 바람에 9개 페이지 53개 클래스의
+            # 보수가 통째로 빠져 있었다 - 그 안에 C-Pe(온라인 개인연금),
+            # Crp(퇴직연금) 같은 연금 클래스가 들어 있다.
+            #
+            # 총보수와 판매보수는 코퍼스 전체에서 어긋난 적이 없고 소수점
+            # 셋째 자리까지 맞아(0.245 / 0.303) "이 표가 이 상품의 보수표"
+            # 라는 걸 충분히 특정한다. 실제로 보수표가 아닌 페이지 23개
+            # (클래스 코드처럼 생긴 라벨이 있는 가입자격표 등)는 이 두
+            # 열부터 못 찾아 그대로 걸러진다.
+            #
+            # 동종유형총보수·총보수·비용은 열을 찾으면 채우고 못 찾으면
+            # 비운다(아래 cols.get(None, "-")가 "-"를 준다).
             if total_col is None and total_sum_n is None:
                 continue
+            if dist_col is None:
+                continue
+
+            # 여기부터는 총보수·판매보수로 "이 표가 이 상품의 보수표"임이
+            # 확인된 뒤다. 두 표가 값을 다르게 적어 열을 특정 못 한
+            # 나머지 두 필드는 칸 이름으로 찾아 채운다.
+            if cost_col is None:
+                cost_col = _column_by_name(label_by_col, "total_fee_and_cost")
+            if peer_col is None:
+                peer_col = _column_by_name(label_by_col, "peer_avg_fee")
+
+            # 이 페이지의 열 구성이 검증됐다. 표가 다음 장으로 이어지면
+            # 거기엔 대조할 클래스가 없을 수 있어서 이걸 물려준다.
+            carry = {
+                "page": page_num, "col_x0s": col_x0s,
+                "dist_col": dist_col, "peer_col": peer_col, "cost_col": cost_col,
+                "total_col": total_col, "total_sum_n": total_sum_n,
+                "total_sum_cols": total_sum_cols,
+            }
 
             for r in raw_rows:
                 if not r["class_code"]:
@@ -1614,11 +1806,25 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
                     # 사용자가 원본 표와 대조해서 지적). class_returns에서
                     # 쓴 것과 같은 원칙(FULL OUTER JOIN처럼 "어느 쪽에만
                     # 있는 정보든 다 살린다")을 여기에도 적용한다.
-                    # 숫자 필드(total_fee 등)는 요약표 것을 그대로 둔다 -
-                    # 이 페이지를 채택한 조건 자체가 "요약표 값과 정확히
-                    # 일치"라서 어느 쪽을 써도 같고, 요약표 쪽엔 비용예시
-                    # (cost_projection_per_10m)까지 있어 더 완전하다.
+                    # 숫자 필드(total_fee 등)는 요약표 것을 그대로 둔다.
+                    # 총보수·판매보수는 이 페이지를 채택한 조건 자체가
+                    # "요약표 값과 정확히 일치"라 어느 쪽을 써도 같고,
+                    # 요약표 쪽엔 비용예시(cost_projection_per_10m)까지
+                    # 있어 더 완전하다.
+                    #
+                    # 총보수·비용과 동종유형총보수는 다르다 - 두 표가 어긋날
+                    # 수 있어서 채택 조건에서 뺐다. 그래서 상세표가 뭐라고
+                    # 했는지를 value_sources에 따로 남긴다. 답변에 쓰는
+                    # 한 줄은 요약표 값이고 근거 페이지도 요약표 쪽이라,
+                    # 고객이 그 페이지를 열면 우리가 말한 숫자가 거기 있다.
                     cur = known[r["class_code"]]
+                    _record_source(cur, "상세표", page_num, {
+                        "total_fee": _detail_total_fee(
+                            cols, total_col, total_sum_cols),
+                        "distribution_fee": cols.get(dist_col),
+                        "peer_avg_fee": cols.get(peer_col),
+                        "total_fee_and_cost": cols.get(cost_col),
+                    })
                     if not cur.get("fee_breakdown"):
                         bd = [
                             {"label": label_by_col[c], "value": v}
@@ -1656,7 +1862,7 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
                     if c not in (dist_col, peer_col, cost_col)
                     and (total_col is None or c != total_col)
                 ]
-                new_rows.append({
+                fresh = {
                     "class_code": r["class_code"],
                     "sales_commission_desc": None,
                     "total_fee": total_fee,
@@ -1676,7 +1882,11 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
                     "method": "detail_table_cross_validated",
                     "confidence": 0.7,
                     "product_code": doc_id,
-                })
+                }
+                # 이 클래스는 상세표에만 있다 - 요약표 쪽 값은 애초에 없다.
+                _record_source(fresh, "상세표", page_num,
+                               {f: fresh.get(f) for f in FEE_SOURCE_FIELDS})
+                new_rows.append(fresh)
 
     return existing_rows + new_rows
 

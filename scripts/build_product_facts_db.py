@@ -79,6 +79,38 @@ CREATE TABLE class_fees (
 );
 CREATE INDEX idx_class_fees_product ON class_fees(product_code);
 
+-- 같은 값을 문서의 두 표가 다르게 적을 때, 어느 표가 무엇이라고 했는지
+-- (extract_class_fees.py).
+--
+-- 간이투자설명서는 앞쪽 "요약정보"와 뒤쪽 "13. 보수 및 수수료"에 같은
+-- 값을 두 번 싣는데, 총보수·비용은 두 곳이 어긋나는 문서가 있다.
+--
+--   KR5110501016 종류A
+--   3쪽(요약표)  총보수·비용 0.31   = 총보수 + 0.01 (전 클래스 일괄)
+--   27쪽(상세표) 총보수·비용 0.30   = 총보수 + 그 클래스 기타비용("-")
+--
+-- 어느 쪽이 맞다고 판정할 근거가 없다. 한 쪽을 골라 담으면 그건 문서에
+-- 없는 판단을 우리가 하는 것이고, 고객이 다른 쪽 페이지를 열면 틀린
+-- 답이 된다. 그래서 둘 다 담고 각각 어느 쪽에서 왔는지 남긴다.
+--
+-- class_fees는 "답변에 쓰는 한 줄"로 그대로 두고, 이 표는 그 한 줄이
+-- 어느 표의 값인지와 다른 표는 뭐라고 했는지를 보여 준다. 답변 규칙은
+-- "한 클래스의 값은 그 클래스가 실려 있는 표 한 곳에서만 가져오고
+-- 근거 페이지도 그 표로 단다" - 그래야 고객이 근거 페이지를 열었을 때
+-- 우리가 말한 숫자가 거기 있다.
+DROP TABLE IF EXISTS class_fee_sources;
+CREATE TABLE class_fee_sources (
+    product_code TEXT NOT NULL,
+    class_code TEXT NOT NULL,
+    field TEXT NOT NULL,        -- total_fee / distribution_fee / ...
+    source TEXT NOT NULL,       -- 요약표 / 상세표
+    value TEXT,
+    page INTEGER,
+    PRIMARY KEY (product_code, class_code, field, source)
+);
+CREATE INDEX IF NOT EXISTS idx_class_fee_sources_product
+    ON class_fee_sources(product_code);
+
 DROP TABLE IF EXISTS class_returns;
 CREATE TABLE class_returns (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -291,6 +323,25 @@ def load_class_fees(conn, path):
             ),
         )
         n += 1
+    return n
+
+
+def load_class_fee_sources(conn, path):
+    """class_fees.json의 각 행이 들고 있는 "어느 표가 뭐라고 했는지"를
+    편다. 값이 한 표에서만 나온 클래스도 그대로 담는다 - 나중에 "이
+    숫자는 몇 쪽에서 왔나"를 물을 때 필요하다."""
+    with open(path, "r", encoding="utf-8") as f:
+        records = json.load(f)
+    n = 0
+    for r in records:
+        for s in r.get("value_sources") or []:
+            conn.execute(
+                "INSERT OR REPLACE INTO class_fee_sources "
+                "(product_code, class_code, field, source, value, page) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (r["product_code"], r["class_code"], s["field"],
+                 s["source"], s.get("value"), s.get("page")))
+            n += 1
     return n
 
 
@@ -577,12 +628,13 @@ def main():
     n8 = load_product_charges(conn, args.product_charges)
     n9 = load_trade_rules(conn, args.trade_rules)
     n10 = load_yearly_returns(conn, args.yearly_returns)
+    n11 = load_class_fee_sources(conn, args.class_fees)
 
     conn.commit()
     conn.close()
     print(
         f"product_master {n1}건, class_fees {n2}건, class_returns {n3}건, "
-        f"manager_info(참고용) {n4}건, fund_aum {n5}건, class_meaning {n6}건, class_charges {n7}건, product_charges {n8}건, trade_rules {n9}건, yearly_returns {n10}건 → {args.db}"
+        f"manager_info(참고용) {n4}건, fund_aum {n5}건, class_meaning {n6}건, class_charges {n7}건, product_charges {n8}건, trade_rules {n9}건, yearly_returns {n10}건, class_fee_sources {n11}건 → {args.db}"
     )
 
 
