@@ -46,19 +46,22 @@ class Report:
     def __init__(self):
         self.checks = []
 
-    def add(self, name, bad, total, samples, note=""):
-        self.checks.append((name, bad, total, samples, note))
+    def add(self, name, bad, total, samples, note="", info=False):
+        # info=True는 "고칠 것"이 아니라 "알고 있어야 할 것"이다. 0이 되는
+        # 게 목표가 아니라서 실패로 세지 않는다.
+        self.checks.append((name, bad, total, samples, note, info))
 
     def show(self, limit):
         worst = 0
-        for name, bad, total, samples, note in self.checks:
-            mark = "OK " if not bad else "!! "
+        for name, bad, total, samples, note, info in self.checks:
+            mark = ".. " if info else "OK " if not bad else "!! "
             print(f"{mark}{name}: {bad}건" + (f" / {total}건 검사" if total else ""))
             if note and bad:
                 print(f"      {note}")
             for s in samples[:limit]:
                 print(f"      {s}")
-            worst = max(worst, bad)
+            if not info:
+                worst = max(worst, bad)
         return worst
 
 
@@ -168,24 +171,58 @@ def check_retail_vs_eligibility(conn, rep):
 
 
 def _norm_code(code):
-    """표기 차이만 지운다(C-e/Ce, 대소문자, "Cp(퇴직연금)"의 괄호)."""
+    """붙임표·대소문자·괄호만 지운 열쇠. 이건 "같은 클래스다"가 아니라
+    "따져 볼 후보다"라는 뜻일 뿐이다 - 같은지는 이름표가 정한다."""
     return re.sub(r"\(.*?\)", "", code).replace("-", "").upper()
+
+
+def check_lookalike_codes(conn, rep):
+    """붙임표만 다른데 뜻은 다른 클래스를 찾는다.
+
+    표기를 뭉개서 클래스를 합치고 싶어질 때가 있는데(수익률표는 "Ae",
+    보수표는 "A-e"), 그렇게 하면 안 되는 경우가 실제로 있다.
+
+        KR5114420027  C-P          수수료미징구-오프라인-개인연금
+                      Cp(퇴직연금)  수수료미징구-오프라인-퇴직연금
+
+    한 번 이걸 뭉갰다가 퇴직연금 행이 개인연금 행을 덮어써서 개인연금
+    클래스가 통째로 사라진 적이 있다. 여기 잡히는 짝은 절대 합치면
+    안 되는 짝이라, 목록을 남겨 두고 지켜본다."""
+    groups = collections.defaultdict(list)
+    for pc, cc, ft, ch, at, attrs in conn.execute(
+            "SELECT product_code, class_code, fee_type, channel, "
+            "account_type, attributes FROM class_meaning"):
+        groups[(pc, _norm_code(cc))].append((cc, (ft, ch, at, attrs)))
+
+    trap = []
+    for (pc, _key), rows in sorted(groups.items()):
+        if len(rows) < 2 or len({m for _c, m in rows}) < 2:
+            continue
+        trap.append(f"{pc}: " + " / ".join(
+            f"{c}={m[2] or m[1]}" for c, m in sorted(rows)))
+    rep.add("표기를 뭉개면 안 되는 클래스 짝", len(trap), 0, trap,
+            "표기를 뭉개면 개인연금과 퇴직연금이 한 행으로 합쳐진다 - "
+            "합치기 전에 이름표로 같은지 확인해야 한다", info=True)
 
 
 def check_class_code_consistency(conn, rep):
     """수익률·수수료 표에는 있는데 보수표에는 없는 클래스를 찾는다.
 
-    같은 클래스를 표마다 다르게 적어서(C-e / Ce) 갈라진 것이면 표기를
-    맞춰야 하고, 아예 없는 것이면 보수를 못 읽은 것이다. 뒤엣것이
-    특히 아픈데, 우리가 수수료를 말할 때 그 클래스를 통째로 빼고
-    말하게 되기 때문이다."""
+    표기가 갈린 것(A-e / Ae)이면 맞춰야 하고, 아예 없는 것이면 보수를
+    못 읽은 것이다. 뒤엣것이 특히 아픈데, 우리가 수수료를 말할 때 그
+    클래스를 통째로 빼고 말하게 되기 때문이다.
+
+    둘을 가르는 건 표기가 아니라 이름표다 - 붙임표만 다른데 뜻이 다른
+    짝이 실재하기 때문이다(check_lookalike_codes 참고)."""
     fees = collections.defaultdict(set)
     for pc, cc in conn.execute("SELECT product_code, class_code FROM class_fees"):
         fees[pc].add(cc)
     meaning = {}
-    for pc, cc, retail, acct in conn.execute(
-            "SELECT product_code, class_code, retail, account_type FROM class_meaning"):
-        meaning[(pc, cc)] = (retail, acct)
+    for pc, cc, retail, acct, ft, ch, attrs in conn.execute(
+            "SELECT product_code, class_code, retail, account_type, "
+            "fee_type, channel, attributes FROM class_meaning"):
+        meaning[(pc, cc)] = {"retail": retail, "acct": acct,
+                             "label": (ft, ch, acct, attrs)}
 
     elsewhere = collections.defaultdict(set)
     for table in ("class_returns", "class_charges", "yearly_returns"):
@@ -198,20 +235,28 @@ def check_class_code_consistency(conn, rep):
     spelling, missing = [], []
     by_kind = collections.Counter()
     for pc in sorted(fees):
-        norm = {_norm_code(c) for c in fees[pc]}
+        by_key = collections.defaultdict(set)
+        for c in fees[pc]:
+            by_key[_norm_code(c)].add(c)
         for cc in sorted(elsewhere[pc] - fees[pc]):
-            if _norm_code(cc) in norm:
-                spelling.append(f"{pc} {cc} (보수표에는 다른 표기로 있음)")
-                continue
-            retail, acct = meaning.get((pc, cc), (None, None))
-            kind = ("이름표 없음" if retail is None
-                    else "일반 가입 불가" if not retail
-                    else acct or "일반")
+            twins = by_key.get(_norm_code(cc), set())
+            mine = meaning.get((pc, cc))
+            # 보수표에 같은 열쇠의 코드가 하나뿐이고, 이름표까지 같을 때만
+            # "표기가 갈린 것"으로 본다.
+            if len(twins) == 1:
+                other = meaning.get((pc, next(iter(twins))))
+                if mine and other and mine["label"] == other["label"]:
+                    spelling.append(
+                        f"{pc} {cc} (보수표에는 {next(iter(twins))}로 있음)")
+                    continue
+            kind = ("이름표 없음" if mine is None
+                    else "일반 가입 불가" if not mine["retail"]
+                    else mine["acct"] or "일반")
             by_kind[kind] += 1
             missing.append(f"{pc} {cc} [{kind}]")
 
-    rep.add("같은 클래스를 표마다 다르게 적음", len(spelling), 0, spelling,
-            "C-e/Ce처럼 표기가 갈리면 클래스별 답이 둘로 쪼개진다")
+    rep.add("이름표가 같은데 표기가 갈린 클래스", len(spelling), 0, spelling,
+            "A-e/Ae처럼 갈리면 클래스별 답이 둘로 쪼개진다")
     rep.add("보수표에 없는 클래스", len(missing), 0,
             missing + [f"  -> {k} {v}건" for k, v in by_kind.most_common()],
             "요약정보 보수표에만 있는 클래스를 읽고 있어서, 뒤쪽 상세 "
@@ -300,7 +345,8 @@ def main():
     conn.row_factory = sqlite3.Row
     rep = Report()
     for fn in (check_fee_internal, check_avg_vs_yearly, check_retail_vs_eligibility,
-               check_class_code_consistency, check_as_of, check_trade_rules,
+               check_lookalike_codes, check_class_code_consistency,
+               check_as_of, check_trade_rules,
                check_yearly_periods, check_returns_range):
         fn(conn, rep)
     conn.close()

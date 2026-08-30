@@ -295,11 +295,12 @@ def load_class_fees(conn, path):
 
 
 _CANON = None
+_MEANING = None
 
 
 def _canon_key(code):
-    """표기 차이만 지운 열쇠. "A-e"와 "Ae", "Cp(퇴직연금)"과 "CP"가
-    같은 열쇠로 모인다."""
+    """표기 차이만 지운 열쇠. "A-e"와 "Ae"가 같은 열쇠로 모인다.
+    이건 "같은 클래스인지"의 답이 아니라 "따져 볼 후보"를 모으는 것뿐이다."""
     return re.sub(r"\(.*?\)", "", code or "").replace("-", "").upper()
 
 
@@ -309,17 +310,48 @@ def canonical_code(conn, product_code, class_code):
     같은 문서 안에서도 보수표는 "A-e", 뒤쪽 수익률 상세표는 "Ae"로
     적는 일이 있다(KR5110501016 실측). 그대로 두면 A-e를 물었을 때
     수수료는 나오는데 수익률은 안 나온다 - 한 클래스가 둘로 쪼개진다.
-    보수표 표기를 기준으로 삼는다(수수료가 답의 중심이라서)."""
-    global _CANON
+
+    그런데 표기만 보고 맞추면 안 된다. 붙임표를 지워 보면 같아 보이는데
+    실제로는 서로 다른 클래스인 경우가 있다(KR5114420027 실측).
+
+        C-P          수수료미징구-오프라인-개인연금
+        Cp(퇴직연금)  수수료미징구-오프라인-퇴직연금
+
+    처음엔 표기만 맞췄다가 퇴직연금 행이 개인연금 행을 덮어써서, 개인연금
+    클래스가 통째로 퇴직연금으로 둔갑했다. 연금 상품에서 이보다 나쁜
+    오류가 없다. 그래서 문서가 적어 둔 이름표로 같은 클래스임을 확인한
+    뒤에만 맞춘다.
+
+      - 보수표에 같은 열쇠의 코드가 둘 이상이면 손대지 않는다.
+        어느 쪽으로 맞춰야 할지 문서가 말해 주지 않는다
+        (KR5120420039 실측: 보수표에 C-E와 CE가 나란히 있다).
+      - 이름표(수수료방식·판매경로·계좌종류·속성)가 완전히 같을 때만
+        맞춘다.
+      - 한쪽이라도 이름표가 없으면 손대지 않는다. 같다는 걸 확인할
+        길이 없으면 쪼개진 채로 두는 편이 낫다."""
+    global _CANON, _MEANING
     if _CANON is None:
-        _CANON = {}
+        by_key = {}
         for pc, cc in conn.execute(
                 "SELECT product_code, class_code FROM class_fees "
                 "WHERE class_code IS NOT NULL"):
-            _CANON.setdefault((pc, _canon_key(cc)), cc)
+            by_key.setdefault((pc, _canon_key(cc)), set()).add(cc)
+        _CANON = {k: next(iter(v)) for k, v in by_key.items() if len(v) == 1}
+        _MEANING = {}
+        for pc, cc, ft, ch, at, attrs in conn.execute(
+                "SELECT product_code, class_code, fee_type, channel, "
+                "account_type, attributes FROM class_meaning"):
+            _MEANING[(pc, cc)] = (ft, ch, at, attrs)
     if not class_code:
         return class_code
-    return _CANON.get((product_code, _canon_key(class_code)), class_code)
+    target = _CANON.get((product_code, _canon_key(class_code)))
+    if target is None or target == class_code:
+        return class_code
+    mine = _MEANING.get((product_code, class_code))
+    theirs = _MEANING.get((product_code, target))
+    if mine is None or theirs is None or mine != theirs:
+        return class_code
+    return target
 
 
 def load_class_returns(conn, path):
@@ -427,7 +459,11 @@ def load_class_meaning(conn, path):
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                r["product_code"], canonical_code(conn, r["product_code"], r["class_code"]), r.get("fee_type"),
+                # class_meaning은 이름표의 출처라서 표기를 손대지 않는다.
+                # (product_code, class_code)가 기본키라 표기를 맞추면 뜻이
+                # 다른 두 행이 서로를 덮어쓴다 - 실제로 KR5114420027의
+                # 개인연금 행이 퇴직연금 행에 덮여 사라진 적이 있다.
+                r["product_code"], r["class_code"], r.get("fee_type"),
                 r.get("channel"), r.get("account_type"),
                 ",".join(r.get("attributes") or []),
                 1 if r.get("retail") else 0,
@@ -530,10 +566,13 @@ def main():
 
     n1 = load_product_master(conn, args.product_master)
     n2 = load_class_fees(conn, args.class_fees)
+    # class_meaning이 먼저다 - 표기가 갈린 클래스를 맞출지 말지를
+    # 이름표로 판단하기 때문에(canonical_code 참고), 이름표가 DB에
+    # 들어와 있어야 한다.
+    n6 = load_class_meaning(conn, args.class_meaning)
     n3 = load_class_returns(conn, args.class_returns)
     n4 = load_manager_info(conn, args.manager_info)
     n5 = load_fund_aum(conn, args.fund_aum)
-    n6 = load_class_meaning(conn, args.class_meaning)
     n7 = load_class_charges(conn, args.class_charges)
     n8 = load_product_charges(conn, args.product_charges)
     n9 = load_trade_rules(conn, args.trade_rules)
