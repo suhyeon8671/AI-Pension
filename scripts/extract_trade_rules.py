@@ -199,31 +199,42 @@ def extract(db_path=DEFAULT_DB_PATH):
     out = []
     for code in codes:
         found = {}
-        # 본문 청크에서 먼저 찾고, 없으면 표에서 찾는다. 표로만 잡힌
-        # 문서가 있다(칸이 뒤섞여 읽기는 나쁘지만 없는 것보다 낫다).
-        for sql, col in (("SELECT page, text FROM chunks WHERE doc_id = ? ORDER BY page", 1),
-                         ("SELECT page, row_text FROM tables WHERE doc_id = ? ORDER BY page", 1)):
-            for row in conn.execute(sql, (code,)):
-                for kind, patterns in SECTIONS:
-                    if kind in found:
-                        continue
-                    body = _section(row[col], patterns)
-                    if body:
-                        found[kind] = (body, row[0])
+        # 표의 칸을 먼저 본다. 예전엔 본문 글자를 먼저 봤는데, 같은 상품을
+        # 두 방식으로 뽑아 견줘 보니 글자 쪽이 조건 하나를 통째로 빠뜨리고
+        # 도표 잔해까지 딸려 오는 경우가 있었다.
+        #
+        #   글자: "(1) 오후 5시 이전에 ... 2영업일 ... T일 T+1일 자금납입일
+        #          집합투자증권 매입일 (매입청구일) (기준가적용일)"
+        #          <- 경과 후 조건이 없고 도표 글자가 섞였다
+        #   셀  : "· 17시 이전 : 2영업일 기준가 매입
+        #          · 17시 경과 후 : 3영업일 기준가 매입"
+        #
+        # 값이 서로 어긋나는 건 아니었지만(영업일 숫자는 같다) 셀 쪽이
+        # 더 온전하고 짧아서 답변에 그대로 쓰기 좋다.
+        for page, dj in conn.execute(
+                "SELECT page, data_json FROM tables WHERE doc_id = ? ORDER BY page",
+                (code,)):
+            try:
+                rows = json.loads(dj)
+            except (ValueError, TypeError):
+                continue
+            for kind, body in _from_cells(rows).items():
+                if kind not in found:
+                    found[kind] = (body, page)
             if len(found) == len(SECTIONS):
                 break
 
+        # 표로 안 잡힌 문서는 본문 절을 읽는다(원래 서술형인 문서가 있다).
         if len(found) < len(SECTIONS):
-            for page, dj in conn.execute(
-                    "SELECT page, data_json FROM tables WHERE doc_id = ? ORDER BY page",
-                    (code,)):
-                try:
-                    rows = json.loads(dj)
-                except (ValueError, TypeError):
-                    continue
-                for kind, body in _from_cells(rows).items():
-                    if kind not in found:
-                        found[kind] = (body, page)
+            for sql, col in (("SELECT page, text FROM chunks WHERE doc_id = ? ORDER BY page", 1),
+                             ("SELECT page, row_text FROM tables WHERE doc_id = ? ORDER BY page", 1)):
+                for row in conn.execute(sql, (code,)):
+                    for kind, patterns in SECTIONS:
+                        if kind in found:
+                            continue
+                        body = _section(row[col], patterns)
+                        if body:
+                            found[kind] = (body, row[0])
                 if len(found) == len(SECTIONS):
                     break
 
