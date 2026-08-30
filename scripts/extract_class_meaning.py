@@ -167,6 +167,64 @@ def _parse(text):
     return found
 
 
+# 코드만 든 칸("C", "C-Pe", "종류A")을 알아보기 위한 모양.
+RE_BARE_CODE = re.compile(r"^(?:종류)?([A-Za-z][A-Za-z0-9가-힣\-]{0,12})$")
+
+
+def _parse_label_only(text):
+    """코드 없이 이름표만 든 칸을 읽는다("수수료미징구-오프라인- 기관")."""
+    t = _squash(text)
+    fee = RE_FEE.search(t)
+    if not fee:
+        return None
+    ch = RE_CHANNEL.search(t[fee.end(): fee.end() + _GAP])
+    if not ch or ch.start() != 0:
+        return None
+    channel = ch.group(1)
+    after = t[fee.end() + ch.end():]
+    attrs_raw = RE_ATTRS.match(after).group(1)
+    # 이름표 칸이면 뒤에 다른 말이 붙지 않는다. 붙어 있으면 다른 칸이
+    # 섞인 것이므로 쓰지 않는다.
+    if after[len(attrs_raw):].strip():
+        return None
+    return {
+        "fee_type": fee.group(1),
+        "channel": channel,
+        "attributes": [p for p in re.split(r"[-,]", attrs_raw) if p],
+        "raw_label": f"수수료{fee.group(1)}-{channel}{attrs_raw}",
+    }
+
+
+def _parse_row(cells):
+    """한 줄의 칸들에서 이름표를 읽는다.
+
+    줄을 통째로 이어 붙이면 안 된다. 명칭표가 한 줄에 (코드, 라벨,
+    펀드코드) 쌍을 두 벌씩 싣는 문서가 있어서, 앞 쌍의 펀드코드가 뒤
+    쌍의 클래스 코드에 들러붙는다("...오프라인A8183S-P..." -> 코드를
+    "A8183S-P"로 읽음). 칸 짝으로 읽어야 정확하다."""
+    out = {}
+    cells = [(c or "") for c in cells]
+    for i, cell in enumerate(cells):
+        # 칸 하나에 라벨과 코드가 다 든 경우
+        for cc, rec in _parse(cell).items():
+            out.setdefault(cc, rec)
+        # 라벨 칸 + 바로 앞 코드 칸
+        label = _parse_label_only(cell)
+        if not label or i == 0:
+            continue
+        for j in range(i - 1, -1, -1):
+            prev = _squash(cells[j])
+            if not prev:
+                continue
+            m = RE_BARE_CODE.match(prev)
+            if m:
+                code = m.group(1).strip("-")
+                if code:
+                    out.setdefault(code, dict(label, class_code=code))
+            break
+    return out
+
+
 def _describe(rec):
     """고객에게 보여 줄 말. 코드 대신 이걸 쓴다."""
     account = next((a for a in rec["attributes"] if _match_any(a, ACCOUNT_TYPES)), None)
@@ -200,17 +258,35 @@ def extract(db_path=DEFAULT_DB_PATH):
     out = []
     for code in codes:
         merged, pages = {}, {}
-        # 표에서 먼저 찾고, 못 찾으면 본문 청크에서 찾는다. 이름표 표가
-        # 표로 안 잡힌 문서가 있다.
-        for sql in ("SELECT page, row_text AS t FROM tables WHERE doc_id = ?",
-                    "SELECT page, text AS t FROM chunks WHERE doc_id = ?"):
-            for row in conn.execute(sql, (code,)):
-                for cc, rec in _parse(row["t"]).items():
+        # 표는 "줄 단위"로 읽는다. 표 전체를 한 덩어리 글로 평탄화하면
+        # 아랫줄의 칸이 윗줄 라벨에 붙어 엉뚱하게 짝지어진다. 실제로
+        # KR515302022M의 CI가 "수수료미징구-오프라인-고액"인데 옆줄과
+        # 섞여 "수수료선취-오프라인"으로 읽혔다 - 고액 전용 클래스를
+        # 일반 고객이 살 수 있는 것으로 답하게 되는 오류다.
+        #
+        # 한 줄 안에서는 붙여도 된다. 코드 칸과 라벨 칸이 나뉜 표가
+        # 있어서(["종류A", "수수료선취-오프라인", "98292"]) 칸 하나씩만
+        # 보면 그런 표를 통째로 놓친다.
+        for page, dj in conn.execute(
+                "SELECT page, data_json FROM tables WHERE doc_id = ?", (code,)):
+            try:
+                rows = json.loads(dj)
+            except (ValueError, TypeError):
+                continue
+            for row in rows:
+                for cc, rec in _parse_row(row).items():
                     if cc not in merged:
                         merged[cc] = rec
-                        pages[cc] = row["page"]
-            if merged:
-                break
+                        pages[cc] = page
+        # 표로 안 잡힌 문서를 위해 본문 청크도 본다(줄 단위로).
+        if not merged:
+            for page, text in conn.execute(
+                    "SELECT page, text FROM chunks WHERE doc_id = ?", (code,)):
+                for line in (text or "").splitlines():
+                    for cc, rec in _parse(line).items():
+                        if cc not in merged:
+                            merged[cc] = rec
+                            pages[cc] = page
 
         for cc, rec in sorted(merged.items()):
             out.append({
