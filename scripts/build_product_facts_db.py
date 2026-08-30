@@ -173,6 +173,24 @@ CREATE INDEX IF NOT EXISTS idx_class_charges_product ON class_charges(product_co
 -- 조건문이라 문장을 그대로 담는다. 기준시각이 문서마다 다르고
 -- (15시 30분 / 오후 5시 / 17시) 시각별로 적용일이 갈리기 때문에,
 -- "제2영업일" 하나만 뽑으면 틀린 답이 된다.
+-- 해마다의 수익률 (extract_yearly_returns.py).
+-- class_returns의 연평균(누적)과는 다른 값이다. "최근 3년 -31.08%"는
+-- 3년을 묶은 값이고, "작년에 얼마 벌었나"는 여기 있다.
+-- period를 함께 담는 이유: "3년차"가 몇 년 몇 월부터인지는 문서마다
+-- 다르다(24.01.01~24.12.31 / 24.05.20~25.05.19). 년차만 말하면 어느
+-- 기간인지 알 수 없다.
+DROP TABLE IF EXISTS yearly_returns;
+CREATE TABLE yearly_returns (
+    product_code TEXT NOT NULL,
+    row_kind TEXT NOT NULL,     -- class_return / fund / benchmark
+    class_code TEXT,
+    year_rank INTEGER NOT NULL, -- 최근 N년차
+    period TEXT,
+    return_pct REAL,
+    page INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_yearly_returns_product ON yearly_returns(product_code);
+
 DROP TABLE IF EXISTS trade_rules;
 CREATE TABLE trade_rules (
     product_code TEXT NOT NULL,
@@ -442,6 +460,22 @@ def load_trade_rules(conn, path):
     return n
 
 
+def load_yearly_returns(conn, path):
+    if not os.path.exists(path):
+        return 0
+    with open(path, "r", encoding="utf-8") as f:
+        records = json.load(f)
+    n = 0
+    for r in records:
+        conn.execute(
+            "INSERT INTO yearly_returns (product_code, row_kind, class_code,"
+            " year_rank, period, return_pct, page) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (r["product_code"], r["row_kind"], r.get("class_code"),
+             r["year_rank"], r.get("period"), r.get("return_pct"), r.get("page")))
+        n += 1
+    return n
+
+
 def main():
     parser = argparse.ArgumentParser(description="상품 팩트 3종을 SQLite로 적재")
     parser.add_argument("--db", default=DEFAULT_DB_PATH)
@@ -454,6 +488,8 @@ def main():
                         default=os.path.join(REPO_ROOT, "class_meaning.json"))
     parser.add_argument("--class-charges",
                         default=os.path.join(REPO_ROOT, "class_charges.json"))
+    parser.add_argument("--yearly-returns",
+                        default=os.path.join(REPO_ROOT, "yearly_returns.json"))
     parser.add_argument("--trade-rules",
                         default=os.path.join(REPO_ROOT, "trade_rules.json"))
     parser.add_argument("--product-charges",
@@ -472,12 +508,13 @@ def main():
     n7 = load_class_charges(conn, args.class_charges)
     n8 = load_product_charges(conn, args.product_charges)
     n9 = load_trade_rules(conn, args.trade_rules)
+    n10 = load_yearly_returns(conn, args.yearly_returns)
 
     conn.commit()
     conn.close()
     print(
         f"product_master {n1}건, class_fees {n2}건, class_returns {n3}건, "
-        f"manager_info(참고용) {n4}건, fund_aum {n5}건, class_meaning {n6}건, class_charges {n7}건, product_charges {n8}건, trade_rules {n9}건 → {args.db}"
+        f"manager_info(참고용) {n4}건, fund_aum {n5}건, class_meaning {n6}건, class_charges {n7}건, product_charges {n8}건, trade_rules {n9}건, yearly_returns {n10}건 → {args.db}"
     )
 
 

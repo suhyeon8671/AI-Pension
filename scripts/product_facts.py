@@ -26,6 +26,9 @@ MAX_CLASS_LINES = 5
 INTENT_KEYWORDS = {
     "fee": ("총보수", "보수", "수수료", "비용", "판매보수", "얼마나 떼", "비싸", "싸"),
     "return": ("수익률", "성과", "얼마나 벌", "수익", "실적", "올랐", "떨어졌"),
+    # "작년에 얼마 벌었어?" - 연평균(누적)과 다른 값이라 따로 낸다.
+    "yearly": ("작년", "재작년", "해마다", "연도별", "년도별", "매년", "해별",
+               "올해", "지난해", "년에는", "년 수익", "연간 수익"),
     "risk": ("위험등급", "위험", "등급"),
     "aum": ("설정액", "순자산", "규모", "자산총액", "얼마나 큰"),
     "cost_projection": ("비용예시", "1,000만원", "1000만원", "천만원", "투자하면"),
@@ -244,6 +247,39 @@ def product_facts(code, class_code=None, intents=None, db_path=DEFAULT_DB_PATH):
                     lines.append(f"    - {_label(cc, meaning)}: {c['redemption_fee']}")
                     ev.append({"table": "class_charges", "product_code": code,
                                "class_code": cc, "page": c.get("page")})
+
+        if "yearly" in intents:
+            # 연평균은 여러 해를 묶은 값이라 "작년 성과"와 다르다. 해마다의
+            # 값은 따로 실려 있고, 몇 년 몇 월 구간인지도 같이 말해야 한다
+            # (문서마다 회계연도 시작이 다르다).
+            yr = list(conn.execute(
+                "SELECT * FROM yearly_returns WHERE product_code = ? "
+                "AND row_kind = 'class_return'"
+                + (" AND class_code = ?" if class_code else "")
+                + " ORDER BY class_code, year_rank",
+                [code] + ([class_code] if class_code else [])))
+            if not yr:
+                lines.append("  [연도별 수익률] 문서에서 확인하지 못했습니다.")
+            else:
+                by_class = {}
+                for r in yr:
+                    by_class.setdefault(r["class_code"], []).append(r)
+                # 클래스가 여럿이면 다 늘어놓지 않는다. 연금 계좌용을
+                # 앞세우고 하나만 보인다 - 해마다 값은 클래스별로 소수점
+                # 아래만 다르다.
+                pick = next((c for c in by_class
+                             if (meaning.get(c) or {}).get("account_type")
+                             and (meaning.get(c) or {}).get("retail")),
+                            next(iter(by_class)))
+                lines.append(f"  [연도별 수익률] {_label(pick, meaning)} 기준")
+                for r in by_class[pick]:
+                    lines.append(f"    - 최근 {r['year_rank']}년차"
+                                 f"({r['period']}): {r['return_pct']}%")
+                    ev.append({"table": "yearly_returns", "product_code": code,
+                               "class_code": pick, "page": r["page"]})
+                if len(by_class) > 1:
+                    lines.append(f"    (다른 클래스 {len(by_class) - 1}개도 "
+                                 "있으며 소수점 아래에서만 차이가 납니다)")
 
         if "timing" in intents:
             rules = {r["kind"]: dict(r) for r in conn.execute(
