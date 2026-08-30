@@ -501,6 +501,38 @@ def find_return_rows_on_page(page, page_num, section="가", known_classes=None):
 RETURN_PERIOD_RE = re.compile(r"^(?:최근)?(\d)년(?:차)?$")
 RETURN_LABEL_NAMES = ("종류", "클래스", "구분", "종류(클래스)")
 
+# "24.01.01~24.12.31" 같은 기간. 물결표를 문서마다 다르게 쓴다.
+TABLE_PERIOD_RE = re.compile(
+    r"(\d{2,4}[.\-]\d{1,2}[.\-]\d{1,2})\s*[~∼〜～]\s*"
+    r"(\d{2,4}[.\-]\d{1,2}[.\-]\d{1,2})")
+
+
+def _period_end_days(texts):
+    """글자들에서 기간을 찾아 "끝나는 날"만 모은다.
+
+    시작일과 끝일이 다른 칸으로 쪼개지는 표가 있어서("24.01.01~" /
+    "24.12.31" - 가로줄을 글자 줄에서 잡으면 늘 이렇게 된다) 칸마다
+    따로 보면 기간을 하나도 못 찾는다. 붙여 놓고 본다 - 정규식이
+    "날짜~날짜"가 맞붙은 자리만 잡으므로 엉뚱한 칸끼리 이어져 걸릴
+    일은 없다."""
+    joined = re.sub(r"\s+", "", " ".join(t or "" for t in texts))
+    return {m.group(2) for m in TABLE_PERIOD_RE.finditer(joined)}
+
+
+def _looks_yearly(texts):
+    """"나. 연도별 수익률 추이" 표인가.
+
+    열 이름이 "최근 1년차 / 최근 2년차 ..."로 연평균 표와 거의 같아서
+    이름만으로는 못 가른다. 가르는 건 기간이다 - 연평균은 재는 구간의
+    길이만 다를 뿐 모두 같은 날에 끝나고(24.01.01~24.12.31 /
+    23.01.01~24.12.31 / 22.01.01~24.12.31), 연도별은 해마다 끝나는 날이
+    다르다(24.12.31 / 23.12.31 / 22.12.31).
+
+    이걸 안 보다가 연도별 값을 연평균 칸에 넣고 있었다(KR510902511M
+    실측: 46쪽 연평균 표의 열 구성을 47쪽 연도별 표가 물려받아
+    "최근 2년 35.66%"가 됐다 - 실제 연평균 2년은 1.79%다)."""
+    return len(_period_end_days(texts)) > 1
+
 
 def _is_multi_header(name):
     """여러 칸의 이름이 한 셀에 다 들어가 있는 묶음 머리글인지 본다.
@@ -629,6 +661,19 @@ def _return_grid_one(page, inherited=None, settings=None):
                     ent[col_of(x0)] = txt
             grid.append({"top": top, "bottom": bottom, "cells": ent})
 
+        # 이 표가 통째로 "나. 연도별 수익률 추이"면 여기서 버린다. 머리글을
+        # 못 찾아도 앞 페이지 열 구성을 물려받는 길이 아래에 있어서, 표
+        # 단위로 먼저 막지 않으면 연도별 표가 연평균 열 이름을 뒤집어쓴다.
+        # "설정일 이후" 칸이 보이면 이 격자 안에 연평균 표도 같이 들어
+        # 있다는 뜻이라(페이지 전체가 표 하나로 잡히는 문서) 통째로 버리지
+        # 않고, 아래 머리글 단위 검사에 맡긴다.
+        grid_texts = [v for r in grid for v in r["cells"].values()]
+        flat_grid = re.sub(r"\s+", "", " ".join(grid_texts))
+        if (_looks_yearly(grid_texts)
+                and ("년차" in flat_grid or "연도별" in flat_grid)
+                and "설정일이후" not in flat_grid and "설정이후" not in flat_grid):
+            continue
+
         # 페이지 전체가 표 하나로 잡히는 문서가 많다(보수표·수익률표·
         # 운용전문인력표가 한 격자 안에 다 들어 있다). 그래서 "첫 데이터
         # 행 앞이 머리글"이라는 규칙은 못 쓴다 - 대신 수익률 표 열 이름이
@@ -678,6 +723,11 @@ def _return_grid_one(page, inherited=None, settings=None):
                         fmap[ci] = f
                         hb_bottom = max([hb_bottom] + band_of[ci])
                         break
+            # 이 머리글이 연도별 표의 것인지는 바로 아래 (기간) 줄이
+            # 말해 준다. 한 격자 안에 가·나 표가 다 들어 있어 표 단위로는
+            # 못 버린 경우를 여기서 거른다.
+            if _looks_yearly(v for ps in parts_by_col.values() for v in ps):
+                continue
             cols_here, right_limit = col_x0s, max(c[2] for c in cells)
             if "since_inception" not in fmap.values():
                 # 표 테두리 오른쪽 바깥에 "설정일 이후" 칸이 칸 선 없이

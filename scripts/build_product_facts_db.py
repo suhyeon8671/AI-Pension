@@ -33,6 +33,7 @@ confidence 필드에 대한 주의: 이 값은 "이 행의 모든 필드가 다 
 import argparse
 import json
 import os
+import re
 import sqlite3
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -293,6 +294,34 @@ def load_class_fees(conn, path):
     return n
 
 
+_CANON = None
+
+
+def _canon_key(code):
+    """표기 차이만 지운 열쇠. "A-e"와 "Ae", "Cp(퇴직연금)"과 "CP"가
+    같은 열쇠로 모인다."""
+    return re.sub(r"\(.*?\)", "", code or "").replace("-", "").upper()
+
+
+def canonical_code(conn, product_code, class_code):
+    """같은 클래스를 표마다 다르게 적은 것을 보수표 표기로 맞춘다.
+
+    같은 문서 안에서도 보수표는 "A-e", 뒤쪽 수익률 상세표는 "Ae"로
+    적는 일이 있다(KR5110501016 실측). 그대로 두면 A-e를 물었을 때
+    수수료는 나오는데 수익률은 안 나온다 - 한 클래스가 둘로 쪼개진다.
+    보수표 표기를 기준으로 삼는다(수수료가 답의 중심이라서)."""
+    global _CANON
+    if _CANON is None:
+        _CANON = {}
+        for pc, cc in conn.execute(
+                "SELECT product_code, class_code FROM class_fees "
+                "WHERE class_code IS NOT NULL"):
+            _CANON.setdefault((pc, _canon_key(cc)), cc)
+    if not class_code:
+        return class_code
+    return _CANON.get((product_code, _canon_key(class_code)), class_code)
+
+
 def load_class_returns(conn, path):
     with open(path, "r", encoding="utf-8") as f:
         records = json.load(f)
@@ -310,7 +339,7 @@ def load_class_returns(conn, path):
             (
                 r["product_code"],
                 r["row_kind"],
-                r["class_code"],
+                canonical_code(conn, r["product_code"], r["class_code"]),
                 r.get("inception_date"),
                 to_float(v.get("1y")),
                 to_float(v.get("2y")),
@@ -398,7 +427,7 @@ def load_class_meaning(conn, path):
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                r["product_code"], r["class_code"], r.get("fee_type"),
+                r["product_code"], canonical_code(conn, r["product_code"], r["class_code"]), r.get("fee_type"),
                 r.get("channel"), r.get("account_type"),
                 ",".join(r.get("attributes") or []),
                 1 if r.get("retail") else 0,
@@ -423,7 +452,7 @@ def load_class_charges(conn, path):
                  back_load_fee, redemption_fee, switch_fee, page)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (r["product_code"], r["class_code"], r.get("eligibility"),
+            (r["product_code"], canonical_code(conn, r["product_code"], r["class_code"]), r.get("eligibility"),
              r.get("front_load_fee"), r.get("back_load_fee"),
              r.get("redemption_fee"), r.get("switch_fee"), r.get("page")),
         )
@@ -470,7 +499,7 @@ def load_yearly_returns(conn, path):
         conn.execute(
             "INSERT INTO yearly_returns (product_code, row_kind, class_code,"
             " year_rank, period, return_pct, page) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (r["product_code"], r["row_kind"], r.get("class_code"),
+            (r["product_code"], r["row_kind"], canonical_code(conn, r["product_code"], r.get("class_code")),
              r["year_rank"], r.get("period"), r.get("return_pct"), r.get("page")))
         n += 1
     return n
