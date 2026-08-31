@@ -1218,6 +1218,13 @@ DETAIL_FEE_DASH_RE = re.compile(r"^-$")
 # (KR510902773M 실측). 뒤에 다른 한글이 바로 안 붙게(예: "종류형") 경계를
 # 둔다 - class_returns.py의 CLASS_CODE_JONGRYU_RE와 같은 취지.
 DETAIL_FEE_CLASS_CODE_JONGRYU_RE = re.compile(r"종류([A-Za-z][A-Za-z0-9\-]{0,6})(?![A-Za-z0-9\-])")
+# 클래스 코드 뒤에 자격 설명이 괄호로 한 번 더 붙는 문서가 있다
+# (KR5129420025 실측: "수수료미징구-온라인-개인연금 (C-Pe(연금저축))").
+# 괄호가 겹쳐서 CLASS_CODE_RE가 아무것도 못 잡고 그 행을 통째로 버렸는데,
+# 하필 연금 클래스들이다(C-P/C-Pe/C-Pu/C-RP/C-RPe 5개). class_meaning이
+# 쓰는 표기("C-Pe(연금저축)")와 같게 뽑아야 두 표가 같은 클래스로 이어진다.
+DETAIL_FEE_CLASS_CODE_NESTED_RE = re.compile(
+    r"\(([A-Za-z0-9\-]{1,8}\([^()]{1,12}\))\)")
 # 헤더 여러 줄이 데이터 행과 가까워서(표마다 헤더 줄 수가 달라 정확한
 # 경계를 못 잡음) 클래스 코드 정규식에 걸리는 흔한 금융 약어들
 # (KR5172450019 실측: 헤더의 "(TER)"이 A클래스 행의 코드로 잘못 붙어서
@@ -1582,13 +1589,299 @@ def _same_class_in_summary(code, known, labels):
     return twins[0] if len(twins) == 1 else code
 
 
-def _same_columns(prev_x0s, x0s, tol=8):
-    """두 페이지의 표가 같은 열 구성인가. 열 개수가 같고 각 열의 왼쪽
-    x좌표가 서로 tol 안에 있으면 이어지는 표로 본다. 페이지마다 표가
-    몇 pt씩 밀려 그려지는 문서가 있어 정확히 같기를 요구하면 안 된다."""
-    if len(prev_x0s) != len(x0s):
-        return False
-    return all(abs(a - b) <= tol for a, b in zip(prev_x0s, x0s))
+# 보수표가 뒤집혀 있는 문서가 있다 - 클래스가 열이고 보수 항목이 행이다.
+#
+#   구 분          |   A   |  A2   |  A-e  |  A-G  |   C   ...
+#   집합투자업자보수 | 0.0750| 0.0750| 0.0750| 0.0750| 0.0750
+#   판매회사보수    | 0.1500| 0.0000| 0.1000| 0.1125| 0.3500
+#   총보수         | 0.2500| 0.1000| 0.2000| 0.2125| 0.4500
+#
+# "행 하나 = 클래스 하나"를 전제한 기존 경로로는 클래스 코드조차 못 읽어서
+# 이런 문서 4개(클래스 33개)의 보수가 통째로 비어 있었다.
+FEE_ITEM_FIELDS = (
+    # 순서가 중요하다 - "총보수·비용"에도 "총보수"가 들어 있어서 긴 이름
+    # 부터 봐야 한다.
+    ("total_fee_and_cost", ("총보수비용", "총보수·비용", "총보수ㆍ비용", "총보수∙비용")),
+    ("peer_avg_fee", ("동종유형",)),
+    ("distribution_fee", ("판매회사보수", "판매보수")),
+    ("total_fee", ("총보수",)),
+)
+# 뒤집힌 표의 머리글엔 코드가 괄호 없이 그대로 놓인다("A2", "C-e").
+RE_BARE_CLASS_CODE = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,3}(?:-[A-Za-z0-9]{1,3})?$")
+
+
+def _fee_item_field(label):
+    """행 앞머리 글자 → 이 행이 무슨 보수인지. 못 알아보면 None."""
+    n = re.sub(r"\s+", "", label or "")
+    # "합성총보수·비용"은 피투자 집합투자기구 보수까지 더한 다른 값이다.
+    if not n or "합성" in n:
+        return None
+    for field, words in FEE_ITEM_FIELDS:
+        if any(w in n for w in words):
+            return field
+    return None
+
+
+def _class_code_token(text):
+    """글자 하나가 클래스 코드로 보이면 코드를, 아니면 None."""
+    t = re.sub(r"\s+", "", text or "")
+    for regex in (DETAIL_FEE_CLASS_CODE_NESTED_RE, CLASS_CODE_RE,
+                  DETAIL_FEE_CLASS_CODE_JONGRYU_RE):
+        mm = [x for x in regex.finditer(t)
+              if x.group(1) not in DETAIL_FEE_CODE_BLOCKLIST]
+        if mm:
+            return mm[-1].group(1)
+    if RE_BARE_CLASS_CODE.match(t) and t not in DETAIL_FEE_CODE_BLOCKLIST:
+        return t
+    return None
+
+
+def _codes_in_band(page, top, bottom):
+    """이 y구간에서 클래스 코드가 늘어선 줄을 찾아 x순서대로 돌려준다.
+
+    뒤집힌 표는 머리글이 격자 행으로 안 잡히는 자리에 있다(한 페이지에
+    표가 두 덩이 쌓이면 둘째 덩이 머리글은 데이터 행 사이에 끼어 있어
+    격자에서 아예 빠진다 - KR5118420062 30쪽 실측: y=601에
+    "C-F C-P C-Pe C-W C-P1 C-P1e S"가 그대로 있는데 못 읽고 있었다).
+    격자 대신 글자를 직접 본다."""
+    ws = [w for w in page.extract_words(x_tolerance=2)
+          if top < (w["top"] + w["bottom"]) / 2 < bottom]
+    lines = {}
+    for w in ws:
+        lines.setdefault(round(w["top"] / 3), []).append(w)
+    best = []
+    for _y, row in sorted(lines.items()):
+        codes = []
+        for w in sorted(row, key=lambda x: x["x0"]):
+            code = _class_code_token(w["text"])
+            if code:
+                codes.append((w["x0"], code))
+        # 코드만 늘어선 줄이어야 한다 - 설명 글자가 섞인 줄은 머리글이
+        # 아니다(값 행에서 우연히 몇 개 걸리는 것도 이걸로 걸러진다).
+        if len(codes) >= 2 and len(codes) >= len(row) - 2 and len(codes) > len(best):
+            best = codes
+    return [c for _x, c in best]
+
+
+def _row_value_cols(row):
+    """이 행에서 숫자가 들어 있는 열 번호."""
+    return {ci for ci, v in row["cells"].items()
+            if ci and DECIMAL_RE.match(v.replace(" ", "")) and "%" not in v}
+
+
+def _transposed_blocks(grid_rows):
+    """항목 이름이 다시 나오는 자리에서 덩이를 가른다.
+
+    같은 표가 한 페이지에 여러 덩이 쌓여 있는 문서가 있다(KR5118420062
+    실측: 30쪽에 클래스 7개짜리 표가 두 번). 덩이마다 클래스가 다르므로
+    따로 읽어야 한다."""
+    blocks, seen, cur, cur_cols = [], set(), [], None
+    for r in grid_rows:
+        key = re.sub(r"\s+", "", r["cells"].get(0, ""))
+        cols = _row_value_cols(r)
+        # 항목 이름이 되풀이되면 새 덩이다. 그것만으로는 모자란데, 앞
+        # 페이지에서 이어지는 덩이는 위쪽 항목이 없어서 이름이 겹치지
+        # 않은 채로 다음 표와 붙어 버린다(KR5118201004 실측: 38쪽 위는
+        # 37쪽에서 이어지는 표라 "총보수"부터 시작하고, 그 아래 새 표의
+        # "집합투자업자보수"가 같은 덩이로 묶였다). 두 표는 값이 놓인
+        # 열이 아예 다르므로(1/2/4/6 대 1/3/5/7) 그것으로도 가른다.
+        split = key in seen
+        if not split and cur_cols and cols:
+            overlap = len(cols & cur_cols) / min(len(cols), len(cur_cols))
+            split = overlap < 0.6
+        if split:
+            blocks.append(cur)
+            seen, cur, cur_cols = set(), [], None
+        seen.add(key)
+        cur.append((_fee_item_field(r["cells"].get(0, "")), r))
+        if cols and (cur_cols is None or len(cols) > len(cur_cols)):
+            cur_cols = cols
+    if cur:
+        blocks.append(cur)
+    return blocks
+
+
+def enrich_with_transposed_fee_table(doc_id, existing_rows):
+    """클래스가 열, 보수 항목이 행인 보수표에서 빠진 클래스를 보강한다.
+
+    채택 기준은 행 방향 표와 같다 - 요약표에 이미 있는 클래스 둘 이상의
+    총보수와 판매보수가 정확히 맞아야 이 표를 이 상품의 보수표로 본다.
+    요약표는 정답지가 아니라 "어느 열이 어느 클래스인지" 확인하는 자다."""
+    known = {r["class_code"]: r for r in existing_rows if r.get("class_code")}
+    if len(known) < 2:
+        return existing_rows
+    pdfs = glob.glob(os.path.join(DATA_DIR, doc_id, "*.pdf"))
+    if not pdfs:
+        return existing_rows
+
+    def close(a, b, tol=0.0005):
+        try:
+            return abs(float(a) - float(b)) <= tol
+        except (TypeError, ValueError):
+            return False
+
+    labels = _class_labels_for_doc(doc_id)
+    new_rows, added = [], set()
+    # 머리글이 앞 격자나 앞 페이지에 있고 값만 이어지는 문서가 있다
+    # (KR5118201004 실측: 37쪽에 코드 9개, 38쪽에 값 9열). 마지막으로
+    # 읽은 코드 줄을 들고 다니다가 열 개수가 같으면 물려준다.
+    last_codes, last_codes_page = [], None
+    with pdfplumber.open(pdfs[0]) as pdf:
+        for page_num, header_rows, grid_rows, col_x0s in _detail_fee_grids(pdf):
+            page = pdf.pages[page_num - 1]
+            blocks = _transposed_blocks(grid_rows)
+            prev_bottom = (min(h["top"] for h in header_rows) - 1
+                           if header_rows else None)
+            # 한 페이지에 덩이가 여러 개면 아래 덩이엔 요약표에 있는
+            # 클래스가 한 개뿐일 수 있다(KR5118420062 30쪽: 아래 덩이는
+            # C-F/C-P/C-Pe/C-W/C-P1/C-P1e/S인데 요약표에 있는 건 C-P
+            # 하나다). 위 덩이가 이미 확인됐고 값 열 구성이 똑같으면
+            # 같은 표가 이어지는 것이므로 그 확인을 이어받는다.
+            ok_cols = None
+            for block in blocks:
+                by_field = {f: r for f, r in block if f}
+                band_top = prev_bottom
+                prev_bottom = block[-1][1]["bottom"]
+                # 이 덩이를 쓸 수 있으려면 총보수와 판매보수 행이 있어야
+                # 한다 - 이 표가 이 상품의 보수표인지 가리는 두 값이다.
+                # "항목이 몇 개 이상"으로 요구하면 안 된다. 페이지 끝에서
+                # 잘려 두 행만 남은 덩이가 있는데(KR5118420062 30쪽 아래),
+                # 하필 거기에 C-P1/C-Pe/S-P 같은 연금 클래스가 있다.
+                # 이 덩이의 머리글은 앞 덩이 끝과 이 덩이 첫 행 사이에 있다.
+                # 코드는 항목 행 검사보다 먼저 읽어 둔다 - 머리글만 있고
+                # 총보수 행은 다음 페이지에 있는 덩이가 있어서(KR5118201004
+                # 실측: 37쪽에 코드 9개, 38쪽에 값 9열), 그 덩이를 버리기
+                # 전에 코드를 챙겨야 뒤 페이지가 물려받을 수 있다.
+                top = band_top if band_top is not None else block[0][1]["top"] - 120
+                codes = _codes_in_band(page, top, block[0][1]["top"] - 1)
+                if codes:
+                    last_codes, last_codes_page = codes, page_num
+                if "total_fee" not in by_field:
+                    continue  # 뒤집힌 보수표가 아니다
+                # 값이 든 열(총보수 행 기준)과 코드를 왼쪽부터 순서대로
+                # 짝짓는다. 머리글 칸과 값 칸의 x가 어긋나 있어서(코드는
+                # 1/3/5/7, 값은 1/2/5/6번 열) 좌표로는 못 맞춘다.
+                value_cols = sorted(
+                    ci for ci, v in by_field["total_fee"]["cells"].items()
+                    if ci and DECIMAL_RE.match(v.replace(" ", "")) and "%" not in v)
+                if not codes or len(codes) != len(value_cols):
+                    # 머리글이 앞 격자·앞 페이지에 있는 경우 물려받는다.
+                    if (last_codes and len(last_codes) == len(value_cols)
+                            and last_codes_page is not None
+                            and page_num - last_codes_page <= 1):
+                        codes = last_codes
+                    else:
+                        continue
+
+                pairs = [(_same_class_in_summary(code, known, labels), vc)
+                         for code, vc in zip(codes, value_cols)]
+                # 이 표가 이 상품의 보수표인지는 요약표에 이미 있는
+                # 클래스의 값으로 가린다. 소수점 넷째 자리까지 맞는 게
+                # 둘 이상이고 어긋나는 게 하나도 없어야 한다.
+                #
+                # 총보수와 판매보수를 다 요구하지는 않는다. 표가 페이지를
+                # 넘어가면 위쪽 항목 행이 앞 페이지에 남아 이 덩이엔
+                # 총보수 아래쪽만 있는 경우가 있다(KR5118201004 38쪽:
+                # 판매회사보수는 37쪽에 있다). 있는 값으로만 대조한다.
+                refs = [(c, vc) for c, vc in pairs if c in known]
+                hits = misses = 0
+                for c, vc in refs:
+                    for fld in ("total_fee", "distribution_fee"):
+                        row = by_field.get(fld)
+                        v = row["cells"].get(vc) if row else None
+                        if not v:
+                            continue
+                        if close(v, known[c][fld]):
+                            hits += 1
+                        else:
+                            misses += 1
+                # 어긋나는 게 하나도 없어야 한다는 게 실제 방어선이다 -
+                # 열과 클래스를 잘못 짝지었다면 요약표에 있는 클래스가
+                # 다른 열에 걸려 어긋난다. 그래서 맞는 게 하나뿐이어도
+                # 받되(대조할 클래스가 한 개뿐인 덩이가 있다), 다음
+                # 덩이에 확인을 물려주는 건 둘 이상일 때만 한다.
+                if misses or not refs:
+                    continue
+                if hits >= 2:
+                    ok_cols = value_cols
+                elif hits < 1 and ok_cols != value_cols:
+                    continue
+
+
+                for code, vc in pairs:
+                    if not code or code in known or code in added:
+                        continue
+                    vals = {f: by_field[f]["cells"].get(vc)
+                            for f in FEE_SOURCE_FIELDS if f in by_field}
+                    if not vals.get("total_fee"):
+                        continue
+                    # known을 건드리면 안 된다 - 뒤 덩이에서 이 표가 맞는지
+                    # 대조할 때 요약표 값을 다시 읽어야 하기 때문이다.
+                    added.add(code)
+                    fresh = {
+                        "class_code": code,
+                        "sales_commission_desc": None,
+                        "total_fee": vals.get("total_fee"),
+                        # 항목 행 자체가 이 덩이에 없으면(앞 페이지에 남아
+                        # 있으면) None이다. "-"는 문서가 없다고 적은 것이고
+                        # None은 우리가 못 읽은 것이라 뜻이 다르다.
+                        "distribution_fee": vals.get("distribution_fee"),
+                        "peer_avg_fee": vals.get("peer_avg_fee"),
+                        "total_fee_and_cost": vals.get("total_fee_and_cost"),
+                        "cost_projection_per_10m": {},
+                        "fee_breakdown": [
+                            {"label": re.sub(r"\s+", "", r["cells"].get(0, "")),
+                             "value": r["cells"].get(vc)}
+                            for f, r in block
+                            if f is None and r["cells"].get(vc)
+                        ],
+                        "page": page_num,
+                        "source_pages": [page_num],
+                        "field_source_pages": {},
+                        "evidence": f"[뒤집힌 상세표 보강] 열{vc}",
+                        "method": "transposed_detail_table_cross_validated",
+                        "confidence": 0.7,
+                        "product_code": doc_id,
+                    }
+                    _record_source(fresh, "상세표", page_num, vals)
+                    new_rows.append(fresh)
+    return existing_rows + new_rows
+
+
+def _remap_columns(carry, col_x0s, tol=8):
+    """앞 페이지에서 검증된 열 번호를 이 페이지의 열 번호로 옮긴다.
+
+    페이지가 넘어가면 머리글이 없어서 열 경계가 다르게 잡힌다
+    (KR5129420025 실측: 49쪽은 17열, 50쪽은 11열 - 머리글이 여러 줄로
+    쌓이면서 열이 잘게 쪼개진다). 열 개수가 같기를 요구하면 이어지는
+    표를 물려받지 못한다. 열 번호가 아니라 x좌표로 맞춘다 - 같은 표가
+    이어지는 것이라 각 열이 그려지는 x는 그대로다.
+
+    총보수와 판매보수 열을 못 옮기면 물려받지 않는다. 그 두 열이 이
+    표를 이 상품의 보수표로 특정하는 근거인데, 뒷장엔 대조할 클래스가
+    없어서 값으로 다시 확인할 방법이 없기 때문이다."""
+    prev = carry["col_x0s"]
+
+    def move(ci):
+        if ci is None or ci >= len(prev):
+            return None
+        near = [j for j, x in enumerate(col_x0s) if abs(x - prev[ci]) <= tol]
+        return near[0] if len(near) == 1 else None
+
+    out = {k: move(carry[k]) for k in
+           ("dist_col", "peer_col", "cost_col", "total_col")}
+    span = carry["total_sum_cols"]
+    moved_span = [move(ci) for ci in span] if span else None
+    if moved_span and any(c is None for c in moved_span):
+        moved_span = None
+    out["total_sum_cols"] = moved_span
+    out["total_sum_n"] = len(moved_span) if moved_span else None
+
+    if out["total_col"] is None and not moved_span:
+        return None
+    if out["dist_col"] is None:
+        return None
+    return out
 
 
 def enrich_with_detail_fee_table(doc_id, existing_rows):
@@ -1644,7 +1937,10 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
             for r in grid_rows:
                 label = r["cells"].get(0, "")
                 code = None
-                for regex in (CLASS_CODE_RE, DETAIL_FEE_CLASS_CODE_JONGRYU_RE):
+                # 겹친 괄호를 먼저 본다 - CLASS_CODE_RE가 그런 라벨에선
+                # 아무것도 못 잡아 연금 클래스를 통째로 잃는다.
+                for regex in (DETAIL_FEE_CLASS_CODE_NESTED_RE, CLASS_CODE_RE,
+                              DETAIL_FEE_CLASS_CODE_JONGRYU_RE):
                     mm = [x for x in regex.finditer(label.replace(" ", ""))
                           if x.group(1) not in DETAIL_FEE_CODE_BLOCKLIST]
                     if mm:
@@ -1676,8 +1972,8 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
                 # 같은 방식). 앞 페이지가 아니거나 열 구성이 다르면
                 # 물려받지 않는다 - 무관한 표에 매핑을 씌우면 엉뚱한 행이
                 # 생긴다.
-                inherited = carry if (carry and carry["page"] == page_num - 1
-                                      and _same_columns(carry["col_x0s"], col_x0s)) else None
+                inherited = (_remap_columns(carry, col_x0s)
+                             if carry and carry["page"] == page_num - 1 else None)
                 if inherited is None:
                     continue
 
@@ -3487,6 +3783,10 @@ def main():
         # 대조 기준이 없어 조용히 그대로 넘어간다.
         before = len(rows)
         rows = enrich_with_detail_fee_table(doc_id, rows)
+        # 클래스가 열이고 보수 항목이 행인 보수표를 쓰는 문서가 있다.
+        # 위 경로는 "행 하나 = 클래스 하나"를 전제해서 그런 문서에선
+        # 클래스 코드조차 못 읽는다.
+        rows = enrich_with_transposed_fee_table(doc_id, rows)
         if len(rows) > before:
             detail_enriched += 1
         # "나" 상세표 보강으로 새로 생긴 클래스들의 sales_commission_desc
