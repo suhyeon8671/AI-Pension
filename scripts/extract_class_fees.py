@@ -1462,15 +1462,31 @@ def _detail_fee_grids(pdf):
             first_col_x = col_x0s[0]
             label_ws = [w for w in words
                         if first_col_x - 1 <= (w["x0"] + w["x1"]) / 2 < col_x0s[1] - 1]
+            # 클래스명이 표 테두리 바깥 왼쪽에 그려진 문서도 있다
+            # (KR5139420015 30쪽 실측: 격자의 0번 칸이 이미 숫자
+            # "0.0945"이고 "수수료미징구-오프라인-개인연금(C-p)"은 표
+            # 밖에 있다). 그러면 0번 칸이 비어 있지 않아 위 보정이 안
+            # 걸리고, 코드를 하나도 못 읽어 그 표의 클래스가 전부 빠진다.
+            outside_ws = [w for w in words
+                          if (w["x0"] + w["x1"]) / 2 < first_col_x - 1]
             for r in data_rows:
-                if r["cells"].get(0):
+                cur = r["cells"].get(0, "")
+                # 클래스 이름이 숫자일 리는 없다 - 숫자면 라벨이 아니라
+                # 첫 값 칸이다.
+                if cur and not DECIMAL_RE.match(cur.replace(" ", "")):
                     continue
                 lo, hi = r["top"], r["bottom"]
-                ws = [w for w in label_ws
+                pool = label_ws if not cur else outside_ws
+                ws = [w for w in pool
                       if lo - 1 <= (w["top"] + w["bottom"]) / 2 <= hi + 1]
                 if ws:
                     ws.sort(key=lambda w: (round(w["top"], 1), w["x0"]))
-                    r["cells"][0] = " ".join(w["text"] for w in ws).strip()
+                    label = " ".join(w["text"] for w in ws).strip()
+                    if cur:
+                        # 0번 칸은 값이므로 라벨은 따로 둔다.
+                        r["label_outside"] = label
+                    else:
+                        r["cells"][0] = label
 
             if len(data_rows) >= 2:
                 results.append((i + 1, header_rows, data_rows, col_x0s))
@@ -2007,7 +2023,7 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
 
             raw_rows = []
             for r in grid_rows:
-                label = r["cells"].get(0, "")
+                label = r.get("label_outside") or r["cells"].get(0, "")
                 code = None
                 # 겹친 괄호를 먼저 본다 - CLASS_CODE_RE가 그런 라벨에선
                 # 아무것도 못 잡아 연금 클래스를 통째로 잃는다.
@@ -2018,10 +2034,22 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
                     if mm:
                         code = mm[-1].group(1)
                         break
+                if code is None:
+                    # 코드가 괄호도 "종류"도 없이 첫 칸에 그냥 놓인 표가
+                    # 있다(KR5111450067 41쪽 실측: "A | 수수료선취-오프라인
+                    # | 0.7446 | ..."). 그러면 코드를 하나도 못 읽어 표
+                    # 전체가 버려진다. 잘못 읽어도 아래 총보수·판매보수
+                    # 대조에서 걸러지므로 여기서는 넓게 본다.
+                    bare = re.sub(r"\s+", "", label)
+                    if RE_BARE_CLASS_CODE.match(bare) \
+                            and bare not in DETAIL_FEE_CODE_BLOCKLIST:
+                        code = bare
                 code = _same_class_in_summary(code, known, labels)
                 cols = {}
+                # 라벨이 표 밖에 있으면 0번 칸도 값 칸이다.
+                skip0 = not r.get("label_outside")
                 for ci, v in r["cells"].items():
-                    if ci == 0:
+                    if ci == 0 and skip0:
                         continue
                     t = v.replace(" ", "")
                     if DECIMAL_RE.match(t) and "%" not in t:
