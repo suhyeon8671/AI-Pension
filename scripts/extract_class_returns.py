@@ -923,10 +923,44 @@ def _return_grid_one(page, inherited=None, settings=None):
     return [header_carry] if header_carry else None
 
 
+def _section_marks(words):
+    """이 페이지에서 "가.연평균수익률" / "나.연도별 수익률 추이" 제목이
+    나오는 세로 위치. [(y, "가"|"나"), ...]"""
+    lines = {}
+    for w in words:
+        lines.setdefault(round(w["top"] / 3), []).append(w)
+    marks = []
+    for line in lines.values():
+        line.sort(key=lambda w: w["x0"])
+        flat = re.sub(r"\s+", "", "".join(w["text"] for w in line))
+        y = min(w["top"] for w in line)
+        if SECTION_NA_RE.search(flat):
+            marks.append((y, "나"))
+        elif SECTION_GA_RE.search(flat):
+            marks.append((y, "가"))
+    return sorted(marks)
+
+
 def return_rows_for_doc(doc_id, pdf, pages, known_classes=None):
     """요약표/상세표의 연평균수익률 표를 셀 격자로 읽어 레코드를 만든다."""
     rows = []
     inherited, prev_page = None, None
+    # "가.연평균 / 나.연도별" 구분을 페이지를 넘어 이어 간다.
+    #
+    # 표 하나만 보는 가드(_looks_yearly)는 그 표 안에 "년차"나 기간
+    # 머리글이 있어야 걸린다. 연도별 표가 페이지 경계에서 잘리면 뒷장
+    # 조각엔 머리글이 하나도 없어서 그냥 통과한다(KR510902777M 실측:
+    # 48쪽에 「가.연평균」과 「나.연도별」이 같이 있고 49쪽은 연도별 표의
+    # 이어진 부분인데, 49쪽 조각만 보면 연도별인 줄 알 수가 없다).
+    #
+    # 그러면 49쪽 연도별 값이 연평균 행으로 들어가고, 뒤에서 같은
+    # 클래스끼리 합칠 때 "뒤쪽 페이지가 이긴다"로 3쪽의 맞는 연평균을
+    # 밀어낸다(C-e: 68.88/35.97/22.67/16.30/12.17 -> 68.88/9.57/
+    # -0.18/-20.87/45.60). 1년 값이 같아서 눈으로도 잘 안 보인다.
+    #
+    # 좌표 방식(find_return_rows_on_page)은 이 상태를 이미 물려받고
+    # 있었다. 셀 격자 방식에만 없었다.
+    section = "가"
     for page_num in pages:
         if page_num < 1 or page_num > len(pdf.pages):
             continue
@@ -938,6 +972,10 @@ def return_rows_for_doc(doc_id, pdf, pages, known_classes=None):
             continue
         inherited = (got[-1][0], got[-1][3])
         prev_page = page_num
+        marks = _section_marks(page.extract_words(x_tolerance=2))
+        page_start_section = section
+        if marks:
+            section = marks[-1][1]
         for field_by_col, data_rows, cells, col_x0s, words in got:
             label_cols = [c for c, f in field_by_col.items() if f == "label"]
             first_val = min((c for c, f in field_by_col.items()
@@ -948,6 +986,15 @@ def return_rows_for_doc(doc_id, pdf, pages, known_classes=None):
             period_set = {c for c, f in field_by_col.items()
                           if f.endswith("y") or f == "since_inception"}
             for r in data_rows:
+                # 이 행이 "나.연도별 수익률 추이" 아래에 있으면 버린다.
+                # 한 페이지에 두 표가 같이 있는 문서가 있어서(위 48쪽)
+                # 페이지 단위가 아니라 행의 세로 위치로 가른다.
+                row_section = page_start_section
+                for y, s in marks:
+                    if y < r["top"]:
+                        row_section = s
+                if row_section == "나":
+                    continue
                 # 클래스명 칸이 여러 행에 걸쳐 병합돼 있으면 이 행 자신의
                 # 칸은 비어 있다 - 이 행을 세로로 품고 있는 왼쪽 칸을 쓴다.
                 label = " ".join(r["cells"][c] for c in sorted(label_cols)

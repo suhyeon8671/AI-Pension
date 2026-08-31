@@ -399,6 +399,11 @@ def _meaning_from_eligibility(conn, product_code, code):
     return None
 
 
+# 「집합투자기구의 명칭(종류형 명칭)」 표가 자기 머리에 적어 둔 이름.
+# 코드 개수가 같은 표가 여럿일 때만 쓴다(_Vote 참고).
+NAMING_TABLE_TITLES = ("집합투자기구의명칭", "종류형명칭", "집합투자기구명칭")
+
+
 def _tables_in_order(conn, doc_id):
     """이 문서의 표를 쪽 번호 순으로. ORDER BY가 없으면 DB가 돌려주는
     대로라, 근거 페이지가 다시 쌓을 때마다 달라질 수 있었다."""
@@ -438,25 +443,47 @@ class _Vote:
     표에서만 센다 - 본문은 줄이 섞일 여지가 있어서 표가 있는데 굳이
     섞을 이유가 없다. 같은 수로 갈리면 앞쪽 페이지를 쓴다.
 
-    근거 페이지는 이긴 이름표가 처음 나온 쪽이다. 다른 뜻으로 적힌
-    페이지를 근거로 달면 안 되기 때문이다."""
+    근거 페이지는 「집합투자기구의 명칭(종류형 명칭)」 표가 있는 쪽으로
+    단다. 그 표가 이 문서가 클래스를 정의한 자리이기 때문이다. 요약
+    투자비용표에도 이름표가 곁다리로 적혀 있지만, 거기를 근거로 대면
+    "이 클래스가 무슨 뜻이냐"의 출처로는 약하다.
+
+    명칭표를 알아보는 건 제목이 아니라 구조로 한다. 제목으로 해 봤더니
+    투자자유의사항 문구 안에 "집합투자기구의 명칭"이 들어 있는 표가
+    명칭표로 잡혔고, 하필 그게 이름표가 틀린 수익률표였다. 명칭표는
+    정의상 그 펀드의 클래스를 다 싣기 때문에, 클래스 코드를 제일 많이
+    담은 표가 명칭표다(KR510902511M 실측: 명칭표 14개 / 요약표 6개).
+
+    같은 수인 표가 여럿이면 그때만 제목을 곁들인다. 이때는 안전한데,
+    후보가 이미 "클래스 코드를 최대로 담은 표"로 좁혀져 있어서 코드를
+    하나도 안 담은 안내문 표는 아예 후보가 못 되기 때문이다. 제목도
+    없으면 앞쪽 페이지를 쓴다.
+
+    단, 이긴 이름표가 실제로 적혀 있는 쪽만 후보다. 다른 뜻으로 적힌
+    페이지를 근거로 달면 고객이 열어 봤을 때 우리 답과 다르다."""
 
     def __init__(self):
         self.table = collections.Counter()
         self.chunk = collections.Counter()
         self.rec = {}
         self.page = {}
+        self.rank = {}
         self.order = {}
         self._n = 0
 
-    def add(self, rec, page, from_table):
+    def add(self, rec, page, from_table, n_codes=0, titled=False):
         key = _meaning_key(rec)
         (self.table if from_table else self.chunk)[key] += 1
+        rank = (n_codes, titled, -page)
         if key not in self.rec:
             self.rec[key] = rec
             self.page[key] = page
+            self.rank[key] = rank
             self.order[key] = self._n
             self._n += 1
+        elif rank > self.rank[key]:
+            self.page[key] = page
+            self.rank[key] = rank
 
     def candidates(self):
         counts = self.table or self.chunk
@@ -646,9 +673,19 @@ def extract(db_path=DEFAULT_DB_PATH):
         # 보면 그런 표를 통째로 놓친다.
         votes = collections.defaultdict(_Vote)
         for page, rows in _tables_in_order(conn, code):
+            # 표 하나가 한 클래스에 한 표만 준다. 병합된 칸 때문에 같은
+            # 이름표가 여러 줄에 걸쳐 나오는 표가 있어서, 줄마다 세면
+            # 그 표가 여러 번 투표한 셈이 된다.
+            found = {}
             for row in rows:
                 for cc, rec in _parse_row(row, known_codes).items():
-                    votes[cc].add(rec, page, True)
+                    found.setdefault(cc, rec)
+            if not found:
+                continue
+            flat = _squash(" ".join((c or "") for r in rows for c in r))
+            titled = any(t in flat for t in NAMING_TABLE_TITLES)
+            for cc, rec in found.items():
+                votes[cc].add(rec, page, True, len(found), titled)
         # 본문 청크도 본다(줄 단위로). 표에서 하나도 못 찾았을 때만
         # 보던 것을 항상 보도록 바꿨다 - "종류형 명칭" 표가 테두리 없이
         # 글자로만 놓인 문서가 있는데(KR5139420015 2쪽 실측: 16개 클래스가

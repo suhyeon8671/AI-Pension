@@ -46,6 +46,15 @@ NUM_RE = re.compile(r"^\d[\d,]*\.?\d*$")
 # 토큰으로 낸다(공백 없이 붙어 있어 pdfplumber가 한 단어로 묶음). %가 없는
 # 문서와 똑같이 처리하기 위해 optional %를 허용하고, 저장할 때는 벗겨낸다.
 DECIMAL_RE = re.compile(r"^\d+\.\d+%?$")
+# 보수율 칸에는 소수점 없이 "0"만 놓이기도 한다 - 랩·기관 전용 클래스의
+# 판매보수가 0인 건 정상이다. DECIMAL_RE가 소수점을 요구해서 그 칸을 값으로
+# 안 봤고, 칸 하나가 비면서 열 맞추기가 어긋나 그 행이 통째로 버려졌다
+# (KR5152420028 28쪽 실측: 15줄 중 랩 전용 CW 한 줄만 빠졌다 -
+# "수수료미징구-오프라인-랩(CW) | 0 | ... | 0.035").
+# DECIMAL_RE 자체는 "이 줄이 데이터 줄인가"를 세는 데도 쓰여서 건드리면
+# 안 된다(맨 정수는 펀드코드·비용예시·연도에도 널려 있다). 값 칸이라는 게
+# 이미 확인된 자리에서만 이걸 쓴다.
+FEE_VALUE_RE = re.compile(r"^(?:\d+\.\d+|0)%?$")
 DECIMAL_FINDALL_RE = re.compile(r"\d+\.\d+")  # 앵커 없이 텍스트 뭉치 안에서 찾을 때
 CLASS_CODE_RE = re.compile(r"\(([A-Za-z0-9\-]{1,8})\)")
 # "A(수수료선취-오프라인)"처럼 클래스 코드가 괄호 안이 아니라 괄호 바로
@@ -1495,8 +1504,73 @@ def _detail_fee_grids(pdf):
                     else:
                         r["cells"][0] = label
 
-            if len(data_rows) >= 2:
+            # 값 행이 하나뿐인 표도 넘긴다. 보수표가 페이지 경계에서 잘려
+            # 다음 장에 한 줄만 남는 문서가 흔한데(KR5114420022 37쪽 실측:
+            # "수수료미징구-온라인슈퍼-개인연금(S-P) 0.26 0.12 0.04 0.00
+            # 0.42 …" 한 줄), 두 줄 미만이면 버리고 있어서 그 클래스를
+            # 통째로 잃었다. 같은 모양이 최소 6개 문서에 있다.
+            #
+            # 이 완화가 위험하지 않은 이유는 여기서 쓸지 말지를 정하지
+            # 않기 때문이다. 뒤(enrich_with_detail_fee_table)에서 총보수와
+            # 판매보수 열을 요약표 값으로 맞춰 보거나, 못 맞추면 바로 앞
+            # 페이지에서 검증된 열 구성을 x좌표로 물려받아야만(그것도 안
+            # 되면 그냥 건너뛴다) 이 행을 담는다. 보수표가 아닌 한 줄짜리
+            # 표는 거기서 걸러진다.
+            if data_rows:
                 results.append((i + 1, header_rows, data_rows, col_x0s))
+    return _stitch_labels_across_pages(results)
+
+
+def _label_has_code(text):
+    t = re.sub(r"\s+", "", text or "")
+    for regex in (DETAIL_FEE_CLASS_CODE_NESTED_RE, CLASS_CODE_RE,
+                  DETAIL_FEE_CLASS_CODE_JONGRYU_RE):
+        if any(x.group(1) not in DETAIL_FEE_CODE_BLOCKLIST
+               for x in regex.finditer(t)):
+            return True
+    return False
+
+
+def _stitch_labels_across_pages(results):
+    """페이지 경계에서 잘린 이름표를 앞 장 마지막 값 행에 이어 붙인다.
+
+    표가 페이지를 넘어가면 마지막 클래스의 이름표만 다음 장 첫머리로
+    넘어가는 문서가 있다(KR5194450018 실측).
+
+        36쪽 마지막 값 행: "수수료미징구- 오프라인-"  0.72 0.70 0.03 …
+        37쪽 머리글 자리 : "보수체감(C4)"            (값 칸 전부 빔)
+
+    이러면 그 행은 코드를 못 읽어 통째로 빠진다 - 보수는 멀쩡히 읽어
+    놓고 어느 클래스 것인지 몰라 버리는 셈이다.
+
+    페이지 안에서 쓰는 규칙과 같다: 이름표 칸은 값 행에서 시작해 아래로
+    이어지고 코드가 끝에 온다. 그게 페이지를 넘을 뿐이다. 다만 아무
+    조각이나 갖다 붙이면 안 되므로 세 가지를 다 만족할 때만 잇는다.
+
+      - 두 표가 바로 이웃한 페이지이고 열 개수가 같다.
+      - 앞 장 마지막 값 행에 코드가 없다(있으면 이미 온전한 이름표다).
+      - 다음 장 조각이 첫 칸에만 있고 값 칸이 없으며, 클래스 코드처럼
+        생겼다. "명칭 (클래스)"나 "지급비율(연간, %)" 같은 머리글은
+        괄호 안이 한글이라 코드로 안 잡힌다.
+    """
+    for k in range(1, len(results)):
+        prev_page, _prev_hdr, prev_rows, prev_x = results[k - 1]
+        page, hdr, _rows, xs = results[k]
+        if page != prev_page + 1 or len(xs) != len(prev_x):
+            continue
+        last = prev_rows[-1]
+        cur = last.get("label_outside") or last["cells"].get(0, "")
+        if _label_has_code(cur):
+            continue
+        tail = next((h["cells"][0] for h in hdr
+                     if set(h["cells"]) == {0} and _label_has_code(h["cells"][0])),
+                    None)
+        if not tail:
+            continue
+        if last.get("label_outside"):
+            last["label_outside"] = f"{cur} {tail}".strip()
+        else:
+            last["cells"][0] = f"{cur} {tail}".strip()
     return results
 
 
@@ -2063,7 +2137,7 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
                     if ci == 0 and skip0:
                         continue
                     t = v.replace(" ", "")
-                    if DECIMAL_RE.match(t) and "%" not in t:
+                    if FEE_VALUE_RE.match(t) and "%" not in t:
                         cols[ci] = t
                 raw_rows.append({"class_code": code, "cols": cols, "label": label})
 
