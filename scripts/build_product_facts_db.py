@@ -414,10 +414,25 @@ def canonical_code(conn, product_code, class_code):
       - 보수표에 같은 열쇠의 코드가 둘 이상이면 손대지 않는다.
         어느 쪽으로 맞춰야 할지 문서가 말해 주지 않는다
         (KR5120420039 실측: 보수표에 C-E와 CE가 나란히 있다).
-      - 이름표(수수료방식·판매경로·계좌종류·속성)가 완전히 같을 때만
-        맞춘다.
-      - 한쪽이라도 이름표가 없으면 손대지 않는다. 같다는 걸 확인할
-        길이 없으면 쪼개진 채로 두는 편이 낫다."""
+        위 KR5114420027의 Cp도 여기서 걸린다 - 열쇠 CP를 쓰는 보수표
+        코드가 C-P, Cp, Cp(퇴직연금) 셋이라 후보가 하나로 안 좁혀진다.
+      - 양쪽 다 이름표가 있으면, 이름표가 완전히 같을 때만 맞춘다.
+      - 한쪽에 이름표가 아예 없으면(=문서의 「종류형 명칭」 표가 그
+        표기를 모른다) 그건 클래스가 아니라 표기 차이다. 상대에 이름표가
+        있고 후보가 하나뿐일 때만 맞춘다.
+
+        이 갈래를 안 두면 문서가 두 표에서 코드를 다르게 적은 클래스가
+        쪼개진 채로 남는다(6건 실측). 명칭표는 C(장마)라고 적어 뒀는데
+        수익률표는 ClassC(장마)를 "C"로 읽히게 적어 두는 식이라,
+        C(장마)를 물으면 보수는 나오는데 수익률이 안 나온다.
+
+            KR5120450015  수익률표 C      <- 명칭표·보수표 C(장마)
+            KR5120420091  수익률표 C-P    <- 명칭표·보수표 C-P(연금)
+            KR5120420039  수익률표 Ai     <- 명칭표·보수표 A-i
+
+        "이름표가 없다"가 근거가 되는 이유는 이름표가 보수표 클래스를
+        빠짐없이 덮고 있기 때문이다(verify_data의 "뜻을 모르는 클래스"
+        0건). 문서가 이름 붙인 클래스라면 이름표에 있어야 한다."""
     global _CANON, _MEANING
     if _CANON is None:
         by_key = {}
@@ -438,9 +453,13 @@ def canonical_code(conn, product_code, class_code):
         return class_code
     mine = _MEANING.get((product_code, class_code))
     theirs = _MEANING.get((product_code, target))
-    if mine is None or theirs is None or mine != theirs:
+    if theirs is None:
+        # 맞출 상대가 무슨 클래스인지 문서가 말해 주지 않는다.
         return class_code
-    return target
+    if mine is None:
+        # 이 표기는 문서의 명칭표에 없다 = 같은 클래스를 다르게 적은 것.
+        return target
+    return target if mine == theirs else class_code
 
 
 def load_class_returns(conn, path):
