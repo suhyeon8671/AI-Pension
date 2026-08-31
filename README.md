@@ -1786,12 +1786,45 @@ curl -G "http://127.0.0.1:8000/answer" \
     --data-urlencode "question=DC와 DB, 운용 주체가 어떻게 다른가요?"
 ```
 
-**현재 상태**: 라우팅 + 검색(`retrieved_context`, `think_trace`)까지는 실제로
-동작한다. `answer` 필드는 아직 HyperCLOVA X API 키가 없어서 진짜 LLM 생성이
-아니라 검색된 근거를 발췌해서 보여주는 임시 스텁이다(`api/server.py`의
-`generate_answer()`에 `TODO` 표시). 키가 발급되면 이 함수만 HCX Chat
-Completions 호출로 교체하면 나머지(라우팅, 검색, 응답 스키마)는 그대로 쓸 수
-있다.
+### 답변 생성 (HyperCLOVA X)
+
+LLM은 **문장만** 만든다. 어떤 상품인지 찾고, 어느 클래스의 숫자인지 고르고,
+일반 고객이 못 사는 클래스를 빼고, 근거 페이지를 다는 일은 전부 구조화 DB
+쪽에서 끝낸다. 평가 기준이 정확성·근거 완전성·근거 기반이라, 숫자를 LLM이
+고르게 하면 그 셋이 전부 LLM의 운에 걸리기 때문이다.
+
+그래도 문장을 쓰다가 숫자를 흘릴 수 있어서, 답이 나온 뒤 한 번 더 센다
+(`answer_llm.check_numbers`). **근거에 없는 숫자가 답에 있으면 그 답을 버리고
+조회 결과를 그대로 내보낸다.** 데이터에 해 온 것과 같은 원칙이다 — 값으로
+검산할 수 있는 기준을 두고, 검산이 안 되면 안 담는다.
+
+무엇으로 답했는지는 `think_trace` 마지막 줄에 항상 남는다:
+
+```
+3. 답변 생성: HCX가 조회 결과를 문장으로 옮김(숫자 검산 통과)
+3. 답변 생성: 생성된 답에 근거에 없는 숫자 ['0.48']가 있어 버리고 조회 결과를 그대로 내보냄
+3. 답변 생성: HCX 호출 실패(...) - 조회 결과를 그대로 내보냄
+```
+
+키는 저장소 루트 `.env`에 넣는다(`.gitignore`에 있음):
+
+```bash
+echo 'NCP_CLOVASTUDIO_API_KEY=nv-...' > .env   # 필요하면 MODEL/CHAT_URL도
+
+python scripts/hcx.py --selftest          # 키·엔드포인트가 실제로 통하는지
+python scripts/answer_llm.py --check --mock  # 망 없이 답변 경로 전체 확인
+```
+
+`--mock`은 HCX 응답만 가짜로 바꾸고 나머지(경로 판단 → 조회 → 검산 →
+think_trace)는 진짜로 돌린다. 망이 막힌 개발 환경에서도 LLM 갈래를 지나가
+보고 배포할 수 있어야 해서 넣었다.
+
+**현재 상태**: 라우팅·검색·답변 생성·검산까지 코드는 다 붙어 있다. 다만 이
+개발 환경은 `clovastudio.stream.ntruss.com` 아웃바운드가 정책상 막혀 있어
+(프록시 403) **실제 HCX 호출은 미검증**이다. 망이 열린 환경에서 위
+`--selftest` 한 번으로 확인된다. 호출이 안 되면 답변은 조회 결과로
+떨어지고 그 사실이 `think_trace`에 남으므로, 키가 없거나 망이 막혀도
+서버는 정상 응답한다.
 
 **제출용 API End-point**: `[TODO — 네이버클라우드 또는 개인 서버에 배포 후
 실제 접속 가능한 URL로 채울 것. 대회 규정상 README에 명시 필수]`
@@ -1807,8 +1840,8 @@ Completions 호출로 교체하면 나머지(라우팅, 검색, 응답 스키마
 - [ ] `hyperclova` 임베딩 프로바이더 실제 키로 검증 (엔드포인트/응답 스키마 확인)
 - [ ] 가능하면 `sentence_transformers` 프로바이더를 huggingface.co 접근 가능한 환경에서 검증하고 tfidf보다 우선 사용 검토
 - [x] ~~질의 유형 분류(제도/세제/상품/복합) 라우팅 로직~~ (`router.py`, 지금은 키워드 규칙 기반 — HCX 키 발급 후 의도분류로 교체 검토)
-- [ ] HyperCLOVA X API 연동 (질문 → 검색 → 답변 생성 파이프라인) — 키 발급 대기 중
-- [x] ~~평가용 API 서버~~ (`api/server.py`, `/answer` 엔드포인트 스펙대로 동작 — `answer` 필드는 HCX 연동 전까지 발췌형 스텁)
+- [x] ~~HyperCLOVA X API 연동 (질문 → 검색 → 답변 생성 파이프라인)~~ (`scripts/hcx.py` + `scripts/answer_llm.py`, LLM은 문장만 만들고 숫자는 근거와 대조해 검산 — 이 개발 환경은 clovastudio 아웃바운드가 막혀 실제 호출 **미검증**)
+- [x] ~~평가용 API 서버~~ (`api/server.py`, `/answer` 엔드포인트 스펙대로 동작 — 세 경로(comparison/single_product/rag) 모두 HCX 생성 + 검산 경유, 실패 시 조회 결과로 폴백)
 - [ ] 서버를 네이버클라우드/개인 서버에 실제 배포하고 README에 End-point URL 명시 (제출 필수 항목)
 - [ ] 역질문/정보한계 대응 로직 (평가 비중 가장 높은 항목) — HCX 연동과 함께 진행
 - [ ] 종합소득세/연금수령한도 등 복잡한 계산이 필요한 질의에 대한 규칙 기반 계산 로직 검토

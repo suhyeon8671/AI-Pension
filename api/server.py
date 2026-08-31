@@ -117,30 +117,45 @@ def format_think_trace(query: str, route_result: dict) -> str:
         lines.append(f"3. 표 검색(table_search) 결과 {len(route_result['table_hits'])}건")
         for hit in route_result["table_hits"]:
             lines.append(f"   - {hit.get('doc_id')} p.{hit.get('page')}")
-    lines.append(
-        "4. [주의] 답변 생성 단계는 아직 HyperCLOVA X API 키가 없어 실제 LLM 호출이 아니라 "
-        "검색된 근거를 발췌/요약하는 임시 로직으로 대체되어 있음 (generate_answer 참고)"
-    )
     return "\n".join(lines)
 
 
-def generate_answer(query: str, route_result: dict) -> str:
-    """
-    TODO(HyperCLOVA X 키 발급 후): 이 함수를 HCX Chat Completions 호출로 교체.
-    지금은 검색된 상위 근거를 그대로 이어붙인 발췌형 스텁 — 실제 자연어 답변 생성이 아님.
-    """
+NO_EVIDENCE = (
+    "가지고 있는 자료로는 이 질문에 답할 수 있는 근거를 찾지 못했습니다. "
+    "질문을 더 구체적으로 말씀해 주시거나, 관련 제도나 상품명을 알려주시면 다시 찾아보겠습니다."
+)
+
+
+def compose_answer(question: str, context: str, fallback: str):
+    """근거를 사람 말로 옮긴다. (답변, 어떻게 만들었는지 한 줄)
+
+    LLM은 문장만 만든다. 숫자를 고르고 클래스를 가리고 근거 페이지를 다는
+    일은 이미 앞에서 끝났고, 그 결과가 context다. LLM 답에 근거에 없는
+    숫자가 섞이면 그 답은 버리고 fallback(=조회 결과 원문)을 내보낸다 -
+    투박한 근거가 그럴듯한 오답보다 낫다(answer_llm.check_numbers).
+
+    쓰지 못하는 상황(키 없음/호출 실패/검산 실패)을 조용히 넘기지 않고
+    think_trace에 적는 이유는, 그때 나간 답이 LLM이 쓴 문장이 아니라
+    조회 결과라는 걸 채점자가 알 수 있어야 하기 때문이다."""
+    from answer_llm import generate  # HCX가 없어도 서버가 떠야 한다
+
+    text, how = generate(question, context)
+    if text:
+        return text, how
+    return fallback, how
+
+
+def generate_answer(query: str, route_result: dict):
+    """검색(rag) 경로의 답변. (답변, 생성 방식 한 줄)"""
     hits = route_result["semantic_hits"]
     if not hits:
-        return (
-            "죄송합니다, 보유한 데이터에서 이 질문에 답할 수 있는 근거를 찾지 못했습니다. "
-            "질문을 더 구체적으로 말씀해 주시거나, 관련 제도/상품명을 알려주시면 다시 찾아보겠습니다."
-        )
+        return NO_EVIDENCE, "근거가 없어 정보한계로 답함"
+    context = format_retrieved_context(route_result)
     top = hits[0]
     excerpt = top["text"][:300]
-    return (
-        f"[임시 답변 — HyperCLOVA X 연동 전 발췌 결과] "
-        f"관련 근거({top.get('doc_id')} p.{top.get('page')})에 따르면:\n{excerpt}"
-    )
+    fallback = (f"검색된 근거({top.get('doc_id')} p.{top.get('page')})에 따르면:\n"
+                f"{excerpt}")
+    return compose_answer(query, context, fallback)
 
 
 def answer_payload(question_id: str, question: str) -> dict:
@@ -159,6 +174,7 @@ def answer_payload(question_id: str, question: str) -> dict:
     product_codes = [h[0] for h in hits]
     if is_comparison_query(question, product_codes) and len(product_codes) >= 2:
         summary, evidence = compare_products(product_codes)
+        answer, how = compose_answer(question, summary, summary)
         body = {
             "question_id": question_id,
             "question": question,
@@ -169,10 +185,9 @@ def answer_payload(question_id: str, question: str) -> dict:
                 "2. semantic_search 대신 구조화 DB(product_master/class_fees/"
                 "class_returns) 직접 조회로 처리 (토큰 절약)\n"
                 f"   - 조회 근거: {evidence}\n"
-                "3. [주의] 답변 생성 단계는 아직 HyperCLOVA X API 키가 없어 "
-                "실제 LLM 호출이 아니라 조회 결과를 그대로 보여주는 임시 로직임"
+                f"3. 답변 생성: {how}"
             ),
-            "answer": f"[임시 답변 — HyperCLOVA X 연동 전 조회 결과]\n{summary}",
+            "answer": answer,
             "route": "comparison",
         }
         return body
@@ -186,6 +201,7 @@ def answer_payload(question_id: str, question: str) -> dict:
         if set(intents) & {"fee", "return", "risk", "aum", "cost_projection"}:
             code = product_codes[0]
             summary, ev = product_facts(code, find_class_code(question), intents)
+            answer, how = compose_answer(question, summary, summary)
             body = {
                 "question_id": question_id,
                 "question": question,
@@ -197,10 +213,9 @@ def answer_payload(question_id: str, question: str) -> dict:
                     "2. semantic_search 대신 구조화 DB(product_master/class_fees/"
                     "class_returns/fund_aum) 직접 조회\n"
                     f"   - 조회 근거: {ev[:5]}\n"
-                    "3. [주의] 답변 생성 단계는 아직 HyperCLOVA X API 키가 없어 "
-                    "실제 LLM 호출이 아니라 조회 결과를 그대로 보여주는 임시 로직임"
+                    f"3. 답변 생성: {how}"
                 ),
-                "answer": f"[임시 답변 — HyperCLOVA X 연동 전 조회 결과]\n{summary}",
+                "answer": answer,
                 "route": "single_product",
             }
             return body
@@ -212,12 +227,13 @@ def answer_payload(question_id: str, question: str) -> dict:
     # 정답이 든 청크가 상위 6개 안에 들어오는 질문이 늘었다. 답변에 실제로
     # 넣는 청크 수는 MAX_CONTEXT_CHUNKS로 여전히 6개라 토큰은 안 늘어난다.
     route_result = route_search(question, k=10)
+    answer, how = generate_answer(question, route_result)
     return {
         "question_id": question_id,
         "question": question,
         "retrieved_context": format_retrieved_context(route_result),
-        "think_trace": format_think_trace(question, route_result),
-        "answer": generate_answer(question, route_result),
+        "think_trace": format_think_trace(question, route_result) + f"\n4. 답변 생성: {how}",
+        "answer": answer,
         "route": "rag",
     }
 
