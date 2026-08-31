@@ -42,6 +42,7 @@
 """
 
 import argparse
+import collections
 import json
 import os
 import re
@@ -398,6 +399,144 @@ def _meaning_from_eligibility(conn, product_code, code):
     return None
 
 
+def _tables_in_order(conn, doc_id):
+    """이 문서의 표를 쪽 번호 순으로. ORDER BY가 없으면 DB가 돌려주는
+    대로라, 근거 페이지가 다시 쌓을 때마다 달라질 수 있었다."""
+    out = []
+    for page, dj in conn.execute(
+            "SELECT page, data_json FROM tables WHERE doc_id = ? ORDER BY page",
+            (doc_id,)):
+        try:
+            rows = json.loads(dj)
+        except (ValueError, TypeError):
+            continue
+        out.append((page, rows))
+    return out
+
+
+def _meaning_key(rec):
+    return (rec["fee_type"], rec["channel"], tuple(rec["attributes"]))
+
+
+class _Vote:
+    """한 클래스의 이름표를 문서 전체에서 모아, 제일 많이 나온 것을 고른다.
+
+    왜 "먼저 나온 것"이면 안 되나
+    ----------------------------
+    같은 클래스의 이름표가 한 문서에 열 번 넘게 나오는데, 그중 몇 곳이
+    틀려 있는 문서가 있다(KR5194450018 실측).
+
+        수수료미징구-온라인슈퍼-개인연금(S-P)   ... 12곳
+        수수료미징구-오프라인-퇴직연금(S-P)     ...  2곳(6쪽 수익률표)
+
+    6쪽 수익률표는 앞 행의 이름표가 다음 행까지 그대로 이어져 있다.
+    예전 코드는 "먼저 찾은 것"을 썼는데, 맞는 쪽을 집은 건 판단이 아니라
+    DB가 돌려준 순서 덕이었다. 쪽 순서로 바꾸든 표 제목으로 바꾸든,
+    "어느 하나를 먼저 본다"로는 이런 걸 못 가른다.
+
+    문서가 되풀이해서 말하는 쪽을 따른다. 표에서 한 번이라도 봤으면
+    표에서만 센다 - 본문은 줄이 섞일 여지가 있어서 표가 있는데 굳이
+    섞을 이유가 없다. 같은 수로 갈리면 앞쪽 페이지를 쓴다.
+
+    근거 페이지는 이긴 이름표가 처음 나온 쪽이다. 다른 뜻으로 적힌
+    페이지를 근거로 달면 안 되기 때문이다."""
+
+    def __init__(self):
+        self.table = collections.Counter()
+        self.chunk = collections.Counter()
+        self.rec = {}
+        self.page = {}
+        self.order = {}
+        self._n = 0
+
+    def add(self, rec, page, from_table):
+        key = _meaning_key(rec)
+        (self.table if from_table else self.chunk)[key] += 1
+        if key not in self.rec:
+            self.rec[key] = rec
+            self.page[key] = page
+            self.order[key] = self._n
+            self._n += 1
+
+    def candidates(self):
+        counts = self.table or self.chunk
+        return _fold_truncations(counts) if counts else counts
+
+    def pick(self, counts):
+        best = max(counts, key=lambda k: (counts[k], -self.page[k],
+                                          -self.order[k]))
+        return self.rec[best], self.page[best]
+
+
+def _resolve(votes):
+    """{코드: _Vote} -> {코드: (이름표, 근거쪽)}
+
+    남는 자리가 하나 있다. 문서가 두 클래스에 똑같은 이름표를 붙여 둔
+    경우다(KR5194450018 실측).
+
+        명칭표(9쪽)  수수료선취-오프라인(A)    AY120
+                    수수료선취-오프라인(A-e)  AY121   <- 같은 이름
+        보수표(5쪽)  수수료선취-오프라인(A)    선취 1%
+                    수수료선취-온라인(A-e)     선취 0.5%
+
+    종류형 명칭은 클래스를 가르라고 있는 것이니 명칭표 쪽이 틀렸다.
+    그래서 "겹치는 이름표는 빼고 고른다"를 넣어 봤는데, 그건 못 쓴다.
+    이름표가 정당하게 겹치는 문서가 있기 때문이다 - 같은 문서의
+    C1/C2/C3/C4가 넷 다 "수수료미징구-오프라인-보수체감"이다(보유기간
+    으로 갈리는 클래스라 이름이 같은 게 맞다). 그 규칙을 넣었더니
+    C1에서 6표짜리 맞는 이름표를 빼고 1표짜리 틀린 것을 골랐고,
+    KR5160420009 A-e에서는 "수수료미징구-온라인-수수료선취"라는 말도
+    안 되는 이름표를 골랐다.
+
+    그래서 겹침은 손대지 않는다. 문서가 자기 안에서 어긋난 자리는
+    되풀이해서 말하는 쪽을 따르고 그 근거 페이지를 단다 - 어느 쪽이
+    맞는지 우리가 정하는 게 아니라, 문서가 뭐라고 했는지를 확인할 수
+    있게 두는 것이다. 위 A-e는 이 규칙에서 9쪽(오프라인)으로 간다."""
+    out = {}
+    for cc, v in votes.items():
+        counts = v.candidates()
+        if counts:
+            out[cc] = v.pick(counts)
+    return out
+
+
+def _is_truncation_of(short, full):
+    """short가 full의 잘린 조각인가.
+
+    PDF에서 이름표가 줄바꿈이나 칸 경계에서 잘리면 뒷부분이 날아간다.
+
+        "수수료미징구-온라인슈퍼(S-P)"  ->  "…온라인(S-P)"      (KR516702010M 23쪽)
+        "…오프라인-개인연금(C-P)"       ->  "…오프라인-개인(C-P)" (KR515302022M 31쪽)
+
+    이건 다른 뜻이 아니라 같은 말의 조각이라 따로 세면 안 된다. 실제로
+    "온라인"이 "온라인슈퍼"를 표 수로 이겨서 온라인슈퍼 전용 클래스가
+    그냥 온라인으로 바뀌는 일이 있었다.
+
+    반대로 속성이 하나 더 붙은 건(온라인 vs 온라인-보수체감) 조각이
+    아니라 다른 뜻이다 - 옆줄에서 새어 들어온 것일 수도 있으므로
+    합치지 않고 표 수로 겨루게 둔다."""
+    s_fee, s_ch, s_attrs = short
+    f_fee, f_ch, f_attrs = full
+    if s_fee != f_fee or len(s_attrs) != len(f_attrs):
+        return False
+    if not f_ch.startswith(s_ch):
+        return False
+    if not all(f.startswith(s) for s, f in zip(s_attrs, f_attrs)):
+        return False
+    return short != full
+
+
+def _fold_truncations(counts):
+    """잘린 조각의 표를 원래 말 쪽으로 옮긴다. 원래 말 후보가 둘 이상이면
+    어느 쪽인지 모르므로 손대지 않는다."""
+    out = collections.Counter(counts)
+    for short in list(counts):
+        fulls = [f for f in counts if _is_truncation_of(short, f)]
+        if len(fulls) == 1:
+            out[fulls[0]] += out.pop(short, 0)
+    return out
+
+
 def _single_class_fund(conn, product_code, known_codes):
     """종류형이 아닌 펀드인가. 맞으면 그렇다고 적은 한 줄을 돌려준다.
 
@@ -467,17 +606,11 @@ def extract(db_path=DEFAULT_DB_PATH):
         # 한 줄 안에서는 붙여도 된다. 코드 칸과 라벨 칸이 나뉜 표가
         # 있어서(["종류A", "수수료선취-오프라인", "98292"]) 칸 하나씩만
         # 보면 그런 표를 통째로 놓친다.
-        for page, dj in conn.execute(
-                "SELECT page, data_json FROM tables WHERE doc_id = ?", (code,)):
-            try:
-                rows = json.loads(dj)
-            except (ValueError, TypeError):
-                continue
+        votes = collections.defaultdict(_Vote)
+        for page, rows in _tables_in_order(conn, code):
             for row in rows:
                 for cc, rec in _parse_row(row, known_codes).items():
-                    if cc not in merged:
-                        merged[cc] = rec
-                        pages[cc] = page
+                    votes[cc].add(rec, page, True)
         # 본문 청크도 본다(줄 단위로). 표에서 하나도 못 찾았을 때만
         # 보던 것을 항상 보도록 바꿨다 - "종류형 명칭" 표가 테두리 없이
         # 글자로만 놓인 문서가 있는데(KR5139420015 2쪽 실측: 16개 클래스가
@@ -486,14 +619,17 @@ def extract(db_path=DEFAULT_DB_PATH):
         # 안 걸려 나머지를 통째로 잃고 있었다(16개 중 11개).
         #
         # 표에서 찾은 것이 우선이다 - 표는 코드 칸과 라벨 칸이 나뉘어
-        # 있어 짝이 확실하고, 본문은 줄이 섞일 여지가 있다.
+        # 있어 짝이 확실하고, 본문은 줄이 섞일 여지가 있다(_Vote 참고).
         for page, text in conn.execute(
-                "SELECT page, text FROM chunks WHERE doc_id = ?", (code,)):
+                "SELECT page, text FROM chunks WHERE doc_id = ? ORDER BY page",
+                (code,)):
             for line in (text or "").splitlines():
                 for cc, rec in _parse(line, known_codes).items():
-                    if cc not in merged:
-                        merged[cc] = rec
-                        pages[cc] = page
+                    votes[cc].add(rec, page, False)
+
+        for cc, (rec, page) in _resolve(votes).items():
+            merged[cc] = rec
+            pages[cc] = page
 
         if not merged:
             single = _single_class_fund(conn, code, known_codes)
