@@ -233,6 +233,26 @@ CREATE TABLE trade_rules (
     PRIMARY KEY (product_code, kind)
 );
 
+-- 이 펀드가 무엇에 얼마나 투자하고 있는지 (extract_asset_mix.py).
+-- "이 펀드 뭐에 투자해요?"에 답하기 위한 것. 위험등급만으로는 주식형인지
+-- 채권형인지도 흐릿하다. 비중은 시점에 따라 바뀌는 값이라 as_of 없이
+-- 숫자만 내보내면 틀린 답이 된다.
+DROP TABLE IF EXISTS asset_mix;
+CREATE TABLE asset_mix (
+    product_code TEXT NOT NULL,
+    asset TEXT NOT NULL,        -- 주식 / 채권 / 파생상품(장내) / 단기대출및예금 ...
+    amount REAL,                -- 백만원
+    pct REAL,
+    total_amount REAL,
+    -- 문서가 비율을 안 싣고 금액만 적은 경우 자산총액으로 나눠 만든
+    -- 값이다. 문서에 그대로 적힌 숫자가 아니라서 구분해 둔다.
+    pct_derived INTEGER,
+    as_of TEXT,
+    page INTEGER,
+    PRIMARY KEY (product_code, asset)
+);
+CREATE INDEX IF NOT EXISTS idx_asset_mix_product ON asset_mix(product_code);
+
 DROP TABLE IF EXISTS product_charges;
 CREATE TABLE product_charges (
     product_code TEXT PRIMARY KEY,
@@ -323,6 +343,24 @@ def load_class_fees(conn, path):
             ),
         )
         n += 1
+    return n
+
+
+def load_asset_mix(conn, path):
+    with open(path, "r", encoding="utf-8") as f:
+        records = json.load(f)
+    n = 0
+    for r in records:
+        for it in r.get("items") or []:
+            conn.execute(
+                "INSERT OR REPLACE INTO asset_mix (product_code, asset, amount,"
+                " pct, total_amount, pct_derived, as_of, page)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (r["product_code"], it["asset"], to_float(it.get("amount")),
+                 to_float(it.get("pct")), to_float(r.get("total_amount")),
+                 1 if r.get("pct_derived") else 0,
+                 r.get("as_of"), r.get("page")))
+            n += 1
     return n
 
 
@@ -610,6 +648,8 @@ def main():
                         default=os.path.join(REPO_ROOT, "trade_rules.json"))
     parser.add_argument("--product-charges",
                         default=os.path.join(REPO_ROOT, "product_charges.json"))
+    parser.add_argument("--asset-mix",
+                        default=os.path.join(REPO_ROOT, "asset_mix.json"))
     args = parser.parse_args()
 
     conn = sqlite3.connect(args.db)
@@ -629,12 +669,13 @@ def main():
     n9 = load_trade_rules(conn, args.trade_rules)
     n10 = load_yearly_returns(conn, args.yearly_returns)
     n11 = load_class_fee_sources(conn, args.class_fees)
+    n12 = load_asset_mix(conn, args.asset_mix)
 
     conn.commit()
     conn.close()
     print(
         f"product_master {n1}건, class_fees {n2}건, class_returns {n3}건, "
-        f"manager_info(참고용) {n4}건, fund_aum {n5}건, class_meaning {n6}건, class_charges {n7}건, product_charges {n8}건, trade_rules {n9}건, yearly_returns {n10}건, class_fee_sources {n11}건 → {args.db}"
+        f"manager_info(참고용) {n4}건, fund_aum {n5}건, class_meaning {n6}건, class_charges {n7}건, product_charges {n8}건, trade_rules {n9}건, yearly_returns {n10}건, class_fee_sources {n11}건, asset_mix {n12}건 → {args.db}"
     )
 
 

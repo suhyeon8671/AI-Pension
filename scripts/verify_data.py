@@ -148,7 +148,10 @@ def check_retail_vs_eligibility(conn, rep):
         if not e:
             continue
         total += 1
-        flat = " ".join(e.split())
+        # 공백을 다 지우고 본다. 원문이 낱말 한가운데서 줄바꿈되는
+        # 문서가 있어("금 융기관") 공백을 남겨 두면 "금융기관"의 "기관"을
+        # 제한으로 잘못 세게 된다.
+        flat = re.sub(r"\s+", "", e)
         restricted_in_text = False
         for w in words:
             for m in re.finditer(re.escape(w), flat):
@@ -316,6 +319,31 @@ def check_source_conflicts(conn, rep):
             "답변에 쓸 때 한 표 안에서만 뽑으면 된다", info=True)
 
 
+def check_asset_mix(conn, rep):
+    """자산구성 비율이 100%가 되나.
+
+    자산별 비중은 서로 더하면 100이어야 한다. 안 맞으면 열을 잘못
+    짚었거나(금액 칸을 비율로 읽었거나) 자산 하나를 통째로 빠뜨린
+    것이다. 이 표는 답변에 "주식 97.6%"처럼 바로 나가는 값이라
+    한 칸만 어긋나도 그대로 틀린 답이 된다."""
+    tot = collections.defaultdict(float)
+    for pc, pct in conn.execute(
+            "SELECT product_code, pct FROM asset_mix WHERE pct IS NOT NULL"):
+        tot[pc] += pct
+    bad = [f"{pc}: 비율 합 {v:.2f}%" for pc, v in sorted(tot.items())
+           if abs(v - 100) > 1.0]
+    rep.add("자산구성 비율 합이 100%가 아님", len(bad), len(tot), bad,
+            "열을 잘못 짚었거나 자산 하나를 빠뜨린 것이다")
+
+    # 기준일이 없으면 "언제 기준 비중인지" 없이 숫자만 내보내게 된다.
+    n = conn.execute("SELECT COUNT(DISTINCT product_code) FROM asset_mix").fetchone()[0]
+    miss = [r[0] for r in conn.execute(
+        "SELECT DISTINCT product_code FROM asset_mix WHERE as_of IS NULL")]
+    rep.add("자산구성에 기준일이 없음", len(miss), n, miss,
+            "비중은 시점에 따라 바뀌는 값이라 기준일 없이 말하면 안 된다",
+            info=True)
+
+
 def check_as_of(conn, rep):
     bad = []
     rows = _rows(conn, "SELECT DISTINCT product_code, as_of FROM class_fees")
@@ -399,7 +427,8 @@ def main():
     rep = Report()
     for fn in (check_fee_internal, check_avg_vs_yearly, check_retail_vs_eligibility,
                check_lookalike_codes, check_class_code_consistency,
-               check_source_conflicts, check_as_of, check_trade_rules,
+               check_source_conflicts, check_asset_mix,
+               check_as_of, check_trade_rules,
                check_yearly_periods, check_returns_range):
         fn(conn, rep)
     conn.close()

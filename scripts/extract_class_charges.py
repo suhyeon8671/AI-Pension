@@ -165,14 +165,29 @@ def _row_class_code(row):
     return None
 
 
-def _parse_table(rows):
+def _table_header(rows):
+    """이 표가 "가. 투자자에게 직접 부과되는 수수료" 표인지 보고, 맞으면
+    (열매핑, 머리글 끝)을 돌려준다."""
     mapping, header_end = _header_map(rows)
     if not mapping or "redemption_fee" not in mapping.values():
-        return {}
+        return None, 0
     # 진짜 수수료 표는 열이 여럿이다. 환매수수료 하나만 걸렸다면 연혁표
     # ("2015.11.02 | 환매수수료 삭제")를 오인한 것이다.
     if len(mapping) < 2 or set(mapping) == {0}:
-        return {}
+        return None, 0
+    return mapping, header_end
+
+
+def _parse_table(rows, carried=None):
+    """carried: 앞 페이지에서 확인된 열매핑. 표가 페이지를 넘어가면
+    이어지는 쪽엔 머리글이 없어서, 그것만 보고 버리면 뒷장 클래스를
+    통째로 잃는다(KR515302022M 실측: 가.표가 31~33쪽에 걸쳐 있는데
+    32·33쪽에 머리글이 없어 C-P2/S-P/S-I/C-Pe/AG/CG/A1/C-Pe2가 빠졌다)."""
+    mapping, header_end = _table_header(rows)
+    if not mapping:
+        if not carried:
+            return {}
+        mapping, header_end = carried, 0
 
     order = [name for _j, name in sorted(mapping.items())]
     out = {}
@@ -280,17 +295,43 @@ def extract(db_path=DEFAULT_DB_PATH):
 
     out = []
     for code in codes:
-        merged, pages = {}, {}
+        merged, pages, best_n = {}, {}, {}
+        # 머리글이 있는 표에서 열 구성을 확인해 두고, 바로 다음 페이지에
+        # 같은 열 개수로 이어지는 표에 물려준다. 그래서 "환매수수료"가
+        # 적힌 표만 보는 게 아니라 전부 훑는다.
+        carried, carried_cols, carried_page = None, None, None
         for page, dj in conn.execute(
-                "SELECT page, data_json FROM tables WHERE doc_id = ? "
-                "AND row_text LIKE '%환매수수료%' ORDER BY page", (code,)):
+                "SELECT page, data_json FROM tables WHERE doc_id = ? ORDER BY page",
+                (code,)):
             try:
                 rows = json.loads(dj)
             except (ValueError, TypeError):
                 continue
-            for cc, rec in _parse_table(rows).items():
-                if cc not in merged:
-                    merged[cc] = rec
+            ncols = max((len(r) for r in rows), default=0)
+            mapping, _end = _table_header(rows)
+            if mapping:
+                got = _parse_table(rows)
+                carried, carried_cols, carried_page = mapping, ncols, page
+            elif (carried and ncols == carried_cols
+                  and carried_page is not None and page - carried_page <= 1):
+                got = _parse_table(rows, carried=carried)
+                if got:
+                    carried_page = page  # 또 이어질 수 있다
+            else:
+                continue
+            for cc, rec in got.items():
+                # 같은 클래스가 여러 표에 나온다. 먼저 나온 걸 쓰면 안 된다 -
+                # 앞쪽에 가입자격 칸이 없는 비슷한 표가 있는 문서가 있어서
+                # (KR510902511M 실측: 14쪽 표가 26쪽 진짜 "가." 표를 밀어내
+                # 가입자격이 33개 상품에서 11개로 줄었다), 칸별로 합친다.
+                # 근거 페이지는 이 클래스에 대해 가장 많은 칸을 채운 표로
+                # 잡는다 - 고객이 열어 볼 자리는 거기다.
+                cur = merged.setdefault(cc, {})
+                for k, v in rec.items():
+                    if v and not cur.get(k):
+                        cur[k] = v
+                if len(rec) > best_n.get(cc, 0):
+                    best_n[cc] = len(rec)
                     pages[cc] = page
         for cc, rec in sorted(merged.items()):
             out.append({

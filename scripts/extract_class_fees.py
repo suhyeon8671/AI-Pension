@@ -1478,6 +1478,7 @@ def _detail_fee_grids(pdf):
 
 
 _CLASS_LABELS_BY_DOC = None
+_CLASS_RAW_LABEL_BY_DOC = {}
 
 
 def _class_labels_for_doc(doc_id):
@@ -1497,6 +1498,9 @@ def _class_labels_for_doc(doc_id):
                                 r.get("fee_type"), r.get("channel"),
                                 r.get("account_type"),
                                 tuple(r.get("attributes") or ()))
+                        _CLASS_RAW_LABEL_BY_DOC.setdefault(
+                            r["product_code"], {})[r["class_code"]] = \
+                            r.get("raw_label")
     return _CLASS_LABELS_BY_DOC.get(doc_id, {})
 
 
@@ -1636,20 +1640,20 @@ def _class_code_token(text):
     return None
 
 
-def _codes_in_band(page, top, bottom):
-    """이 y구간에서 클래스 코드가 늘어선 줄을 찾아 x순서대로 돌려준다.
+def _code_line_in_band(page, top, bottom):
+    """이 y구간에서 클래스 코드가 늘어선 줄을 찾는다.
 
     뒤집힌 표는 머리글이 격자 행으로 안 잡히는 자리에 있다(한 페이지에
     표가 두 덩이 쌓이면 둘째 덩이 머리글은 데이터 행 사이에 끼어 있어
     격자에서 아예 빠진다 - KR5118420062 30쪽 실측: y=601에
     "C-F C-P C-Pe C-W C-P1 C-P1e S"가 그대로 있는데 못 읽고 있었다).
-    격자 대신 글자를 직접 본다."""
+    격자 대신 글자를 직접 본다. 돌려주는 것은 ([(x, 코드)], 그 줄의 y)."""
     ws = [w for w in page.extract_words(x_tolerance=2)
           if top < (w["top"] + w["bottom"]) / 2 < bottom]
     lines = {}
     for w in ws:
         lines.setdefault(round(w["top"] / 3), []).append(w)
-    best = []
+    best, best_y = [], None
     for _y, row in sorted(lines.items()):
         codes = []
         for w in sorted(row, key=lambda x: x["x0"]):
@@ -1659,8 +1663,36 @@ def _codes_in_band(page, top, bottom):
         # 코드만 늘어선 줄이어야 한다 - 설명 글자가 섞인 줄은 머리글이
         # 아니다(값 행에서 우연히 몇 개 걸리는 것도 이걸로 걸러진다).
         if len(codes) >= 2 and len(codes) >= len(row) - 2 and len(codes) > len(best):
-            best = codes
-    return [c for _x, c in best]
+            best, best_y = codes, min(w["top"] for w in row)
+    return best, best_y
+
+
+def _codes_in_band(page, top, bottom):
+    line, _y = _code_line_in_band(page, top, bottom)
+    return [c for _x, c in line]
+
+
+def _printed_labels(page, line, code_y, bottom, tol=22):
+    """코드 줄 바로 아래에 열마다 인쇄된 이름표를 모은다.
+
+    뒤집힌 보수표는 코드 밑에 그 클래스가 무엇인지를 같이 찍는다
+    ("C-P / 수수료미징구-오프라인-개인연금"). 요약표에 있는 클래스가
+    하나도 없는 표는 값으로 대조할 수가 없는데, 이 이름표를 문서 앞쪽
+    "종류형 명칭" 표에서 뽑아 둔 이름표와 맞춰 보면 열과 클래스를 제대로
+    짝지었는지 확인할 수 있다 - 같은 문서의 다른 표가 독립적으로 같은
+    말을 하는 것이라 근거가 된다."""
+    xs = [x for x, _c in line]
+    got = {}
+    for w in page.extract_words(x_tolerance=2):
+        mid = (w["top"] + w["bottom"]) / 2
+        if not (code_y + 6 < mid < bottom):
+            continue
+        i = min(range(len(xs)), key=lambda k: abs(xs[k] - w["x0"]))
+        if abs(xs[i] - w["x0"]) < tol:
+            got.setdefault(i, []).append(w)
+    return {i: "".join(w["text"] for w in
+                       sorted(v, key=lambda w: (round(w["top"]), w["x0"])))
+            for i, v in got.items()}
 
 
 def _row_value_cols(row):
@@ -1753,7 +1785,18 @@ def enrich_with_transposed_fee_table(doc_id, existing_rows):
                 # 실측: 37쪽에 코드 9개, 38쪽에 값 9열), 그 덩이를 버리기
                 # 전에 코드를 챙겨야 뒤 페이지가 물려받을 수 있다.
                 top = band_top if band_top is not None else block[0][1]["top"] - 120
-                codes = _codes_in_band(page, top, block[0][1]["top"] - 1)
+                data_top = block[0][1]["top"] - 1
+                code_line, code_y = _code_line_in_band(page, top, data_top)
+                codes = [c for _x, c in code_line]
+                if not codes and block is blocks[0] and page_num >= 2:
+                    # 머리글이 앞 페이지 맨 아래에 있고 값만 넘어오는 문서가
+                    # 있다(KR515302022M 실측: 33쪽 끝에 "구분 A Ae C1 C2 C3
+                    # C4 Ce CI CF CW"가 있고 값은 34쪽부터다). 앞 페이지
+                    # 아래쪽도 본다.
+                    prev_page = pdf.pages[page_num - 2]
+                    codes = _codes_in_band(prev_page,
+                                           prev_page.height - 170,
+                                           prev_page.height)
                 if codes:
                     last_codes, last_codes_page = codes, page_num
                 if "total_fee" not in by_field:
@@ -1776,43 +1819,72 @@ def enrich_with_transposed_fee_table(doc_id, existing_rows):
                 pairs = [(_same_class_in_summary(code, known, labels), vc)
                          for code, vc in zip(codes, value_cols)]
                 # 이 표가 이 상품의 보수표인지는 요약표에 이미 있는
-                # 클래스의 값으로 가린다. 소수점 넷째 자리까지 맞는 게
-                # 둘 이상이고 어긋나는 게 하나도 없어야 한다.
+                # 클래스의 값으로 가린다. 다만 표 전체를 한 덩어리로
+                # 판정하면 안 된다 - 어떤 행 하나만 어긋나게 읽히는 일이
+                # 있기 때문이다(KR515302022M 34쪽 실측: 총보수 행은 네
+                # 클래스가 소수점 넷째 자리까지 맞는데, 판매회사보수 행은
+                # 원문에 "주6)" 각주가 끼어 값 순서가 틀어졌다). 그걸로
+                # 표를 통째로 버리면 멀쩡한 총보수까지 잃는다.
                 #
-                # 총보수와 판매보수를 다 요구하지는 않는다. 표가 페이지를
-                # 넘어가면 위쪽 항목 행이 앞 페이지에 남아 이 덩이엔
-                # 총보수 아래쪽만 있는 경우가 있다(KR5118201004 38쪽:
-                # 판매회사보수는 37쪽에 있다). 있는 값으로만 대조한다.
+                # 그래서 필드마다 따로 본다. 어긋나는 게 하나도 없는
+                # 필드만 믿고 담고, 나머지는 값을 안 담는다(None). 우리가
+                # 확인하지 못한 값을 담느니 비워 두는 쪽이다.
                 refs = [(c, vc) for c, vc in pairs if c in known]
-                hits = misses = 0
-                for c, vc in refs:
-                    for fld in ("total_fee", "distribution_fee"):
-                        row = by_field.get(fld)
-                        v = row["cells"].get(vc) if row else None
-                        if not v:
+                trusted, tf_hits, tf_bad = {}, 0, False
+                for fld in FEE_SOURCE_FIELDS:
+                    row = by_field.get(fld)
+                    if row is None:
+                        continue
+                    hit = miss = 0
+                    for c, vc in refs:
+                        v = row["cells"].get(vc)
+                        # 어느 한쪽이 "-"면 견줄 값이 없다.
+                        if not v or v == "-" or known[c][fld] in (None, "-"):
                             continue
                         if close(v, known[c][fld]):
-                            hits += 1
+                            hit += 1
                         else:
-                            misses += 1
-                # 어긋나는 게 하나도 없어야 한다는 게 실제 방어선이다 -
-                # 열과 클래스를 잘못 짝지었다면 요약표에 있는 클래스가
-                # 다른 열에 걸려 어긋난다. 그래서 맞는 게 하나뿐이어도
-                # 받되(대조할 클래스가 한 개뿐인 덩이가 있다), 다음
-                # 덩이에 확인을 물려주는 건 둘 이상일 때만 한다.
-                if misses or not refs:
+                            miss += 1
+                    if not miss:
+                        trusted[fld] = row
+                    if fld == "total_fee":
+                        tf_hits, tf_bad = hit, bool(miss)
+                if tf_bad or "total_fee" not in trusted:
                     continue
-                if hits >= 2:
+                # 총보수가 둘 이상 맞으면 이 열 구성을 확인된 것으로 보고
+                # 같은 페이지의 다음 덩이에 물려준다. 대조할 게 하나뿐인
+                # 덩이는 그 확인을 이어받아야 쓸 수 있다.
+                if tf_hits >= 2:
                     ok_cols = value_cols
-                elif hits < 1 and ok_cols != value_cols:
-                    continue
-
+                elif tf_hits < 1 and ok_cols != value_cols:
+                    # 요약표에 있는 클래스가 하나도 없어 값으로는 대조할
+                    # 수가 없다. 이 표가 코드 밑에 찍어 둔 이름표를, 문서
+                    # 앞쪽 "종류형 명칭" 표에서 뽑아 둔 이름표와 맞춰 본다
+                    # (KR515302022M 34쪽 실측: 11개 열이 전부 일치한다).
+                    # 같은 문서의 다른 표가 독립적으로 같은 말을 하는 것이라
+                    # 열과 클래스를 제대로 짝지었다는 근거가 된다.
+                    if not code_line or code_y is None:
+                        continue
+                    printed = _printed_labels(page, code_line, code_y, data_top)
+                    raw = _CLASS_RAW_LABEL_BY_DOC.get(doc_id, {})
+                    agree = disagree = 0
+                    for i, (code, _vc) in enumerate(pairs):
+                        want = re.sub(r"\s+", "", raw.get(code) or "")
+                        seen = re.sub(r"\s+", "", printed.get(i, ""))
+                        if not want or not seen:
+                            continue
+                        if want in seen or seen in want:
+                            agree += 1
+                        else:
+                            disagree += 1
+                    if disagree or agree < 2:
+                        continue
 
                 for code, vc in pairs:
                     if not code or code in known or code in added:
                         continue
-                    vals = {f: by_field[f]["cells"].get(vc)
-                            for f in FEE_SOURCE_FIELDS if f in by_field}
+                    vals = {f: trusted[f]["cells"].get(vc)
+                            for f in FEE_SOURCE_FIELDS if f in trusted}
                     if not vals.get("total_fee"):
                         continue
                     # known을 건드리면 안 된다 - 뒤 덩이에서 이 표가 맞는지
