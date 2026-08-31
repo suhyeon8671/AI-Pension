@@ -468,6 +468,44 @@ class _Vote:
         return self.rec[best], self.page[best]
 
 
+def _fold_spelling(merged, pages, known_codes):
+    """같은 뜻인데 표기만 다른 이름표를 한 줄로 모은다.
+
+    문서가 같은 클래스를 표마다 다르게 적는다(KR5110501016 실측).
+
+        3쪽 요약표   수수료선취-온라인(A-e)
+        9쪽 명칭표   수수료선취-온라인(Ae)
+
+    둘 다 담으면 15개짜리 펀드가 16개로 보인다. 실제로 이 문서에서
+    그렇게 세고 있었다.
+
+    합치는 조건은 하나다: 뜻(수수료방식·판매경로·속성)이 완전히 같을 것.
+    붙임표만 다른데 뜻이 다른 짝이 코퍼스에 10쌍 실재하므로
+    (C-P=개인연금 / Cp(퇴직연금)=퇴직연금) 표기만 보고 합치면 안 된다.
+
+    남길 표기는 보수표가 쓰는 것이다. 다른 표들이 전부 그 표기로 이어
+    붙기 때문이다. 보수표에 둘 다 없으면 앞쪽 페이지 것을 남긴다.
+    지운 표기는 버리지 않고 aka로 남겨 둔다."""
+    groups = collections.defaultdict(list)
+    for cc in merged:
+        groups[_canon_key(cc)].append(cc)
+    aka = {}
+    for codes in groups.values():
+        if len(codes) < 2:
+            continue
+        if len({_meaning_key(merged[c]) for c in codes}) != 1:
+            continue  # 뜻이 다르면 손대지 않는다
+        keep = next((c for c in sorted(codes) if c in known_codes), None)
+        if keep is None:
+            keep = min(sorted(codes), key=lambda c: pages[c])
+        for c in codes:
+            if c != keep:
+                aka.setdefault(keep, []).append(c)
+                del merged[c]
+                del pages[c]
+    return aka
+
+
 def _resolve(votes):
     """{코드: _Vote} -> {코드: (이름표, 근거쪽)}
 
@@ -630,6 +668,7 @@ def extract(db_path=DEFAULT_DB_PATH):
         for cc, (rec, page) in _resolve(votes).items():
             merged[cc] = rec
             pages[cc] = page
+        aka = _fold_spelling(merged, pages, known_codes)
 
         if not merged:
             single = _single_class_fund(conn, code, known_codes)
@@ -662,6 +701,9 @@ def extract(db_path=DEFAULT_DB_PATH):
                 "attributes": rec["attributes"],
                 "retail": not any(_match_any(a, RESTRICTED)
                                   for a in rec["attributes"]),
+                # 같은 클래스를 문서가 달리 적은 표기(뜻이 같을 때만).
+                # 버리지 않고 남겨 둬야 그 표기로 물었을 때도 찾을 수 있다.
+                "aka": aka.get(cc, []),
                 "description": _describe(rec),
                 "raw_label": rec["raw_label"],
                 "page": pages.get(cc),
