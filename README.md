@@ -1710,6 +1710,27 @@ python scripts/search.py --query "DC와 DB, 운용 주체가 어떻게 다른가
 python scripts/search.py --query "세액공제" --mode table
 ```
 
+### 상품 팩트 파이프라인 (순서가 있다)
+
+각 추출기는 `structured_store.db`의 `tables`/`chunks`를 읽어 JSON 하나를
+만들고, `build_product_facts_db.py`가 그 JSON들을 같은 DB에 적재한다.
+`extract_class_meaning.py`는 보수표에 어떤 클래스가 있는지를 알아야 하고,
+`merge_class_spelling.py`는 그 이름표를 근거로 갈라진 보수 행을 합치므로
+아래 순서를 지켜야 한다(그래서 DB 적재가 두 번 들어간다).
+
+```bash
+python scripts/build_product_master.py
+python scripts/extract_class_fees.py        # → class_fees.json
+python scripts/extract_class_returns.py     # (charges/yearly/trade_rules/asset_mix 등도 각각)
+python scripts/build_product_facts_db.py    # 1차 적재 - class_fees 표가 있어야 다음이 돈다
+python scripts/extract_class_meaning.py     # → class_meaning.json (보수표의 클래스 목록 참고)
+python scripts/merge_class_spelling.py      # 이름표를 근거로 class_fees.json의 표기를 통일
+python scripts/build_product_facts_db.py    # 2차 적재 - 최종
+
+python scripts/verify_data.py               # 값끼리 앞뒤가 맞는지
+python scripts/eval_answers.py              # 답변 검증 세트
+```
+
 `scripts/search.py`의 `semantic_search()` / `table_search()`는 다음 단계(질의 라우팅,
 HyperCLOVA X 파이프라인, 평가용 API 서버)에서 그대로 import해서 쓰도록 설계했다.
 두 함수 모두 결과에 `doc_id` / `source_doc` / `page` 등 근거 메타데이터를 포함한다.

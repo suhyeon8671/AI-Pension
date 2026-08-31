@@ -75,6 +75,11 @@ HEADER_WORDS = {"선취판매수수료", "후취판매수수료", "환매수수�
 # 코드만 덩그러니 든 칸("A", "C-Pe")과 이름표가 든 칸을 알아보기 위한 모양.
 RE_BARE_CODE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-]{0,12}$")
 RE_HAS_LABEL = re.compile(r"수수료(선취|미징구|후취)-")
+# "종류C-F"처럼 머리말이 붙은 코드 칸. 끝의 붙임표는 코드가 아니라
+# 비어 있는 종류형 명칭 칸이 이어 붙은 것이라 코드에서 뺀다
+# (extract_class_fees.py의 DETAIL_FEE_CLASS_CODE_JONGRYU_RE와 같은 취지).
+RE_JONGRYU_CODE = re.compile(
+    r"^종류([A-Za-z](?:[A-Za-z0-9\-]{0,5}[A-Za-z0-9])?)(?![A-Za-z0-9])")
 
 
 def _clean(v):
@@ -162,6 +167,15 @@ def _row_class_code(row):
     if len(cells) > 1 and RE_BARE_CODE.match(head) and RE_HAS_LABEL.search(
             _squash(cells[1])):
         return head
+    # 이름표가 아예 없는 클래스. 문서가 종류형 명칭을 "-"(없음)로 적어
+    # 두면 코드 칸이 "종류C-F ⏎ -"가 된다(KR5153420063 23쪽). 위 두
+    # 갈래는 다 이름표를 요구해서 이런 행을 통째로 버렸는데, 하필 이
+    # 문서에서 이름표가 없는 클래스가 랩·금전신탁 전용(C-F)과 기관·
+    # 전문투자자 전용(I)이라 가입자격을 꼭 읽어야 하는 행이다. 이 함수는
+    # 이미 가입자격 표로 확인된 표 안에서만 불리므로 코드만 봐도 된다.
+    m = RE_JONGRYU_CODE.match(head)
+    if m:
+        return m.group(1)
     return None
 
 

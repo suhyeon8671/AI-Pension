@@ -82,6 +82,13 @@ def _label(code, meaning):
     """답변에 쓸 클래스 이름. 뜻을 알면 말로, 모르면 코드 그대로."""
     m = meaning.get(code)
     if m and m.get("description"):
+        # 종류형이 아닌 펀드는 클래스 코드 자리에 "투자신탁"처럼 형태
+        # 이름이 들어가 있다(KR5123365001). 그걸 코드처럼 괄호에 달면
+        # "클래스 구분 없는 단일 펀드 (투자신탁)"이 되어 되레 클래스가
+        # 있는 것처럼 보인다. 이름표에 수수료방식도 판매경로도 없는
+        # 행이 그 경우다.
+        if not m.get("channel") and not m.get("fee_type"):
+            return m["description"]
         return f"{m['description']} ({code})"
     return f"{code} 클래스"
 

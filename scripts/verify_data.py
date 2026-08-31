@@ -192,6 +192,35 @@ def _norm_code(code):
     return re.sub(r"\(.*?\)", "", code).replace("-", "").upper()
 
 
+def check_class_meaning_coverage(conn, rep):
+    """보수표에 있는 클래스 중 뜻을 모르는 것이 남아 있나.
+
+    뜻을 모르면 두 가지가 무너진다.
+
+    - 답에서 코드를 그대로 내보내게 된다("C-Pi 클래스의 총보수는 0.14%").
+      고객은 C-Pi가 뭔지 모른다.
+    - retail 판단이 안 된다. 이름표가 없으면 "제한 없음"으로 취급되므로,
+      고액·기관·랩 전용 클래스를 일반 고객에게 제일 싼 클래스라고 안내하게
+      된다. 실제로 KR5118420006 C-Pi와 KR5144420020 C-P2I(퇴직연금)가
+      둘 다 "퇴직연금(고액)" 전용인데 이름표를 못 읽어 일반 클래스로
+      잡혀 있었다.
+
+    그래서 여기는 0이어야 한다. 0이 아니면 답변에 그 클래스를 올리기 전에
+    먼저 이름표를 뽑아야 한다."""
+    labeled = {(pc, cc) for pc, cc in conn.execute(
+        "SELECT product_code, class_code FROM class_meaning")}
+    bad, total = [], 0
+    for pc, cc in conn.execute(
+            "SELECT product_code, class_code FROM class_fees "
+            "WHERE class_code IS NOT NULL ORDER BY product_code, class_code"):
+        total += 1
+        if (pc, cc) not in labeled:
+            bad.append(f"{pc} {cc}")
+    rep.add("뜻을 모르는 클래스", len(bad), total, bad,
+            "이름표가 없으면 코드를 그대로 답하게 되고, 고액·기관·랩 전용을 "
+            "일반 클래스로 안내하게 된다")
+
+
 def check_lookalike_codes(conn, rep):
     """붙임표만 다른데 뜻은 다른 클래스를 찾는다.
 
@@ -439,6 +468,7 @@ def main():
     conn.row_factory = sqlite3.Row
     rep = Report()
     for fn in (check_fee_internal, check_avg_vs_yearly, check_retail_vs_eligibility,
+               check_class_meaning_coverage,
                check_lookalike_codes, check_class_code_consistency,
                check_source_conflicts, check_asset_mix,
                check_as_of, check_trade_rules,

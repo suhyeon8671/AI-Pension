@@ -119,7 +119,9 @@ def _condition_name(cond):
     account = {"개인연금": "연금저축", "퇴직연금": "퇴직연금(DC/IRP)"}.get(
         account, account)
     channel = {"오프라인": "창구", "온라인": "온라인",
-               "온라인슈퍼": "온라인슈퍼", "직판": "운용사 직판"}.get(channel, channel)
+               "온라인슈퍼": "온라인슈퍼", "직판": "운용사 직판",
+               "온라인직접판매": "운용사 직판(온라인)",
+               "디폴트옵션": "디폴트옵션(사전지정운용)"}.get(channel, channel)
     return " · ".join(p for p in (account, channel) if p)
 
 
