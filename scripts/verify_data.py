@@ -72,6 +72,18 @@ def _rows(conn, sql, params=()):
 def check_fee_internal(conn, rep):
     """한 클래스 안에서 보수 값들이 앞뒤가 맞나."""
     bad_order, bad_range, bad_cost = [], [], []
+    # 후취판매수수료 클래스는 비용예시가 줄어드는 게 정상이다. 일찍
+    # 빼면 환매수수료를 떼기 때문에 1년 비용이 2년보다 높다.
+    #
+    #   KR5153420339 종류S(수수료후취-온라인슈퍼)
+    #   1년 27 / 2년 23 / 3년 35 / 5년 61 / 10년 137 (단위 천원)
+    #   문서 각주: "후취판매수수료를 반영한 값으로 3년 이상 투자시
+    #              투자자가 부담하게 되는 수수료 및 보수·비용은 감소합니다"
+    #
+    # 처음엔 이걸 문서 오류로 봤는데 문서가 이유까지 적어 둔 정상 값이다.
+    back_load = {(r["product_code"], r["class_code"])
+                 for r in _rows(conn, "SELECT product_code, class_code FROM "
+                                      "class_meaning WHERE fee_type = '후취'")}
     rows = _rows(conn, "SELECT * FROM class_fees")
     for r in rows:
         tf, df, tfc = r["total_fee"], r["distribution_fee"], r["total_fee_and_cost"]
@@ -85,16 +97,17 @@ def check_fee_internal(conn, rep):
                 f"{r['product_code']} {r['class_code']}: 총보수 {tf} > 총보수·비용 {tfc}")
         costs = [r[c] for c in ("cost_1y", "cost_2y", "cost_3y", "cost_5y", "cost_10y")]
         seen = [c for c in costs if c is not None]
-        for a, b in zip(seen, seen[1:]):
-            if b < a - EPS:
-                bad_cost.append(
-                    f"{r['product_code']} {r['class_code']}: 비용예시 {seen}")
-                break
+        if (r["product_code"], r["class_code"]) not in back_load:
+            for a, b in zip(seen, seen[1:]):
+                if b < a - EPS:
+                    bad_cost.append(
+                        f"{r['product_code']} {r['class_code']}: 비용예시 {seen}")
+                    break
     rep.add("총보수가 판매보수보다 작음 / 총보수·비용보다 큼", len(bad_order),
             len(rows), bad_order)
     rep.add(f"보수율이 {MAX_FEE_PCT}%를 넘음", len(bad_range), len(rows), bad_range)
     rep.add("비용예시가 기간이 길수록 줄어듦", len(bad_cost), len(rows), bad_cost,
-            "1,000만원을 오래 넣을수록 비용이 줄 수는 없다")
+            "후취판매수수료 클래스가 아닌데 비용이 줄면 잘못 읽은 것이다")
 
 
 def check_avg_vs_yearly(conn, rep):
