@@ -27,12 +27,14 @@
 
 import argparse
 import collections
+import json
 import os
 import re
 import sqlite3
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB_PATH = os.path.join(REPO_ROOT, "structured_store.db")
+DEFAULT_CLASS_FEES_JSON = os.path.join(REPO_ROOT, "class_fees.json")
 
 # 보수율이 이보다 크면 값을 잘못 읽은 것이다(퍼센트인데 다른 칸을 집었거나).
 MAX_FEE_PCT = 10.0
@@ -108,6 +110,65 @@ def check_fee_internal(conn, rep):
     rep.add(f"보수율이 {MAX_FEE_PCT}%를 넘음", len(bad_range), len(rows), bad_range)
     rep.add("비용예시가 기간이 길수록 줄어듦", len(bad_cost), len(rows), bad_cost,
             "후취판매수수료 클래스가 아닌데 비용이 줄면 잘못 읽은 것이다")
+
+
+def check_fee_breakdown_consistency(conn, rep):
+    """총보수·비용이 "총보수+기타비용"에서 얼마나 남는지(여분)를 같은
+    상품의 클래스끼리 비교한다.
+
+    "총보수·비용"의 정의가 문서마다 다르다 - 순수 총보수·비용을 쓰는
+    문서도 있고, 모투자신탁 보수까지 안분해 더한 "합성" 개념을 쓰는
+    문서도 있다(KR5111450067 실측: 6쪽 각주 "상기 도표의 총보수비용은
+    '합성 총보수·비용' 비율을 의미합니다"). 그래서 "총보수+기타비용=
+    총보수·비용"을 절대 기준으로 삼으면 합성 정의를 쓰는 문서 전부가
+    오탐이 된다. 대신 여분(diff = 총보수·비용 - 총보수 - 기타비용)이
+    같은 상품 안의 다른 클래스들과 얼마나 다른지만 본다 - 한 문서
+    안에서는 그 정의가 클래스마다 똑같이 적용돼야 하므로, 유독 하나만
+    크게 벗어나면 그 클래스 행이 원문에서부터 깨졌다는 신호다
+    (KR5111450067 실측: C-PE/C-P2E만 여분이 0.03대, 나머지 12개 클래스는
+    전부 0.0015~0.0024대)."""
+    if not os.path.exists(DEFAULT_CLASS_FEES_JSON):
+        rep.add("총보수·비용 여분이 같은 상품 클래스끼리 크게 어긋남", 0, 0, [],
+                info=True)
+        return
+    with open(DEFAULT_CLASS_FEES_JSON, "r", encoding="utf-8") as f:
+        class_fees = json.load(f)
+
+    by_product = collections.defaultdict(list)
+    for r in class_fees:
+        bd = {i.get("label"): i.get("value")
+              for i in (r.get("fee_breakdown") or []) if i.get("label")}
+        other = bd.get("other_expense")
+        tf, tfc = r.get("total_fee"), r.get("total_fee_and_cost")
+        if other is None or tf is None or tfc is None:
+            continue
+        try:
+            diff = float(tfc) - float(tf) - float(other)
+        except (TypeError, ValueError):
+            continue
+        by_product[r["product_code"]].append(
+            (r.get("class_code"), diff, tf, other, tfc))
+
+    bad, checked = [], 0
+    for product_code, entries in by_product.items():
+        # 클래스가 2개뿐이면 어느 쪽이 벗어난 건지 중앙값으로는 못 가린다.
+        if len(entries) < 3:
+            continue
+        diffs = sorted(d for _, d, _, _, _ in entries)
+        mid = diffs[len(diffs) // 2]
+        checked += len(entries)
+        for class_code, diff, tf, other, tfc in entries:
+            if abs(diff - mid) > 0.01:
+                bad.append(
+                    f"{product_code} {class_code}: 총보수 {tf} + 기타비용 {other} "
+                    f"vs 총보수·비용 {tfc} (여분 {diff:.4f}, "
+                    f"같은 상품 중앙값 {mid:.4f})")
+    rep.add("총보수·비용 여분이 같은 상품 클래스끼리 크게 어긋남",
+            len(bad), checked, bad,
+            "총보수+기타비용과 총보수·비용의 차이가 클래스마다 조금씩 다른 "
+            "건 정상이다(모투자신탁 안분 등 문서마다의 정의) - 그런데 한 "
+            "상품 안에서 유독 하나만 크게 벗어나면 그 행 자체가 원문에서 "
+            "깨졌을 가능성이 크다")
 
 
 def check_avg_vs_yearly(conn, rep):
@@ -439,6 +500,25 @@ def check_yearly_periods(conn, rep):
             "연평균 표를 연도별로 잘못 읽은 것이다")
 
 
+def check_class_return_has_code(conn, rep):
+    """class_return 행인데 class_code가 없나.
+
+    "어느 클래스의 수익률인지 모른다"는 뜻이라 class_returns.json에서는
+    아무 쓸모가 없는 행이다(실측: 운용전문인력 표의 숫자, 그래프 Y축
+    눈금, 세액공제 소득기준 문구의 숫자가 이 모양으로 새 들어온 적이
+    있다 - class_code를 못 찾았다고 기본값으로 class_return 취급하면서
+    생긴 문제였다). 비교지수/변동성/투자신탁전체처럼 class_code가 원래
+    없는 게 정상인 행 종류는 row_kind가 달라 여기 안 걸린다."""
+    bad = []
+    total = 0
+    for r in _rows(conn, "SELECT * FROM class_returns WHERE row_kind='class_return'"):
+        total += 1
+        if not r["class_code"]:
+            bad.append(f"{r['product_code']}: {dict(r)}")
+    rep.add("class_return 행인데 class_code가 없음", len(bad), total, bad,
+            "표 밖의 우연한 숫자를 수익률 행으로 잘못 읽었을 가능성이 크다")
+
+
 def check_returns_range(conn, rep):
     """수익률이 상식 밖인가."""
     bad, total = [], 0
@@ -467,12 +547,14 @@ def main():
     conn = sqlite3.connect(args.db)
     conn.row_factory = sqlite3.Row
     rep = Report()
-    for fn in (check_fee_internal, check_avg_vs_yearly, check_retail_vs_eligibility,
+    for fn in (check_fee_internal, check_fee_breakdown_consistency,
+               check_avg_vs_yearly, check_retail_vs_eligibility,
                check_class_meaning_coverage,
                check_lookalike_codes, check_class_code_consistency,
                check_source_conflicts, check_asset_mix,
                check_as_of, check_trade_rules,
-               check_yearly_periods, check_returns_range):
+               check_yearly_periods, check_class_return_has_code,
+               check_returns_range):
         fn(conn, rep)
     conn.close()
 

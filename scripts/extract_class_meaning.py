@@ -71,11 +71,55 @@ ACCOUNT_TYPES = ("개인연금", "퇴직연금", "주택마련", "금전신탁")
 # C-PI(0.13%)가 일반 클래스로 잡혀, 형제 펀드 비교에서 혼자 3분의 1 값으로
 # 나왔다. 가입자격 원문도 "…자집합투자기구로 두고 있는 모집합투자기구"라고
 # 적고 있다.
-RESTRICTED = ("기관", "고액", "랩", "펀드", "금전신탁", "임직원", "협회")
+RESTRICTED = ("기관", "고액", "랩", "펀드", "금전신탁", "임직원", "협회",
+              # "고유재산" - 집합투자업자·계열금융회사가 펀드 안정 운용을
+              # 위해 매입하는 클래스(KR5117420097 실측: "집합투자업자,
+              # 집합투자업자의 계열금융회사 등이 매입하는 집합투자기구").
+              # "집합투자업자(형)" - "당해 집합투자기구의 집합투자업자"
+              # 전용(KR514X450008/KR5169950018 실측). 둘 다 일반 고객은
+              # 애초에 살 수 없는 자리라 retail:false여야 하는데, 이
+              # 목록에 없어서 일반 클래스로 잘못 잡히고 있었다.
+              "고유재산", "집합투자업자")
 
 # 같은 말이 "기관/기관형/기관등", "개인연금/개인연금형"처럼 조금씩 다르게
 # 적혀 있어서 정확히 같은지로 보면 17개쯤을 놓친다. 놓치면 기관 전용
 # 클래스가 "일반 가입 가능"으로 표시되므로 부분 일치로 본다.
+#
+# 그런데 부분 일치로 "찾기"만 하고 원문 글자는 그대로 저장했더니
+# account_type 칸에 "개인연금"과 "개인연금형"이 같은 뜻인데 다른
+# 문자열로 섞여 나왔다(KR5122420005 등 5개 상품, 24건 실측). 계좌
+# 종류만 골라 "형"을 떼는 좁은 정규화를 둔다 - "무권유저비용형"처럼
+# 진짜 다른 뜻인 속성까지 건드리면 안 되므로, ACCOUNT_TYPES에 "형"이
+# 그대로 붙은 정확한 문자열일 때만 뗀다.
+def _norm_account_attr(a):
+    if a.endswith("형") and a[:-1] in ACCOUNT_TYPES:
+        return a[:-1]
+    return a
+
+
+# 코드 자체의 괄호 속성("(연금저축)")이 계좌 종류를 말하는데, 이름표
+# 문구(fee_type-channel-attrs)엔 그 속성이 안 붙는 문서가 있다
+# (KR5129420025 실측: "C-Pu(연금저축)"의 이름표는 "수수료미징구-오프
+# 라인-전환가능"뿐이라 attributes에 "개인연금"이 없다 - 그런데 8쪽은
+# 이 클래스를 C-P(연금저축)/C-Pe(연금저축)와 나란히 "연금저축계좌의
+# 세제" 대상으로 묶어 부른다). "연금저축"은 개인연금의 다른 말이다.
+_CODE_ACCOUNT_SYNONYMS = {"연금저축": "개인연금"}
+
+
+def _account_type_from_code(code):
+    """코드 자체의 맨 뒤 괄호에서 계좌 종류를 읽는다. 이름표 문구에
+    이미 있으면 이건 안 쓴다(_resolve와 겹쳐 부르는 쪽에서 가린다)."""
+    m = re.search(r"\(([^()]*)\)\s*$", code or "")
+    if not m:
+        return None
+    tail = m.group(1)
+    for word in ACCOUNT_TYPES:
+        if word in tail:
+            return word
+    for word, canon in _CODE_ACCOUNT_SYNONYMS.items():
+        if word in tail:
+            return canon
+    return None
 
 
 def _match_any(attr, words):
@@ -110,7 +154,13 @@ RE_SPACE_CH_ATTR = re.compile(
 # 이걸 속성으로 안 먹으면 그 뒤의 (코드)를 못 읽는다. 고액/기관 전용
 # 클래스가 여기 몰려 있어서, 놓치면 일반 고객이 살 수 없는 클래스를
 # 이름표 없이(=일반 가입 가능으로) 내보내게 된다.
-RE_PAREN_ATTR = re.compile(r"^\(([가-힣][가-힣,]{0,9})\)")
+#
+# "직판"은 예외다 - 코드 자체가 "(직판)"으로 순수 한글인 문서가 있어서
+# (KR5114420016 실측: "수수료미징구-직판(직판)"), 이 정규식이 먼저
+# "(직판)"을 속성으로 삼켜 버리면 그 뒤에 남는 게 없어 코드 자리
+# (RE_CODE_AFTER)까지 아예 못 간다. 속성 자리에 "직판"이 오는 문서는
+# 없어서 빼도 안전하다.
+RE_PAREN_ATTR = re.compile(r"^\((?!직판\))([가-힣][가-힣,]{0,9})\)")
 
 # 이름표 앞에 코드가 "종류" 없이 그냥 놓인 형식:
 #     C-Pi    수수료미징구-오프라인-퇴직연금(고액) EA921  (KR5118420006 9쪽)
@@ -125,19 +175,56 @@ RE_CODE_BEFORE_PLAIN = re.compile(
     r"([A-Za-z][A-Za-z0-9]{0,3}(?:-[A-Za-z0-9]{1,4})?(?:\([^()]{1,10}\))?)$")
 # 속성은 1글자짜리도 있다("랩"). {2,8}로 잡았더니 "-랩,펀드등"이 통째로
 # 떨어져 나가서, 랩 전용인 F클래스가 "일반 고객도 가입 가능"으로 표시됐다.
-RE_ATTRS = re.compile(r"^((?:[-,][가-힣]{1,8})*)")
+#
+# 상한을 8로 뒀더니 이름표가 아니라 서술형 문장을 잘못 먹는 사고가 났다
+# (KR5160420009 실측: "수수료미징구-온라인-판매회사의온라인(On-line)을
+# 통하여 가입하며..."에서 "판매회사의온라인"이 구분자 없이 8자라 통째로
+# "속성"으로 삼켜지고, 그 뒤 문장 속 영어 괄호 "(On-line)"을 클래스
+# 코드로 잘못 읽었다 - "On-line"이라는 있지도 않은 클래스가 생겼다.
+# 코퍼스 전체에서 진짜 속성 중 제일 긴 것이 7자("무권유저비용형",
+# "사원복지연기금")라서, 8자였던 상한을 7로 낮추면 진짜 속성은 하나도
+# 안 잃으면서 이 문장만 더 안 삼킨다(그러면 뒤 텍스트가 "("로 시작하지
+# 않게 되어 코드 자리로 안 넘어간다).
+RE_ATTRS = re.compile(r"^((?:[-,][가-힣]{1,7})*)")
 # 채널 뒤에 바로 붙는 (코드) -> 라벨이 먼저 나오는 형식
-RE_CODE_AFTER = re.compile(r"^\(([A-Za-z0-9][A-Za-z0-9\-]{0,12}(?:\([^)]{1,10}\))?)\)")
+#
+# 코드 자체가 순수 한글(운용사 직판 채널)인 문서가 있다("수수료미징구-
+# 직판(직판)", "수수료미징구-직판-기관(직판f)" - KR5114420016/027
+# 실측). "직판"만 좁게 예외로 둔다 - 아무 한글이나 코드로 받으면
+# 서술형 문장의 괄호를 코드로 오인하는 사고가 난다(RE_ATTRS 8→7 글자수
+# 상한을 고친 이유와 같은 위험이라 폭을 넓히지 않는다).
+RE_CODE_AFTER = re.compile(
+    r"^\((직판[A-Za-z0-9]{0,3}|[A-Za-z][A-Za-z0-9\-]{0,12}(?:\([^)]{1,10}\))?)\)")
+# 코드를 감싼 바깥 괄호가 안 닫힌 문서가 있다(KR5129420031 11쪽 실측:
+# "...고액(Ci-RP(퇴직연금) E3898" - 안쪽 "(퇴직연금)"은 닫혔는데 바깥
+# "(Ci-RP...)"의 닫는 괄호 자체가 원문에 없다. 같은 문서 바로 위 줄의
+# "Cf-RP(퇴직연금))"은 정상적으로 닫혀 있어 이 한 곳만 결함이다).
+# RE_CODE_AFTER는 바깥 닫는 괄호까지 요구해서 이 경우 못 잡으므로,
+# 안쪽 괄호까지만 요구하는 느슨한 짝을 폴백으로 둔다.
+RE_CODE_AFTER_UNCLOSED = re.compile(
+    r"^\(([A-Za-z][A-Za-z0-9\-]{0,12}\([^)]{1,10}\))")
 # 코드가 먼저 나오는 형식: "종류C1(수수료...오프라인)" / "A(수수료...오프라인)"
 # 앞이 한글이면 코드가 아니라 펀드 이름의 꼬리다. 이걸 안 막았더니
 # "..._직판f(수수료미징구-직판-기관)"이라는 자펀드 목록 줄에서 f를
 # 클래스로 만들어 냈다(KR5114420027 60쪽). "종류"/"Class"는 코드 앞에
 # 붙는 머리말이므로 예외로 둔다.
+# 코드 뒤에 "형"을 붙이는 문서도 26개 있다("A형(수수료선취-오프라인)",
+# "C-G형(...)" - 신영자산운용 계열 문서군 실측). 괄호 바로 앞에서만
+# 허용하므로 임의의 한글 뒤 괄호를 코드로 오인할 위험은 없다.
+#
+# 코드는 항상 영문자로 시작한다(진짜 클래스 코드 중 숫자로 시작하는 게
+# 코퍼스 전체에 하나도 없다). 첫 글자를 숫자까지 허용했더니, 테두리 없는
+# 표 전체가 셀 하나로 뭉쳐진 문서에서 "2025/05/25C(수수료미징구..." 같은
+# 날짜 뒤 숫자를 코드로 잘못 읽었다(KR5125450023 4쪽 실측: "25C"라는
+# 있지도 않은 클래스가 생겼다 - RE_ATTRS 8→7, "On-line" 사고와 같은
+# 종류의 위험이다).
 RE_CODE_BEFORE = re.compile(
-    r"(?:종류|Class|^|[^가-힣A-Za-z0-9])([A-Za-z0-9][A-Za-z0-9\-]{0,12})\($")
+    r"(?:종류|Class|^|[^가-힣A-Za-z0-9])([A-Za-z][A-Za-z0-9\-]{0,12})형?\($")
 # 괄호가 아예 없는 형식: "종류C2수수료미징구-오프라인-보수체감98295"
 # (투자설명서 앞쪽 "집합투자기구의 명칭" 표가 이 모양이다)
-RE_CODE_BEFORE_BARE = re.compile(r"종류([A-Za-z0-9][A-Za-z0-9\-]{0,12})$")
+# "종류직판F"(KR5153420105 실측)처럼 "직판"으로 시작하는 코드도 있다.
+RE_CODE_BEFORE_BARE = re.compile(
+    r"종류(직판[A-Za-z0-9]{0,3}|[A-Za-z][A-Za-z0-9\-]{0,12})$")
 # 코드 앞에 붙는 머리말("종류C1", "Class S-R")
 RE_CODE_PREFIX = re.compile(r"^(?:종류|Class)")
 
@@ -147,7 +234,13 @@ _GAP = 150
 
 
 def _squash(text):
-    t = RE_SPACE_FEE_CH.sub(r"\1-", text or "")
+    # 붙임표를 일반 하이픈(-, U+002D) 대신 en dash/em dash/마이너스 기호로
+    # 쓰는 문서가 3개 있다("수수료미징구 –\n온라인형(Ce)" - KR514X450008
+    # 실측). RE_FEE 등 이 파일의 모든 정규식이 일반 하이픈만 찾으므로,
+    # 안 바꾸면 그 줄의 이름표를 통째로 못 읽는다("Ae"/"Ce"가 aka로도
+    # 안 남고 사라졌었다).
+    t = (text or "").translate(str.maketrans("–—−", "---"))
+    t = RE_SPACE_FEE_CH.sub(r"\1-", t)
     t = RE_SPACE_CH_ATTR.sub(r"\1-", t)
     return re.sub(r"\s+", "", t)
 
@@ -195,7 +288,7 @@ def _parse(text, known_codes=()):
             rest = rest[pa.end():]
 
         code = None
-        m = RE_CODE_AFTER.match(rest)
+        m = RE_CODE_AFTER.match(rest) or RE_CODE_AFTER_UNCLOSED.match(rest)
         if m:
             code = m.group(1)
         elif rest.startswith(")"):
@@ -222,8 +315,8 @@ def _parse(text, known_codes=()):
         if not code or code in found:
             continue
 
-        attrs = [p for p in re.split(r"[-,]", attrs_raw) if p]
-        attrs.extend(a for pa in paren_attrs for a in re.split(r"[,]", pa) if a)
+        attrs = [_norm_account_attr(p) for p in re.split(r"[-,]", attrs_raw) if p]
+        attrs.extend(_norm_account_attr(a) for pa in paren_attrs for a in re.split(r"[,]", pa) if a)
         body = channel + attrs_raw + "".join(f"({a})" for a in paren_attrs)
         found[code] = {
             "class_code": code,
@@ -235,8 +328,12 @@ def _parse(text, known_codes=()):
     return found
 
 
-# 코드만 든 칸("C", "C-Pe", "종류A")을 알아보기 위한 모양.
-RE_BARE_CODE = re.compile(r"^(?:종류)?([A-Za-z][A-Za-z0-9가-힣\-]{0,12})$")
+# 코드만 든 칸("C", "C-Pe", "종류A")을 알아보기 위한 모양. 코드 뒤에
+# 괄호 속성이 붙는 칸도 있다("S-P(퇴직)" - KR5118420062 8쪽 실측: 코드
+# 칸과 라벨 칸이 나뉜 표에서, 괄호를 안 받아 주니 "S-P(퇴직)"이 통째로
+# 코드칸 매칭에서 빠져 그 클래스 자체가 사라졌다).
+RE_BARE_CODE = re.compile(
+    r"^(?:종류)?([A-Za-z][A-Za-z0-9가-힣\-]{0,12}(?:\([^()]{1,10}\))?)$")
 
 
 def _parse_label_only(text):
@@ -332,13 +429,21 @@ def _describe(rec):
 # 가입자격 원문에서 "이 사람만 살 수 있다"를 분명히 말하는 구절.
 # 애매한 말은 일부러 넣지 않았다 - 여기 걸리면 "전용"이라고 단정하게
 # 되므로, 틀리느니 아무 말도 안 하는 편이 낫다.
+#
+# 짧은 속성 토큰(2번째 자리)도 같이 둔다 - 예전엔 description(긴 문구)만
+# 만들고 attributes는 빈 채로 남겨서, 이 자리로 채워지는 클래스(이름표가
+# 아예 없는 클래스)는 구조화된 속성이 하나도 없었다(KR5153420063 C-F/I
+# 실측). RESTRICTED가 쓰는 짧은 낱말과 같은 어휘를 쓴다.
 ELIGIBILITY_ONLY = (
-    ("랩어카운트", "랩·일임 계좌 전용"),
-    ("일임·자문", "랩·일임 계좌 전용"),
-    ("금전신탁", "금전신탁 전용"),
-    ("전문투자자", "전문투자자 전용"),
-    ("집합투자기구", "펀드(모집합투자기구) 전용"),
-    ("고액", "고액 전용"),
+    # "집합투자업자가 판매회사로서 직접 판매하는 수익증권" - 운용사가
+    # 중개 판매사 없이 직접 파는 클래스(KR5153420063 C-F 실측).
+    ("직접판매", "직판", "운용사 직판 전용"),
+    ("랩어카운트", "랩", "랩·일임 계좌 전용"),
+    ("일임·자문", "랩", "랩·일임 계좌 전용"),
+    ("금전신탁", "금전신탁", "금전신탁 전용"),
+    ("전문투자자", "전문투자자등", "전문투자자 전용"),
+    ("집합투자기구", "펀드", "펀드(모집합투자기구) 전용"),
+    ("고액", "고액", "고액 전용"),
 )
 RE_NO_LIMIT = re.compile(r"제한\s*없[음습]")
 
@@ -347,6 +452,27 @@ def _canon_key(code):
     """붙임표·괄호·대소문자만 지운 열쇠(merge_class_spelling.py와 같은 것).
     "같은 클래스다"가 아니라 "따져 볼 후보다"라는 뜻일 뿐이다."""
     return re.sub(r"\(.*?\)", "", code or "").replace("-", "").upper()
+
+
+def _channel_from_eligibility(conn, product_code, code):
+    """가입자격 원문에서 기본 판매경로(오프라인/온라인) 단어를 읽는다.
+    "온라인슈퍼"/"온라인직접판매"처럼 "온라인"을 부분 문자열로 포함하는
+    복합 채널과 안 헷갈리려고, 여기서는 기본 두 채널만 본다 - 이 함수를
+    부르는 쪽도 라벨 채널이 이 둘 중 하나일 때만 부른다(호출부 참고).
+    단어가 정확히 하나만 나올 때만 돌려준다 - 여럿이거나 하나도 없으면
+    라벨 쪽 채널을 못 믿을 근거가 없다는 뜻이라 손대지 않는다(None)."""
+    try:
+        row = conn.execute(
+            "SELECT eligibility FROM class_charges "
+            "WHERE product_code = ? AND class_code = ?",
+            (product_code, code)).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if not row or not row[0]:
+        return None
+    flat = re.sub(r"\s+", "", row[0])
+    found = {ch for ch in ("오프라인", "온라인") if ch in flat}
+    return next(iter(found)) if len(found) == 1 else None
 
 
 def _meaning_from_eligibility(conn, product_code, code):
@@ -374,15 +500,18 @@ def _meaning_from_eligibility(conn, product_code, code):
     text, page = row[0], row[1]
     flat = re.sub(r"\s+", "", text)
 
-    limits = []
-    for word, name in ELIGIBILITY_ONLY:
-        if word in flat and name not in limits:
-            limits.append(name)
+    limits, attrs = [], []
+    for word, attr, name in ELIGIBILITY_ONLY:
+        if word in flat:
+            if name not in limits:
+                limits.append(name)
+            if attr not in attrs:
+                attrs.append(attr)
     if limits:
         return {
             "product_code": product_code, "class_code": code,
             "fee_type": None, "channel": None, "account_type": None,
-            "attributes": [], "retail": False,
+            "attributes": attrs, "retail": False, "aka": [],
             "description": " · ".join(limits),
             "raw_label": f"종류형 명칭 없음(문서 표기 \"-\"), 가입자격: {text}",
             "page": page,
@@ -391,7 +520,7 @@ def _meaning_from_eligibility(conn, product_code, code):
         return {
             "product_code": product_code, "class_code": code,
             "fee_type": None, "channel": None, "account_type": None,
-            "attributes": [], "retail": True,
+            "attributes": [], "retail": True, "aka": [],
             "description": "가입 제한 없음",
             "raw_label": f"종류형 명칭 없음(문서 표기 \"-\"), 가입자격: {text}",
             "page": page,
@@ -402,6 +531,72 @@ def _meaning_from_eligibility(conn, product_code, code):
 # 「집합투자기구의 명칭(종류형 명칭)」 표가 자기 머리에 적어 둔 이름.
 # 코드 개수가 같은 표가 여럿일 때만 쓴다(_Vote 참고).
 NAMING_TABLE_TITLES = ("집합투자기구의명칭", "종류형명칭", "집합투자기구명칭")
+
+
+# 표를 그릴 때 칸 안의 줄바꿈까지 별도 "행"으로 쪼개는 문서가 있다
+# (KR5127420034 21쪽 실측: 논리적으로 한 행("C-퇴직연금" / "수수료미징구-
+# 오프라인-퇴직연금" / "퇴직연금 가입자...")인데, 셀 안에서 줄이 바뀐
+# 지점("금" / "연금")이 다음 '행'으로 떨어져 나와 코드가 "C-퇴직연",
+# 속성이 "퇴직"으로 통째로 잘려 보였다 - 문서 결함이 아니라 표 읽기
+# 쪽 문제였다). 이런 조각 행은 칸 전부가 한글 1~3자뿐이라, 정상 행과
+# 안 헷갈리고 가려낼 수 있다.
+RE_WRAP_FRAGMENT = re.compile(r"^[가-힣]{1,3}$")
+
+
+def _looks_like_wrap_continuation(row):
+    """이 행이 새 행이 아니라 윗 행 칸 글자의 줄바꿈 조각인가.
+
+    칸 전부(빈 칸 제외)가 한글 1~3자뿐이어야 한다 - 숫자·영문·붙임표가
+    하나라도 섞이면 진짜 행(수익률 숫자 행 등)일 수 있으므로 손대지
+    않는다. "직판"은 그 자체로 진짜 코드라 예외로 둔다."""
+    cells = [(c or "").strip() for c in row]
+    non_empty = [c for c in cells if c]
+    if not non_empty:
+        return False
+    for c in non_empty:
+        if c == "직판" or not RE_WRAP_FRAGMENT.match(c):
+            return False
+    return True
+
+
+def _stitch_wrapped_rows(rows):
+    """조각 행을 윗 행에 칸별로 이어 붙인다(사이에 아무 글자도 안 넣는다 -
+    줄바꿈이 곧 이어 붙일 자리이므로)."""
+    out = []
+    for row in rows:
+        if out and _looks_like_wrap_continuation(row):
+            prev = out[-1]
+            width = max(len(prev), len(row))
+            out[-1] = [
+                (prev[i] or "" if i < len(prev) else "") +
+                (row[i] or "" if i < len(row) else "")
+                for i in range(width)
+            ]
+            continue
+        out.append(list(row))
+    return out
+
+
+# 본문(표가 아닌 문장) 줄바꿈이 코드 중간(붙임표 뒤)에서 끊기면 뒷 줄만
+# 봐서는 코드가 마지막 글자 하나로 잘못 읽힌다(KR5118420062 34쪽 실측:
+# "...예상투자기간이 해당 시점 이전이라면 종류C-" 줄 다음 "e(수수료
+# 미징구-온라인)에 가입하시는..." 줄 - 뒷 줄만 보면 코드가 "e"가 된다.
+# 진짜 온라인 미징구 클래스는 "C-e"로 이미 따로 있다). 앞 줄이
+# "종류CODE-"로 끝나고 뒷 줄이 코드 조각처럼 보이는 글자로 시작하면
+# 이어 붙인다.
+RE_LINE_CODE_TAIL = re.compile(r"종류([A-Za-z][A-Za-z0-9]{0,3})-$")
+RE_LINE_CODE_HEAD = re.compile(r"^[A-Za-z0-9]{1,3}\(")
+
+
+def _stitch_wrapped_lines(lines):
+    out = []
+    for line in lines:
+        if out and RE_LINE_CODE_TAIL.search(out[-1].rstrip()) \
+                and RE_LINE_CODE_HEAD.match(line.lstrip()):
+            out[-1] = out[-1].rstrip() + line.lstrip()
+            continue
+        out.append(line)
+    return out
 
 
 def _tables_in_order(conn, doc_id):
@@ -415,7 +610,7 @@ def _tables_in_order(conn, doc_id):
             rows = json.loads(dj)
         except (ValueError, TypeError):
             continue
-        out.append((page, rows))
+        out.append((page, _stitch_wrapped_rows(rows)))
     return out
 
 
@@ -517,11 +712,12 @@ def _fold_spelling(merged, pages, known_codes):
     for cc in merged:
         groups[_canon_key(cc)].append(cc)
     aka = {}
-    for codes in groups.values():
+
+    def _take(codes):
         if len(codes) < 2:
-            continue
+            return
         if len({_meaning_key(merged[c]) for c in codes}) != 1:
-            continue  # 뜻이 다르면 손대지 않는다
+            return  # 뜻이 다르면 손대지 않는다
         keep = next((c for c in sorted(codes) if c in known_codes), None)
         if keep is None:
             keep = min(sorted(codes), key=lambda c: pages[c])
@@ -530,6 +726,79 @@ def _fold_spelling(merged, pages, known_codes):
                 aka.setdefault(keep, []).append(c)
                 del merged[c]
                 del pages[c]
+
+    for codes in list(groups.values()):
+        _take(codes)
+
+    # 글자 순서만 뒤바뀐 표기도 있다(KR5111450067 실측). 11쪽 명칭표는
+    # "C-P2E", 43쪽 비용예시표는 "C-PE2"라고 적는다 - 붙임표를 지운
+    # 글자가 같은데(P,2,E) 순서만 다르다. _canon_key로는 안 걸려서
+    # (다른 문자열이라 다른 그룹이 됨) 정렬한 글자로 한 번 더 묶는다.
+    # 위와 똑같이 뜻이 완전히 같을 때만 합친다 - 자릿수가 같은 두
+    # 코드가 우연히 애너그램이 될 확률은 낮고, 그마저도 뜻이 다르면
+    # 안 건드리므로 위험이 크지 않다.
+    remaining = collections.defaultdict(list)
+    for cc in merged:
+        remaining["".join(sorted(_canon_key(cc)))].append(cc)
+    for codes in remaining.values():
+        _take(codes)
+
+    # 코드와 뜻이 함께 잘린 표기도 있다 - 문서 자체의 글자 결락이다(실측:
+    # KR5127420034/039 21쪽. "퇴직" 뒤 "금" 글자가 PDF 콘텐츠 스트림에
+    # 아예 없다 - 지운 게 아니라 원본에 없다). 그러면 코드도
+    # "C-퇴직연"(정확히는 "C-퇴직연금"이어야 함), 속성도 "퇴직"(정확히는
+    # "퇴직연금")으로 코드·뜻이 같이 잘린다. 뜻만 보고 합치면 "C-P"(개인
+    # 연금)와 "C-P2"(코퍼스에 실재하는 별도 클래스)처럼 진짜 다른 클래스를
+    # 잘못 묶을 위험이 있으므로, 코드 문자열 자체도 canon_key 접두 관계일
+    # 때만 합친다 - "짧은 코드의 뜻이 긴 코드 뜻의 앞부분과 같고, 짧은
+    # 코드 글자 자체도 긴 코드 글자의 앞부분과 같다"는 두 조건이 함께
+    # 성립하는 경우는 "글자가 잘렸다"는 가설 말고는 달리 설명하기 어렵다.
+    for c_short in list(merged):
+        if c_short not in merged:
+            continue
+        ck_short = _canon_key(c_short)
+        for c_full in list(merged):
+            if c_full == c_short or c_full not in merged or c_short not in merged:
+                continue
+            ck_full = _canon_key(c_full)
+            if ck_full == ck_short or not ck_full.startswith(ck_short):
+                continue
+            if not _is_truncation_of(_meaning_key(merged[c_short]), _meaning_key(merged[c_full])):
+                continue
+            aka.setdefault(c_full, []).append(c_short)
+            del merged[c_short]
+            del pages[c_short]
+            break
+
+    # 코드 앞쪽 글자(클래스 계열 접두, "C-" 등)가 표 하나에서만 통째로
+    # 빠지는 경우도 있다 - 뜻(수수료방식-판매경로-속성)은 완전히 같은데
+    # 코드만 짧다(KR5160420009 41쪽 실측: 수익률표에서만 "C-P2e"가
+    # "P2e"로, "C-W"가 "W"로 적혀 있다. 이 문서의 다른 모든 표는 전부
+    # "C-" 접두를 그대로 쓴다).
+    #
+    # 뜻이 같다는 것만으로는 부족하다 - 파서가 못 잡아낸 속성 차이 때문에
+    # 뜻(fee_type·channel·attributes)이 같게 읽혀도 실제로는 다른 클래스인
+    # 경우가 있다(KR5153420105 실측: "I"와 "C-PI"가 파싱상 뜻은 똑같이
+    # "미징구-오프라인-기관"이지만, 보수표엔 총보수 0.19%/0.17%로 각각
+    # 따로 실려 있는 별개 클래스다). 그래서 둘 다 보수표(known_codes)에
+    # 독자적으로 등재돼 있으면 - 보수표가 이미 "둘은 별개"라고 말하는
+    # 것이므로 - 합치지 않는다. 한쪽만 등재돼 있을 때만(등재 안 된 쪽이
+    # 어느 한 표에서만 접두가 빠진 조각일 가능성이 높을 때만) 합친다.
+    for c_short in list(merged):
+        if c_short not in merged:
+            continue
+        ck_short = _canon_key(c_short)
+        for c_full in list(merged):
+            if c_full == c_short or c_full not in merged or c_short not in merged:
+                continue
+            ck_full = _canon_key(c_full)
+            if ck_full == ck_short or not ck_full.endswith(ck_short):
+                continue
+            if c_short in known_codes and c_full in known_codes:
+                continue
+            _take([c_short, c_full])
+            break
+
     return aka
 
 
@@ -640,6 +909,7 @@ def _single_class_fund(conn, product_code, known_codes):
         "account_type": None,
         "attributes": [],
         "retail": True,
+        "aka": [],
         "description": "클래스 구분 없는 단일 펀드",
         "raw_label": form_line or "종류형 표시 없음",
         "page": form_page,
@@ -698,14 +968,54 @@ def extract(db_path=DEFAULT_DB_PATH):
         for page, text in conn.execute(
                 "SELECT page, text FROM chunks WHERE doc_id = ? ORDER BY page",
                 (code,)):
-            for line in (text or "").splitlines():
+            for line in _stitch_wrapped_lines((text or "").splitlines()):
                 for cc, rec in _parse(line, known_codes).items():
                     votes[cc].add(rec, page, False)
 
         for cc, (rec, page) in _resolve(votes).items():
             merged[cc] = rec
             pages[cc] = page
+
+        # 이름표가 여러 표에 반복돼도, 그 반복이 전부 같은 최초 입력
+        # 오타의 복붙이면 "많이 나왔다"는 다수결로는 못 가른다(KR5194450018
+        # 실측: "수수료선취-오프라인(A-e)"이 명칭표·비용표·요약표 9곳에서
+        # 나오는데, 가입자격 원문은 "판매사의 온라인을 통해 가입"이라고
+        # 분명히 말하고, 협회 펀드코드(AY121)·판매수수료율(0.5%)도 다른
+        # 표의 "수수료선취-온라인(A-e)"와 완전히 같다 - 반복 횟수가 아니라
+        # 가입자격이라는 별도 출처가 진실이다). 가입자격 원문에 판매경로
+        # 단어가 하나만, 그것도 라벨과 다르게 적혀 있으면 그쪽을 따른다.
+        for cc in list(merged):
+            cur_channel = merged[cc]["channel"]
+            # "온라인슈퍼"/"온라인직접판매" 등 복합 채널은 대상에서 뺀다 -
+            # 가입자격 원문의 "온라인"이 그 복합 채널의 일부일 수 있어
+            # (S-P 실측: "온라인 판매시스템"이 "온라인슈퍼"를 가리킴)
+            # 기본 채널로 잘못 덮어쓸 위험이 있다.
+            if cur_channel not in ("오프라인", "온라인"):
+                continue
+            elig_ch = _channel_from_eligibility(conn, code, cc)
+            if elig_ch and elig_ch != cur_channel:
+                merged[cc] = dict(merged[cc], channel=elig_ch)
+
         aka = _fold_spelling(merged, pages, known_codes)
+
+        # 티어(보수체감) 계열 전체를 대표하는 벌거벗은 글자가 곁다리로
+        # 남는 문서가 있다 - 보수표엔 C1~C5(또는 C1~C4)만 실제 클래스로
+        # 있고 "C" 자체는 없는데, <1,000만원 투자시...> 비용예시표가
+        # C1~C5를 한 줄로 몰아 "C"라는 대표 라벨을 쓴다(KR5172450019
+        # 27쪽, KR5194450018 38쪽 실측 - KR5194450018은 각주로도 "C는
+        # 이연보수체계를 적용하여 계산한 수치"라고 명시). 보수표에 자기
+        # 몫의 보수 행이 없고, 같은 접두의 숫자-티어 계열이 2개 이상
+        # 이미 실재할 때만 지운다 - 그래야 진짜 벌거벗은 클래스(A, C
+        # 등 티어가 아예 없는 문서)는 안 건드린다.
+        for cc in list(merged):
+            if cc in known_codes:
+                continue
+            tiers = sum(1 for kc in known_codes if kc.startswith(cc)
+                        and kc[len(cc):].isdigit())
+            if tiers >= 2:
+                del merged[cc]
+                del pages[cc]
+                aka.pop(cc, None)
 
         if not merged:
             single = _single_class_fund(conn, code, known_codes)
@@ -727,17 +1037,25 @@ def extract(db_path=DEFAULT_DB_PATH):
                 out.append(rec)
 
         for cc, rec in sorted(merged.items()):
+            account_type = next(
+                (a for a in rec["attributes"]
+                 if _match_any(a, ACCOUNT_TYPES)), None)
+            attrs = rec["attributes"]
+            if account_type is None:
+                inferred = _account_type_from_code(cc)
+                if inferred:
+                    account_type = inferred
+                    attrs = attrs + [inferred]
+            rec = dict(rec, attributes=attrs)
             out.append({
                 "product_code": code,
                 "class_code": cc,
                 "fee_type": rec["fee_type"],
                 "channel": rec["channel"],
-                "account_type": next(
-                    (a for a in rec["attributes"]
-                     if _match_any(a, ACCOUNT_TYPES)), None),
-                "attributes": rec["attributes"],
+                "account_type": account_type,
+                "attributes": attrs,
                 "retail": not any(_match_any(a, RESTRICTED)
-                                  for a in rec["attributes"]),
+                                  for a in attrs),
                 # 같은 클래스를 문서가 달리 적은 표기(뜻이 같을 때만).
                 # 버리지 않고 남겨 둬야 그 표기로 물었을 때도 찾을 수 있다.
                 "aka": aka.get(cc, []),

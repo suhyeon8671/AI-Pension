@@ -33,6 +33,8 @@ from collections import defaultdict
 
 import pdfplumber
 
+from pdf_words import extract_words as _safe_words
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(REPO_ROOT, "data", "products")
 EXTRACTED_DIR = os.path.join(REPO_ROOT, "extracted", "products")
@@ -43,16 +45,37 @@ DECIMAL_RE = re.compile(r"^-?\d+\.\d+$")
 # 아직 수익률이 없는(전액 "-") 클래스 행도 있다 (예: 설정된 지 얼마 안 된 클래스).
 # 값이 없다는 사실 자체와 class_code/설정일은 여전히 의미가 있어 버리지 않는다.
 DASH_RE = re.compile(r"^-+$")
+# 클래스 코드는 이 말뭉치에서 절대 4자리 연도 모양이 아니다 - 기간
+# 헤더 문구("2024.11.01~")가 데이터 행으로 오인될 때만 이 모양이
+# 나온다(process_doc의 가짜 행 필터 참고).
+RE_BOGUS_YEAR_CODE = re.compile(r"^(?:19|20)\d{2}$")
 CLASS_CODE_RE = re.compile(r"\(([A-Za-z0-9\-]{1,8})\)")
 # 일부 문서는 클래스명을 "(A2)"처럼 괄호로 안 감싸고 "ClassA2"처럼 그대로 붙여 쓴다
 # (예: KR5120420039). 괄호 형식이 안 잡히면 이 패턴으로 한 번 더 시도한다.
-CLASS_CODE_NOPAREN_RE = re.compile(r"Class[- ]?([A-Za-z0-9\-]{1,6})", re.IGNORECASE)
+# "S-P"와 "S-P(퇴직)"처럼 괄호 안 한글 접미사만 다르고 나머지 코드가 같은
+# 클래스 쌍이 한 상품 안에 같이 있는 문서가 있다(KR5118201004/036/062
+# 실측: "ClassS-P(퇴직) ... 3.85" / "ClassS-P ... 3.84" - 값도 설정일도
+# 서로 다른 완전히 별개의 클래스인데, 접미사를 못 잡으면 "S-P(퇴직)"의
+# 값이 진짜 "S-P"에 붙어버린다. 이미 "S-P"도 이 상품의 정식 코드라
+# _normalize_class_code의 사후 보정도 못 걸러낸다 - "이미 아는 코드"라
+# 그대로 통과해버리기 때문). 뒤에 "(한글)"이 공백 없이 바로 붙어 있으면
+# 처음부터 코드에 포함해서 잡는다.
+CLASS_CODE_NOPAREN_RE = re.compile(
+    r"Class[- ]?([A-Za-z0-9\-]{1,6}(?:\([가-힣]+\))?)", re.IGNORECASE
+)
 # 괄호도 "Class"도 없이 그냥 "종류A", "종류C4"처럼 쓰는 문서도 있다(제3부
 # "3.집합투자기구의 운용실적" 섹션에서 확인 - KR510902511M 46페이지). 이
 # 라벨은 데이터 줄 "위"에 오는 경우가 많아(3줄 구조: 종류코드 / 데이터 /
 # 상세설명) 예외적으로 이전 줄까지 같이 본다 - "종류"라는 키워드로 앵커링돼
 # 있어서 일반 괄호 패턴과 달리 다른 행의 것을 잘못 가져올 위험이 낮다.
 CLASS_CODE_JONGRYU_RE = re.compile(r"종류\s*([A-Za-z0-9\-]{1,6})")
+# 클래스 코드 자체에 한글이 섞인 문서도 있다(KR5153420105 실측: "종류직판F
+# 수수료미징구-..." - class_fees.json이 아는 정식 코드도 "직판F"). 그런데
+# "종류"라는 낱말 자체가 "종류형투자신탁의 경우..." 같은 흔한 각주 문구에도
+# 나와서, 한글까지 무조건 다 허용하면 "형" 같은 걸 코드로 잘못 뽑아낼
+# 위험이 크다. known_classes에 그대로 있는 경우에만 인정하도록 별도
+# 패턴으로 분리한다(아래 사용처에서 known_classes 대조 후에만 쓴다).
+CLASS_CODE_JONGRYU_KO_RE = re.compile(r"종류\s*([A-Za-z0-9\-가-힣]{1,6})")
 # "가.연평균수익률"(누적 1/2/3/5년+설정후, 우리 스키마와 동일)과 "나.연도별
 # 수익률 추이"(1~5년차별 단년도 수익률, 컬럼 의미가 다름)는 둘 다 숫자
 # 5개짜리 줄이라 구분 안 하면 "나" 표 값을 "가" 표 컬럼에 잘못 매핑하게
@@ -70,7 +93,15 @@ CLASS_CODE_JONGRYU_RE = re.compile(r"종류\s*([A-Za-z0-9\-]{1,6})")
 # 조사가 붙어서 "추이"/제목 형태와 구분된다).
 SECTION_GA_RE = re.compile(
     r"(?:가[\.．]|(?<!주)\d[\).])연평균수익률(?![은는이가을를및])|^연평균수익률\(")
-SECTION_NA_RE = re.compile(r"(?:나[\.．]|\d[\).])?연도별수익률추이")
+# "추이" 없이 그냥 "나. 연도별 수익률"이라고만 쓰는 문서도 있다
+# (KR5169950018 실측: "나.연도별수익률(세전기준,단위:%)" - "추이"가
+# 아예 없다). "추이"를 필수로 요구하면 이 표를 "가" 표와 구분 못 해
+# "나" 표 클래스 행(값 의미가 다름 - 연도별 단년도)이 "가" 표의 실제
+# known과 충돌하는 값으로 섞여 들어가 그 페이지 검증 전체가 실패했다.
+# "추이"는 선택으로 두되, 위 "가" 표와 같은 이유로 뒤에 조사가 붙은
+# 설명 문장과는 구분한다.
+SECTION_NA_RE = re.compile(
+    r"(?:나[\.．]|\d[\).])?연도별수익률(?:추이)?(?![은는이가을를및])")
 # 클래스 행의 설정일("2016-04-18", "2001.01.31" 등) - 표 데이터가 아니라 각 행에
 # 딸린 값이라 구조화 필드로 남겨둘 만하다.
 INCEPTION_DATE_RE = re.compile(r"\d{4}[.\-]\d{1,2}[.\-]\d{1,2}")
@@ -111,9 +142,44 @@ def _detect_period_columns(lines):
     # 혼동" 주의사항과 같은 종류의 문제). 진짜 헤더는 "최근 1년 최근 2년
     # 최근 3년 최근 5년 설정일이후"처럼 여러 개의 "N년"/"설정일이후" 라벨이
     # 한 줄에 다 같이 나온다 - 그런 줄(3개 이상)만 헤더로 인정한다.
+    #
+    # 이 조건을 만족하는 줄이 페이지에 두 번 나오는 문서가 있다(KR5118420036
+    # 54쪽 실측: 표 위에 그려진 막대그래프의 x축 눈금 "최근1년 최근2년
+    # 최근3년 최근5년 설정일이후"도 걸린다 - 눈금은 한 칸에 다 붙여 찍혀서
+    # "최근1년"이 한 단어가 되는데, 이것도 "최근"이 접두로 붙은 "N년"
+    # 형식이라 정규식에 그대로 걸린다). 첫 번째로 걸리는 줄만 쓰면 그래프
+    # 눈금 좌표를 표 헤더로 잘못 쓰게 된다 - 값 행 바로 위, 페이지에서 가장
+    # 마지막에 나오는 자격 있는 줄이 실제 표 헤더다(그래프는 표보다 항상
+    # 위에 그려진다).
+    # "설정일"/"이후"가 칸이 좁아 같은 줄이 아니라 아예 다른 두 줄로
+    # 세로로 쪼개져 찍히는 문서도 있다(KR5169950018 실측: "설정일"
+    # 한 줄, "이후"가 그 아래 다른 줄 - 같은 줄 분리(위 KR5118420036
+    # 사례)로도 못 잡는다). 페이지 전체에서 그런 조각을 먼저 모아두고,
+    # 각 헤더 후보 줄에서 세로로 가까운(±20pt) 조각을 찾아 붙인다.
+    since_candidates = []  # [(top, x0), ...]
+    for li, line in enumerate(lines):
+        for idx, w in enumerate(line):
+            if "설정일이후" in w["text"] or "설정이후" in w["text"]:
+                since_candidates.append((w["top"], w["x0"]))
+            elif w["text"] == "설정일":
+                if idx + 1 < len(line) and "이후" in line[idx + 1]["text"]:
+                    since_candidates.append((w["top"], w["x0"]))
+                else:
+                    # "이후"가 바로 다음 줄이 아니라, 그 사이에 다른 헤더
+                    # 조각 줄(예: "종류 최근1년...")이 끼어 있을 수 있다
+                    # (KR5169950018 실측) - 세로로 가까운(±20pt) 범위
+                    # 안에서 몇 줄 더 찾아본다.
+                    for nxt in lines[li + 1: li + 4]:
+                        if abs(nxt[0]["top"] - w["top"]) >= 20:
+                            break
+                        if any(nw["text"] == "이후" for nw in nxt):
+                            since_candidates.append((w["top"], w["x0"]))
+                            break
+
+    best = None
     for line in lines:
         anchors = {}
-        for w in line:
+        for idx, w in enumerate(line):
             m = YEAR_HEADER_RE.match(w["text"])
             if m:
                 label = {"1": "1y", "2": "2y", "3": "3y", "5": "5y"}.get(m.group(1))
@@ -121,9 +187,25 @@ def _detect_period_columns(lines):
                     anchors[label] = w["x0"]
             elif "설정일이후" in w["text"]:
                 anchors["since_inception"] = w["x0"]
-        if len(anchors) >= 3:
-            return anchors
-    return None
+            elif w["text"] == "설정일" and idx + 1 < len(line) and "이후" in line[idx + 1]["text"]:
+                # "설정일"과 "이후"가 별도 단어로 떨어져 찍히는 문서도 있다
+                # (KR5118420036 실측 - 위 사례와 같은 페이지).
+                anchors["since_inception"] = w["x0"]
+        if "since_inception" not in anchors and since_candidates and anchors:
+            line_top = line[0]["top"]
+            near = min(since_candidates, key=lambda c: abs(c[0] - line_top))
+            if abs(near[0] - line_top) < 20:
+                anchors["since_inception"] = near[1]
+        # 설정된 지 2년이 안 된 펀드는 "최근1년/설정일이후" 두 칸짜리
+        # 헤더만 찍는 문서가 있다(KR5118420006 44쪽 실측: "최근 1년
+        # 설정일 이후" - 2년/3년/5년 칸 자체가 헤더에도 없다). "since_
+        # inception"이 명시적으로 잡혔을 때만(우연히 걸릴 각주 문구와
+        # 구분되는 확실한 표지) 2칸도 인정한다 - 그 표지 없이 2개짜리를
+        # 다 받아주면 무관한 짧은 줄까지 헤더로 오인할 위험이 크다.
+        min_anchors = 2 if "since_inception" in anchors else 3
+        if len(anchors) >= min_anchors:
+            best = anchors
+    return best
 
 
 def cluster_lines(words, tol=2.5):
@@ -175,7 +257,12 @@ def row_kind(pre_text, prev_line_text="", next_line_text=""):
     # 폰트 문제로 글자가 한 자씩 떨어져 나오는 문서에서는 "비교지수"가
     # "비 교 지 수"처럼 공백 낀 상태로 들어오기도 해서, 공백을 지우고 비교한다.
     normalized = re.sub(r"\s+", "", pre_text)
-    if "비교지수" in normalized:
+    # "비교지수"의 동의어를 쓰는 문서도 있다(KR5144450095/KR5153450785
+    # 실측: "참조지수", KR516702010M 실측: "참고지수" - 뜻은 같은데
+    # 말만 다르다). 이 말들을 못 알아보면 class_code도 없고 행 종류도
+    # 못 정해져 기본값인 class_return(class_code=null)으로 새 나가는데,
+    # 실제로는 비교지수 행이라 값이 엉뚱한 클래스에 붙지 않는다.
+    if "비교지수" in normalized or "참조지수" in normalized or "참고지수" in normalized:
         return "benchmark"
     if "변동성" in normalized:
         return "volatility"
@@ -194,27 +281,70 @@ def row_kind(pre_text, prev_line_text="", next_line_text=""):
     # normalized가 "투자신탁2013.08.19"처럼 되면서 매치가 실패해 기본값인
     # class_return(class_code=null)으로 잘못 새는 버그가 있었다(KR510902773M
     # 실측 - 상세표(45페이지, 설정일 없이 "투자신탁"만 있어 정상 매치)의
-    # fund_aggregate 행과 row_kind가 달라져 cross-page dedup도 안 먹혔다).
+    # fund 행과 row_kind가 달라져 cross-page dedup도 안 먹혔다).
     # "비교지수"/"변동성"과 같은 방식으로 부분일치로 바꾼다.
     if "투자신탁" in normalized:
-        return "fund_aggregate"
+        return "fund"
+    # "투자신탁" 대신 "운용"이라고만 줄여 쓰는 문서도 있다(KR5194450018
+    # 5쪽 실측: "운용 2.08 3.46 -4.85 7.78 4.99" 행 바로 아래 "비교지수"/
+    # "수익률변동성" 행이 따라오는 것으로 보아 클래스별 행이 아니라 펀드
+    # 전체 행이다). "운용"은 "운용사"/"운용역"/"운용전문인력"처럼 다른
+    # 말에 흔히 섞여 쓰이므로, "투자신탁"과 달리 부분일치가 아니라 라벨
+    # 전체가 정확히 "운용"일 때만 본다.
+    #
+    # 그런데 "운용"만 정확히 일치해도 가짜로 걸리는 경우가 있다
+    # (KR5118420006 실측: "동종집합투자기구 운용현황" 표의 "책임(팀장)
+    # ... / 운용 3.35 5.24 / 부책임(대리) ..." 행 - 운용사 평균수익률일
+    # 뿐 이 펀드의 수익률이 아닌데 라벨이 우연히 "운용" 한 글자로만
+    # 떨어져 나왔다). KR5194450018 실측 근거 자체가 "바로 아래 비교지수/
+    # 변동성 행이 따라온다"는 것이었으므로, 그 확인을 실제 조건으로
+    # 요구한다 - 근처에 비교지수/변동성이 없으면 fund로 보지
+    # 않는다(class_return으로도 보지 않는다 - 클래스도 아니므로 아래
+    # 호출부가 class_code 없이 걸러낸다).
+    if normalized == "운용" and (
+            "변동성" in around or "비교지수" in around
+            or "참조지수" in around or "참고지수" in around):
+        return "fund"
     return "class_return"
 
 
-def find_return_rows_on_page(page, page_num, section="가", known_classes=None):
+def find_return_rows_on_page(page, page_num, section="가", known_classes=None,
+                              inherited_period_anchors=None, next_page=None):
     """section: 이 페이지 시작 시점의 "가/나" 섹션 상태(문서 내 이전 페이지에서
     이어받음). "나.연도별 수익률 추이" 섹션에 들어간 뒤로는 다음 "가" 제목을
     다시 만나기 전까지 데이터 행을 전부 스킵한다 - 컬럼 의미가 다른 표라
     "가" 표 스키마(1y/2y/3y/5y/since_inception)에 잘못 매핑하면 안 되기 때문.
     known_classes: class_fees.json에서 이미 확인된 이 상품의 클래스 코드
     목록(제공되면 라벨이 상품명 전체와 붙어 나오는 상세표에서 class_code
-    보강용으로 씀). 반환값은 (rows, 이 페이지가 끝난 시점의 section)."""
+    보강용으로 씀). inherited_period_anchors: 바로 앞 페이지에서 찾은 기간
+    헤더 x좌표(이 페이지에 헤더가 없으면 이어받는다 - 아래 참고). next_page:
+    바로 다음 페이지의 pdfplumber Page(있으면) - 라벨의 클래스 코드 자체가
+    페이지 경계에서 끊길 때 보강용으로 씀(아래 참고). 반환값은
+    (rows, 이 페이지가 끝난 시점의 section, 다음 페이지로 넘길 기간 헤더)."""
     # x_tolerance=2(기본)로는 일부 문서에서 폰트 문제로 글자가 한 자씩 떨어져
     # 나오는 케이스(예: "4 .2 1")가 있어 숫자 인식이 아예 안 된다. 5로 올리면
     # 그 문제가 해결되면서도(검증 완료) 다른 문서의 값이 잘못 합쳐지진 않았다.
-    words = page.extract_words(x_tolerance=5, keep_blank_chars=False)
+    #
+    # 그런데 이걸로도 못 고치는 결함이 따로 있다. 글자의 회전행렬에 아주
+    # 작은 잡음(각도로 0.0000016도)이 섞여 있으면 pdfplumber가 그 글자를
+    # "세로쓰기"로 보고 아예 다른 경로로 처리해서, 붙어 있는 글자도 한
+    # 자씩 따로 나온다(KR5111450067 56쪽 실측: 1320자 중 1264자가 이
+    # 증상, "최근 1년"이 "최","근","1","년" 네 단어로 쪼개진다). 이건
+    # 간격 문제가 아니라 아예 다른 묶기 경로를 타는 거라 x_tolerance를
+    # 얼마를 줘도 못 고친다(실측: x_tolerance=5도 1118자를 377개의
+    # "단어"로 줄이지만 여전히 여러 글자가 잘못 뭉쳐 있다 - 정답은 236
+    # 단어). pdf_words.extract_words가 이 회전 잡음만 골라 고친다(정상
+    # 문서는 결과가 완전히 같다).
+    words = _safe_words(page, x_tolerance=5, keep_blank_chars=False)
     lines = cluster_lines(words)
-    period_anchors = _detect_period_columns(lines)
+    # 표가 페이지 경계에서 끊기면 이어지는 쪽엔 기간 헤더("최근1년 ...
+    # 설정일이후")가 반복되지 않는 문서가 있다(KR5120420091 58쪽 실측:
+    # 57쪽에 헤더가 한 번만 있고 58쪽부터는 클래스별 3줄짜리 블록만
+    # 죽 이어진다). 이 페이지에 헤더가 없으면 앞 페이지 것을 그대로
+    # 쓴다 - 없으면 순서 방식(PERIOD_LABELS[:len(값)])으로 떨어져 3번째
+    # 값(실제로는 "설정일이후")이 "3y"로 잘못 이름 붙는다.
+    period_anchors = _detect_period_columns(lines) or inherited_period_anchors
+    out_period_anchors = period_anchors
     rows = []
     for i, line in enumerate(lines):
         line_text_for_section = re.sub(r"\s+", "", " ".join(w["text"] for w in line))
@@ -242,16 +372,56 @@ def find_return_rows_on_page(page, page_num, section="가", known_classes=None):
         # 경우로만 좁힌다.
         if len(value_tokens) == 6 and DASH_RE.match(value_tokens[0]["text"]):
             value_tokens = value_tokens[1:]
-        if len(value_tokens) < 3 or len(value_tokens) > 5:
+        # 설정 2년 미만 펀드는 표 자체가 "최근1년/설정일이후" 두 칸만
+        # 갖기도 한다(KR5118420006 44쪽 실측, 위 _detect_period_columns
+        # 주석 참고) - 이 페이지 헤더가 실제로 그렇게(2칸만) 잡혔을 때만
+        # 값 2개짜리 행도 받아준다. 그 표지 없이 그냥 2개로 낮추면 각주의
+        # 우연한 숫자 2개짜리 줄까지 행으로 오인한다.
+        # 최근에 신설된 클래스는 "설정일이후" 한 칸만 값이 찍히기도 한다
+        # (KR5118420062 44쪽 실측: "ClassS-P 3.37"처럼 5칸 헤더 표에서도
+        # 값이 딱 1개뿐 - 1년도 안 지나 나머지 기간 칸 자체가 아직 없다).
+        # 기간 헤더(period_anchors)가 있으면 값이 몇 개든 x좌표로 정확한
+        # 칸에 매칭되므로, 개수 자체를 문지기로 쓸 필요가 없다 - 헤더를
+        # 못 찾았을 때(순서 추측 방식)만 최소 3개를 요구한다.
+        min_values = 1 if period_anchors else 3
+        if len(value_tokens) < min_values or len(value_tokens) > 5:
+            continue
+        # 값 개수 문지기를 1까지 낮추면, 본문 산문 중 우연히 "-" 하나만
+        # 있는 줄(값이 하나도 없는데 DASH_RE만 걸린 경우)까지 행으로
+        # 오인한다(KR5111420047 실측: "Top-down 및 Bottom-up을 병행한..."
+        # 문장 줄이 class_code="Duration"인 가짜 행으로 잡혔다 - 값이
+        # "-" 하나뿐이었다). 값이 1~2개뿐일 때는 그 중 적어도 하나는
+        # 진짜 소수여야 한다(대시만으로는 신설 클래스 신호가 안 된다 -
+        # 신설 클래스도 최소 하나는 실제 수치를 찍는다).
+        if len(value_tokens) <= 2 and not any(
+            DECIMAL_RE.match(t["text"]) for t in value_tokens
+        ):
             continue
         # 운용전문인력 표(성명/생년/직위 등)와 구분: 그 표는 억원 단위 정수(운용규모)나
         # 4자리 연도(생년) 같은 게 섞여 있고, 클래스 수익률 표는 전부 소수 % 값이다.
-        # 값들이 전부 "%" 스타일(대체로 두 자리 이하 정수부)인지로 대충 거른다.
-        if any(abs(float(d["text"])) > 100 for d in decimals):
+        # DECIMAL_RE 자체가 소수점 없는 정수(생년·펀드수·억원단위 운용규모, 쉼표
+        # 섞인 "77,772" 포함)는 이미 걸러 주므로, 여기서는 소수점 있는 값이
+        # 말도 안 되게 클 때만(운용전문인력 표에 우연히 섞여 든 소수) 거른다.
+        # 100은 너무 좁다 - 진짜 수익률이 100%를 넘는 클래스가 있다(KR5131420025
+        # 실측: C클래스 최근2년 469.56%, 연도별 표에서는 3,260.76% - 펀드
+        # 자체의 급격한 변동으로 원본 문서에 그대로 인쇄된 값이다. 100 기준을
+        # 쓰면 이 클래스의 행 전체가 통째로 버려진다).
+        if any(abs(float(d["text"])) > 5000 for d in decimals):
             continue
 
         pre_text_words = [w for w in line if w["x0"] < value_tokens[0]["x0"]]
         pre_text = " ".join(w["text"] for w in pre_text_words)
+        # 클래스 코드 탐색용으로는 설정일 토큰("2022-11-14")을 뺀 버전을 따로
+        # 만든다 - pre_text_words는 DECIMAL_RE/DASH_RE 형식만 걸러내므로
+        # 날짜 토큰은 그대로 통과해 라벨 조각 "인-퇴직연금(C-"와 다음 줄
+        # 조각 "P2E)" 사이에 날짜가 끼어들어 "C-2022-11-14P2E)"처럼 되고
+        # CLASS_CODE_RE가 매치를 못 한다(KR5131420025 C-P2E 실측: class_code가
+        # None으로 빠짐). 날짜 추출(아래 date_m)은 원본 pre_text를 그대로
+        # 써야 하므로 이 변수는 코드 탐색에만 쓴다.
+        pre_text_words_nodate = [
+            w for w in pre_text_words if not INCEPTION_DATE_RE.fullmatch(w["text"])
+        ]
+        pre_text_nodate = " ".join(w["text"] for w in pre_text_words_nodate)
 
         # 클래스명이 인접 줄로 이어질 수 있어 다음 줄까지 확인 (총보수 표에서
         # 검증된 대로 - "이전 줄"은 다른 행 것일 위험이 있어 보지 않는다.
@@ -262,7 +432,7 @@ def find_return_rows_on_page(page, page_num, section="가", known_classes=None):
         # 그 캡션 조각들을 건너뛴 "진짜" 다음/이전 줄을 본다.
         prev_line_text = _line_text_skipping_captions(lines, i - 1, -1)
         next_line_text = _line_text_skipping_captions(lines, i + 1, 1)
-        label_search_text = pre_text + " " + next_line_text
+        label_search_text = pre_text_nodate + " " + next_line_text
         # 폰트 문제로 글자가 한 자씩 떨어져 나오는 문서(예: "비 교 지 수")에서도
         # 키워드 검사가 되도록, 공백 제거한 버전을 만들어서 모든 문구 검사에 쓴다.
         norm_pre = re.sub(r"\s+", "", pre_text)
@@ -324,6 +494,33 @@ def find_return_rows_on_page(page, page_num, section="가", known_classes=None):
             m = CLASS_CODE_RE.search(norm_label)
             if m:
                 class_code = m.group(1)
+            elif known_classes:
+                # 코드가 "설명(코드)"가 아니라 "코드(설명)"/"코드형(설명)"로
+                # 값 줄 "위" 줄 맨 앞에 오는 문서가 있다(KR5125450023 실측:
+                # "C(수수료미징구 –" / 값 줄 / "오프라인)" 3줄 구조, 같은
+                # 문서 뒤쪽 상세표는 "A-G형(수수료선취-" / "오프라인- <값들>"
+                # / "무권유저비용)" - 코드 뒤에 "형"이 붙기도 한다). 괄호
+                # 안은 한글 설명이라 CLASS_CODE_RE로는 못 잡는다. 칸 폭이
+                # 좁으면 코드 자체가 위쪽 줄에 걸쳐 쪼개지기도 한다("C-"
+                # 한 줄 / "G형(수수료미징구-" 다음 줄, 값 줄은 그 아래 -
+                # 또는 "C-" 한 줄 / "Pe형(수수료미징구- <값들>"처럼 코드
+                # 뒷부분이 값 줄 맨 앞에 붙기도 한다). 위쪽 줄들과 이 줄
+                # 자신의 라벨 부분을 여러 방식으로 이어 붙여 순서대로
+                # 시도한다. "C" 같은 짧은 코드는 오탐 위험이 커서
+                # known_classes에 있을 때만 인정한다.
+                prev_flat = re.sub(r"\s+", "", prev_line_text)
+                prev2_flat = (
+                    re.sub(r"\s+", "", " ".join(w["text"] for w in lines[i - 2]))
+                    if i >= 2 else ""
+                )
+                for candidate in (prev_flat, prev_flat + pre_text_nodate,
+                                  prev2_flat + prev_flat):
+                    pm = re.match(r"^([A-Za-z0-9\-]{1,8})형?\(", candidate)
+                    if pm and pm.group(1) in known_classes:
+                        class_code = pm.group(1)
+                        break
+            if class_code is not None:
+                pass
             else:
                 # 공백을 지우면 "ClassA 2006-09-05"가 "ClassA2006-09-05"로
                 # 붙어버려서 뒤에 오는 날짜까지 클래스 코드로 삼켜버린다
@@ -342,6 +539,10 @@ def find_return_rows_on_page(page, page_num, section="가", known_classes=None):
                     )
                     if m3:
                         class_code = m3.group(1)
+                    elif known_classes and (m3ko := CLASS_CODE_JONGRYU_KO_RE.search(
+                        prev_line_text + " " + label_search_text
+                    )) and m3ko.group(1) in known_classes:
+                        class_code = m3ko.group(1)
                     elif known_classes:
                         # 상세 부속서류(제2부 등)는 라벨이 "(A1)"처럼 괄호로
                         # 안 떨어지고 "마이다스 책임투자 증권 투자신탁(주식)A1"
@@ -407,6 +608,8 @@ def find_return_rows_on_page(page, page_num, section="가", known_classes=None):
                                         break
                             if class_code:
                                 break
+
+            class_code = _normalize_class_code(class_code, known_classes)
 
             if class_code:
                 # 클래스 코드가 확실히 잡혔으면 그 자체로 "클래스 행"이라는
@@ -477,11 +680,35 @@ def find_return_rows_on_page(page, page_num, section="가", known_classes=None):
         })
 
     _apply_merged_cell_dates(page, words, rows)
+
+    # 라벨과 값은 이 페이지 안에서 다 채워졌는데 클래스 코드 자체가 페이지
+    # 경계에서 끊기는 문서가 있다(KR5113420069 실측: 61쪽 마지막 줄이
+    # "수수료선취-오프라인 3.35 5.17 6.24 3.52 3.51"로 라벨·값 다 있는데,
+    # 닫는 코드 "(A)"만 62쪽 맨 첫 줄에 홀로 떨어져 있다). 이 페이지에서
+    # class_code를 못 찾은 class_return 행 중 가장 아래(페이지 마지막) 것에
+    # 한해서만, 다음 페이지 첫 줄이 곧바로 괄호코드로 시작하면 이어붙인다 -
+    # known_classes에 있는 코드만 인정해 엉뚱한 각주 번호 등을 오인하지
+    # 않는다.
+    if next_page is not None and known_classes:
+        unresolved = [r for r in rows
+                      if r["row_kind"] == "class_return" and not r.get("class_code")]
+        if unresolved:
+            last = max(unresolved, key=lambda r: r["_top"])
+            next_words = _safe_words(next_page, x_tolerance=5, keep_blank_chars=False)
+            next_lines = cluster_lines(next_words)
+            if next_lines:
+                first_flat = re.sub(r"\s+", "", " ".join(w["text"] for w in next_lines[0]))
+                cm = CLASS_CODE_RE.match(first_flat) or re.match(
+                    r"^([A-Za-z0-9\-]{1,8})\)", first_flat
+                )
+                if cm and cm.group(1) in known_classes:
+                    last["class_code"] = _normalize_class_code(cm.group(1), known_classes)
+
     # "_top"(줄의 y좌표)은 여기서 바로 지우지 않고 호출자의 중복 제거
     # 단계까지 들고 간다 - 값만으로 중복을 판정하면(아래 dedup 주석 참고)
     # 서로 다른 진짜 행을 잘못 지워버리는 사고가 나서, 페이지 안에서의
     # 실제 위치까지 같이 봐야 한다.
-    return rows, section
+    return rows, section, out_period_anchors
 
 
 
@@ -625,8 +852,10 @@ def _return_grid_one(page, inherited=None, settings=None):
     44쪽에 있다). 이 페이지에서 머리글을 못 찾았을 때만 물려받는다."""
     # 글자가 한 자씩 떨어져 나오는 문서가 있어(폰트 문제 - "C la s s S")
     # x_tolerance를 넉넉히 준다. 값은 공백을 지우고 쓰므로 붙여 읽어도
-    # 안전하고, 붙여야 클래스 이름을 알아본다.
-    words = page.extract_words(x_tolerance=5, keep_blank_chars=False)
+    # 안전하고, 붙여야 클래스 이름을 알아본다. 회전 잡음으로 글자가 아예
+    # 다른 경로로 쪼개지는 문서는 x_tolerance로 못 고쳐서 pdf_words를
+    # 쓴다(find_return_rows_on_page 위쪽 설명 참고).
+    words = _safe_words(page, x_tolerance=5, keep_blank_chars=False)
     out = []
     header_carry = None
     for t in (page.find_tables(table_settings=settings) if settings
@@ -791,13 +1020,37 @@ def _return_grid_one(page, inherited=None, settings=None):
             # "실제로 값이 들어 있는 칸"을 알아낸 뒤 어긋남을 고친다.
             value_cols = {ci for r in collect(None)
                           for ci, v in r["cells"].items() if _val(v)}
-            for ci in sorted(fmap):
-                if fmap[ci] in ("label", "inception_date") or ci in value_cols:
+            # 값 칸 하나를 두고 머리글 없는(=제 칸에 값이 없는) 기간이 여럿
+            # 후보로 몰릴 수 있다(KR5120420091 6쪽 실측: 설정 2년밖에 안 된
+            # 펀드라 3년/5년 칸이 통째로 비어 있고, 값은 딱 1개(설정일이후)
+            # 만 남는데 "5년" 헤더도 "설정일이후" 헤더도 둘 다 그 값 칸을
+            # 이웃(±1)으로 볼 수 있다. 순서대로 먼저 온 "5년"이 거리와
+            # 상관없이 먼저 채가면, 실제로는 그 값이 진짜 "설정일이후"
+            # 값인데 "5년" 이름표가 붙고, 뒤에 남은 "설정일이후" 빈 칸은
+            # 아래 "칸이 아예 안 생긴 열" 채우기 로직이 같은 값을 원본
+            # 단어에서 다시 긁어와 중복까지 만든다). 이웃 후보 전부를
+            # 모아 x좌표가 진짜로 더 가까운 헤더부터 먼저 배정한다.
+            # "설정일 이후" 칸이 표 테두리 밖에 있어(위 참고) col_x0s 범위
+            # 밖의 합성 열 번호(len(cols_here)-1)로 fmap에 들어가 있을 수
+            # 있다 - 그런 열은 실제 x좌표(col_x0s[ci])가 없어 거리를 잴 수
+            # 없으므로 이 재배정 대상에서 제외한다(원래 첫 번째 값 칸 방식
+            # 그대로 유지).
+            orphans = [ci for ci in sorted(fmap)
+                       if fmap[ci] not in ("label", "inception_date")
+                       and ci not in value_cols
+                       and 0 <= ci < len(col_x0s)]
+            candidates = sorted(
+                (abs(col_x0s[nb] - col_x0s[ci]), ci, nb)
+                for ci in orphans
+                for nb in (ci - 1, ci + 1)
+                if nb in value_cols and 0 <= nb < len(col_x0s)
+            )
+            claimed_targets = set()
+            for _, ci, nb in candidates:
+                if ci not in fmap or nb in fmap or nb in claimed_targets:
                     continue
-                for nb in (ci - 1, ci + 1):
-                    if nb in value_cols and nb not in fmap:
-                        fmap[nb] = fmap.pop(ci)
-                        break
+                fmap[nb] = fmap.pop(ci)
+                claimed_targets.add(nb)
             period_cols = [c for c, f in fmap.items()
                            if f.endswith("y") or f == "since_inception"]
             rows2 = collect(period_cols)
@@ -972,7 +1225,7 @@ def return_rows_for_doc(doc_id, pdf, pages, known_classes=None):
             continue
         inherited = (got[-1][0], got[-1][3])
         prev_page = page_num
-        marks = _section_marks(page.extract_words(x_tolerance=2))
+        marks = _section_marks(_safe_words(page, x_tolerance=2))
         page_start_section = section
         if marks:
             section = marks[-1][1]
@@ -1132,29 +1385,101 @@ def col_of_lt(cell, col_x0s, first_val):
     return cell[0] < col_x0s[first_val] - 2 if first_val < len(col_x0s) else True
 
 
+def _normalize_class_code(code, known_classes):
+    """이 표에서 찾은 코드가 문서 다른 곳(class_fees.json이 아는 코드)이
+    쓰는 정식 표기와 다를 수 있다 - "C-" 같은 클래스 계열 접두가 이 표
+    에서만 빠지는 문서상 오탈자가 있다(KR5160420009 41쪽 실측: 가.연평균
+    표엔 "(P2e)"인데, 같은 문서 나.연도별 표와 보수표는 전부 "(C-P2e)").
+    이미 아는 코드 목록에 그대로 있으면 안 건드리고, 없을 때만 접두가
+    붙은 유일한 후보로 바꾼다 - 후보가 둘 이상이면 어느 쪽인지 모르므로
+    손대지 않는다."""
+    if not code or not known_classes or code in known_classes:
+        return code
+    candidates = [k for k in known_classes if k != code and k.endswith(code)]
+    if len(candidates) == 1:
+        return candidates[0]
+    # 수익률 표에서만 "-"가 통째로 빠지는 오탈자도 있다(KR5120420039 6쪽
+    # 실측: 이 표만 "ClassAi"라 붙여 찍었고, 같은 문서 보수표/나.연도별
+    # 표는 전부 "A-i" - class_fees.json이 아는 정식 코드도 "A-i"). "-"를
+    # 지운 모양이 이 코드와 유일하게 일치하는 후보로만 바꾼다.
+    dash_candidates = [
+        k for k in known_classes if k != code and k.replace("-", "") == code
+    ]
+    if len(dash_candidates) == 1:
+        return dash_candidates[0]
+    # 수익률 표는 "연금"/"퇴직연금" 같은 괄호 구분자를 통째로 생략하고
+    # 찍는 문서가 있다(KR5120420091 실측: 가.연평균/상세표 둘 다 그냥
+    # "Class C-P" / "Class C-R"인데, 정식 코드(보수표·class_fees.json)는
+    # "C-P(연금)" / "C-R(퇴직연금)" - 판매채널 구분이라 괄호를 지우면
+    # 다른 뜻의 클래스가 될 수 있어 함부로 못 뭉갠다). 이 코드로 시작하고
+    # 나머지가 온전히 "(한글)" 괄호 하나뿐인 후보가 유일할 때만 바꾼다.
+    suffix_candidates = [
+        k for k in known_classes
+        if k != code and k.startswith(code)
+        and re.fullmatch(r"\([가-힣]+\)", k[len(code):])
+    ]
+    if len(suffix_candidates) == 1:
+        return suffix_candidates[0]
+    # 수익률 표만 알파벳 대소문자가 다르게 찍히는 문서가 있다(KR5160420009
+    # 실측: 보수표·부속서류는 전부 "A-E"인데 가.연평균/나.연도별 표만
+    # "A-e" - 같은 클래스의 단순 오탈자다). 대소문자만 다른 후보가 유일할
+    # 때만 바꾼다.
+    ci_candidates = [
+        k for k in known_classes if k != code and k.lower() == code.lower()
+    ]
+    return ci_candidates[0] if len(ci_candidates) == 1 else code
+
+
 def _return_label_code(label, known_classes):
     """클래스명 칸 하나에서 클래스 코드를 뽑는다. 셀 기준이라 옆 행 이름이
     섞여 들어올 일이 없어서 좌표 방식의 여러 예외 규칙이 필요 없다."""
     if not label:
         return None
     flat = re.sub(r"\s+", "", label)
+    code = None
     m = CLASS_CODE_RE.search(flat)
     if m:
-        return m.group(1)
-    # 글자가 떨어져 나오는 문서("C la s s S")도 있어 공백을 지운 쪽을 본다
-    m2 = CLASS_CODE_NOPAREN_RE.search(flat)
-    if m2:
-        return m2.group(1)
-    m3 = CLASS_CODE_JONGRYU_RE.search(flat)
-    if m3:
-        return m3.group(1)
-    if known_classes:
-        for code in sorted(known_classes, key=len, reverse=True):
-            if flat.endswith(code):
-                before = flat[: -len(code)]
+        code = m.group(1)
+    if code is None:
+        # 글자가 떨어져 나오는 문서("C la s s S")도 있어 공백을 지운 쪽을 본다
+        m2 = CLASS_CODE_NOPAREN_RE.search(flat)
+        if m2:
+            code = m2.group(1)
+    if code is None:
+        m3 = CLASS_CODE_JONGRYU_RE.search(flat)
+        if m3:
+            code = m3.group(1)
+    if code is None and known_classes:
+        m4 = CLASS_CODE_JONGRYU_KO_RE.search(flat)
+        if m4 and m4.group(1) in known_classes:
+            code = m4.group(1)
+    if code is None and known_classes:
+        for kc in sorted(known_classes, key=len, reverse=True):
+            if flat.endswith(kc):
+                before = flat[: -len(kc)]
                 if not before or not before[-1].isalnum():
-                    return code
-    return None
+                    code = kc
+                    break
+    if code is None and known_classes:
+        # "I형(수수료미징구-오프라인-기관)"처럼 코드가 뒤가 아니라 맨
+        # 앞에 오고, 괄호 안은 코드가 아니라 수수료방식 설명인 문서가
+        # 있다(KR5125450070 41쪽 실측: 이 표기라서 위의 모든 갈래가
+        # 못 읽었다 - "I"/"C-P"/"CG" 등 6개 클래스 전부가 class_code
+        # 없이 통째로 버려졌다). 라벨이 아는 코드로 시작하고 바로 뒤가
+        # "형"이면(길이가 긴 코드부터 봐야 "A"가 "Ae"보다 먼저 걸리지
+        # 않는다) 그 코드로 본다.
+        for kc in sorted(known_classes, key=len, reverse=True):
+            if flat.startswith(kc) and flat[len(kc):len(kc) + 1] == "형":
+                code = kc
+                break
+            # 이 표만 "-"가 빠진 표기를 쓰기도 한다(KR5125450070 41쪽
+            # 실측: "CG형(...)"인데 class_fees가 아는 코드는 "C-G").
+            kc_nodash = kc.replace("-", "")
+            if kc_nodash != kc and flat.startswith(kc_nodash) and \
+                    flat[len(kc_nodash):len(kc_nodash) + 1] == "형":
+                code = kc
+                break
+    return _normalize_class_code(code, known_classes)
 
 def _apply_merged_cell_dates(page, words, rows):
     """'최초설정일' 칸이 여러 행에 걸쳐 병합된 경우, 날짜 텍스트는 병합된 셀
@@ -1363,43 +1688,172 @@ def enrich_with_detail_return_table(pdf, doc_id, existing_rows, used_pages, know
 
     new_rows = []
     seen_codes = set(known)
+
+    # 요약 페이지와 같은 원칙(process_doc 참고): 셀 격자 방식이 좌표
+    # 방식보다 코드 인식이 확실하다. 코드 칸과 뜻(수수료방식-판매경로)
+    # 칸이 표에서 서로 떨어진 레이아웃에서, 좌표 방식은 텍스트 인접성
+    # 으로 코드를 찾다가 통째로 놓친다(KR5127420034 35쪽 실측: class_code
+    # 가 13행 전부 None이었다). 페이지 하나씩 셀 격자로 읽어서, 표 테두리가
+    # 없어 셀로 못 읽은 페이지만 좌표 결과로 보충한다.
+    #
+    # 문서 전체를 한 번에 return_rows_for_doc에 넘기면 안 된다 - 그 함수
+    # 자체가 (row_kind, class_code, year_rank) 기준으로 문서 전체에 걸쳐
+    # 중복을 지운다. 요약 페이지(4쪽)에 대표로 실린 "C"가 먼저 seen에
+    # 잡히면, 상세표(35쪽)에 또 나오는 "C"는 "중복"으로 지워진다 - 값이
+    # 같은 게 아니라 대조 기준(known) 자체가 이 페이지 결과에서 사라지는
+    # 것이다. 그러면 대조할 게 하나도 없어 보강 전체가 조용히 실패한다
+    # (직접 겪음: 페이지별로 나눠 부르니 12개 클래스가 다시 잡혔다).
+    #
+    # 그런데 페이지 하나씩만 넘기면 이번엔 다른 문제가 생긴다.
+    # return_rows_for_doc 자신도 "바로 앞 페이지"에서 열 구성(inherited)을
+    # 물려받는 방식으로 동작하는데, 표 헤더가 없는 이어지는 페이지를
+    # 그 페이지 하나만 넘기면 물려받을 앞 페이지가 아예 없어서 통째로
+    # 못 읽는다(KR5160420009 41쪽 실측: 40쪽과 같이 넘기면 13개 클래스가
+    # 다 잡히는데 41쪽 하나만 넘기면 0개). 그래서 "앞 페이지, 이 페이지"
+    # 두 쪽을 같이 넘겨 열 구성은 이어받게 하되, 결과는 이 페이지 것만
+    # 추린다 - 앞 페이지 결과는 그 페이지 자신의 차례에서 이미 처리된다.
     section = "가"
+    period_anchors = None
+    last_validated_page = None
+    # 표가 페이지 경계에서 끊기는데, 이번엔 "뒤" 페이지가 아니라 "앞" 페이지가
+    # known과 안 겹치는 경우도 있다(KR5113420069 실측: 61쪽엔 A-e/C-F/C-R/...
+    # 등 12개 클래스가 있는데 요약표에 실린 유일한 클래스 "C"는 62쪽에야
+    # 나온다 - 61쪽만 보면 대조할 게 하나도 없어 통째로 버려지고, 62쪽이
+    # 검증을 통과했을 땐 이미 61쪽 차례가 지나가버려 되돌아가지 않는다).
+    # 아직 검증 못 한 페이지를 즉시 버리지 않고 "보류"해뒀다가, 바로 다음
+    # 페이지가 검증에 성공하면 그 신뢰를 앞으로 물려서 보류분도 같이
+    # 살린다 - class_fees.py에서 이미 검증된 것과 같은 패턴.
+    pending = None  # (page_num, class_rows)
     for page_num in range(1, len(pdf.pages) + 1):
         page = pdf.pages[page_num - 1]
-        rows, section = find_return_rows_on_page(
-            page, page_num, section=section, known_classes=known_classes
+        next_page = pdf.pages[page_num] if page_num < len(pdf.pages) else None
+        coord_rows, section, period_anchors = find_return_rows_on_page(
+            page, page_num, section=section, known_classes=known_classes,
+            inherited_period_anchors=period_anchors, next_page=next_page,
         )
         if page_num in used_pages:
             continue  # 이미 요약표로 처리한 페이지 - 섹션 상태만 이어받고 넘어감
-        class_rows = [r for r in rows if r["row_kind"] == "class_return" and r.get("class_code")]
-        refs = [r for r in class_rows if r["class_code"] in known]
-        if not refs:
-            continue
-        total_matched = 0
-        conflict = False
-        for r in refs:
-            matched, bad = _values_agree(r["values"], known[r["class_code"]])
-            total_matched += matched
-            conflict = conflict or bad
-        # 숫자 3칸 이상이 정확히 일치해야 인정한다 - 소수점 둘째 자리까지
-        # 3개가 우연히 맞을 확률은 사실상 없어서, 이 표가 같은 표라는 걸
-        # 충분히 특정한다(반대로 "-"뿐이라 대조할 숫자가 없는 문서는 그냥
-        # 보강을 포기한다 - 틀린 값을 넣느니 없는 채로 두는 쪽).
-        if conflict or total_matched < 3:
-            continue
-        for r in class_rows:
-            r.pop("_top", None)  # 요약표 쪽은 _dedupe_and_merge가 지운다
-            cur = known_rows.get(r["class_code"])
-            if cur is not None:
-                _merge_detail_into_summary(cur, r)
+
+        window = [page_num - 1, page_num] if page_num > 1 else [page_num]
+        cell_rows_here = [
+            r for r in return_rows_for_doc(doc_id, pdf, window, known_classes)
+            if r.get("page") == page_num
+        ]
+        # 표가 머리글 없는 이어지는 쪽으로 두 쪽 넘게 계속되면, 앞 한
+        # 쪽만 물려주는 창으로는 못 읽는다(KR5125450070 실측: 41쪽 자체가
+        # 40쪽 머리글을 물려받아야 하는 무머리글 쪽이라, 42쪽이 "41쪽,
+        # 42쪽" 두 쪽 창만 받으면 41쪽조차 이 창 안에서는 머리글이 없어
+        # 42쪽도 같이 통째로 못 읽는다). 두 쪽 창이 비면, 머리글이 있는
+        # 곳까지 창을 넓혀 가며 다시 시도한다(무한정 넓히면 무관한 이전
+        # 표까지 물릴 수 있어 상한을 둔다).
+        for lookback in (3, 4, 5):
+            if cell_rows_here:
+                break
+            wide_window = list(range(max(1, page_num - lookback), page_num + 1))
+            cell_rows_here = [
+                r for r in return_rows_for_doc(doc_id, pdf, wide_window, known_classes)
+                if r.get("page") == page_num
+            ]
+        # 셀 격자(cell_rows_here)가 좌표 방식(coord_rows)보다 코드 인식이
+        # 확실하다는 원칙은 위 주석 그대로인데, 정작 "둘 다 known과
+        # 안 겹치는" 흔한 경우(요약표엔 C 하나뿐인데 상세표 이 페이지엔
+        # I/C-P/C-P2 등 요약표에 없는 새 클래스만 있는 경우 - 아래 신뢰
+        # 이어받기가 원래 이런 페이지를 구하려고 있는 것이다)에 예전
+        # 코드가 걸려 넘어졌다: 후보를 순서대로 돌며 매번 class_rows를
+        # 덮어써서, 반복이 refs 없이 끝나면 마지막으로 시도한 coord_rows
+        # 결과가 그대로 남았다 - 셀 격자가 6개 클래스를 제대로 찾았어도
+        # 좌표 방식이 그 페이지에서 하나도 못 찾으면(실측: 여기서 늘
+        # 그랬다) class_rows가 빈 채로 남아, 신뢰 이어받기 조건
+        # (`class_rows and last_validated_page == page_num - 1`)이 항상
+        # 거짓이 되고 그 뒤의 모든 페이지가 통째로 유실됐다(KR5125450070
+        # 실측: 41쪽 이후 상세표 클래스 12개가 이렇게 전부 사라졌다 -
+        # 오늘 "라벨 파싱을 고쳤는데 결과가 하나도 안 바뀐다"고 확인된
+        # 것도 이 버그가 그 수정 효과를 가려서였다). refs가 없을 때는
+        # (더 신뢰하는) 셀 격자 결과를 그대로 남긴다.
+        cell_class_rows = [r for r in cell_rows_here
+                            if r["row_kind"] == "class_return" and r.get("class_code")]
+        cell_refs = [r for r in cell_class_rows if r["class_code"] in known]
+        coord_class_rows = [r for r in coord_rows
+                             if r["row_kind"] == "class_return" and r.get("class_code")]
+        coord_refs = [r for r in coord_class_rows if r["class_code"] in known]
+        if cell_refs:
+            class_rows, refs = cell_class_rows, cell_refs
+        elif coord_refs:
+            class_rows, refs = coord_class_rows, coord_refs
+        else:
+            class_rows, refs = cell_class_rows, []
+            if refs:
+                break
+
+        def commit(rows_to_add, this_page_num):
+            for r in rows_to_add:
+                r.pop("_top", None)  # 요약표 쪽은 _dedupe_and_merge가 지운다
+                cur = known_rows.get(r["class_code"])
+                if cur is not None:
+                    _merge_detail_into_summary(cur, r)
+                    continue
+                if r["class_code"] in seen_codes:
+                    continue
+                seen_codes.add(r["class_code"])
+                r["product_code"] = doc_id
+                r["method"] = "detail_return_table_cross_validated"
+                r["source_pages"] = [r["page"]]
+                new_rows.append(r)
+
+        if refs:
+            total_matched = 0
+            conflict = False
+            max_possible = 0
+            for r in refs:
+                matched, bad = _values_agree(r["values"], known[r["class_code"]])
+                total_matched += matched
+                conflict = conflict or bad
+                max_possible += sum(
+                    1 for v in known[r["class_code"]].values()
+                    if isinstance(v, str) and DECIMAL_RE.match(v)
+                )
+            # 숫자 3칸 이상이 정확히 일치해야 인정한다 - 소수점 둘째 자리까지
+            # 3개가 우연히 맞을 확률은 사실상 없어서, 이 표가 같은 표라는 걸
+            # 충분히 특정한다(반대로 "-"뿐이라 대조할 숫자가 없는 문서는 그냥
+            # 보강을 포기한다 - 틀린 값을 넣느니 없는 채로 두는 쪽). 다만
+            # 설정 2년이 안 된 펀드는 요약표 자체가 실수(1y/설정일이후)
+            # 2칸뿐이라 애초에 3칸을 채울 수가 없다(KR5118420006 실측) -
+            # 대조 기준(known)이 가진 실수 칸이 3개 미만이면 그만큼만
+            # 요구한다(그래도 최소 2개는 일치해야 한다 - 우연 일치 방지).
+            required = min(3, max_possible) if max_possible else 3
+            required = max(required, min(2, max_possible))
+            if conflict or total_matched < required:
+                pending = None
                 continue
-            if r["class_code"] in seen_codes:
-                continue
-            seen_codes.add(r["class_code"])
-            r["product_code"] = doc_id
-            r["method"] = "detail_return_table_cross_validated"
-            r["source_pages"] = [r["page"]]
-            new_rows.append(r)
+            # 검증 성공 - 바로 앞 쪽이 보류돼 있었다면(대조할 known이
+            # 없었을 뿐 같은 표의 연속) 같이 살린다.
+            if pending is not None and pending[0] == page_num - 1:
+                commit(pending[1], pending[0])
+            pending = None
+            last_validated_page = page_num
+            commit(class_rows, page_num)
+            continue
+
+        # 표가 페이지 경계에서 끊기면, 뒤 페이지엔 요약표(known)에 이미 실린
+        # 클래스가 하나도 안 남고 그 표에만 있는 새 클래스만 남을 수 있다
+        # (KR5131420025 실측: "가" 표가 33쪽에서 34쪽으로 넘어가는데 33쪽에서
+        # A/C-F(known)/C/C-E/A-E/C-PE가 이미 다 잡히고, 34쪽엔 새 클래스
+        # C-P2E 행 하나만 남는다 - known과 대조할 게 없어 refs가 항상 비고,
+        # 그러면 검증 자체가 안 돼 이 클래스가 통째로 버려졌다). 바로 앞
+        # 페이지가 이미 검증을 통과했고 이 페이지가 그 바로 다음 쪽이면,
+        # 같은 표가 이어지는 것으로 보고(같은 좌표/셀 추출 로직이 "나" 절
+        # 헤더를 만나면 스스로 멈추므로 다른 표 내용이 섞일 위험은 낮다)
+        # known 대조 없이도 신뢰한다.
+        if class_rows and last_validated_page == page_num - 1:
+            pending = None
+            last_validated_page = page_num
+            commit(class_rows, page_num)
+            continue
+
+        # 검증도 못 하고 신뢰 이어받기도 안 되면, 다음 쪽이 검증에
+        # 성공할 경우를 대비해 보류만 해둔다(바로 이전 쪽이 보류 중이면
+        # 그 쪽은 이번 쪽으로 이어지지 않은 것이니 버린다).
+        pending = (page_num, class_rows) if class_rows else None
     return new_rows
 
 
@@ -1459,12 +1913,15 @@ def process_doc(doc_id):
         if not pages:
             return []
         section = "가"
+        period_anchors = None
         for page_num in pages:
             if page_num < 1 or page_num > len(pdf.pages):
                 continue
             page = pdf.pages[page_num - 1]
-            rows, section = find_return_rows_on_page(
-                page, page_num, section=section, known_classes=known_classes
+            next_page = pdf.pages[page_num] if page_num < len(pdf.pages) else None
+            rows, section, period_anchors = find_return_rows_on_page(
+                page, page_num, section=section, known_classes=known_classes,
+                inherited_period_anchors=period_anchors, next_page=next_page,
             )
             for r in rows:
                 r["product_code"] = doc_id
@@ -1491,6 +1948,33 @@ def process_doc(doc_id):
         final += enrich_with_detail_return_table(
             pdf, doc_id, final, set(pages), known_classes
         )
+        # class_code가 없는 class_return 행은 "어느 클래스의 수익률인지
+        # 모른다"는 뜻인데, class_returns.json은 클래스별 수익률을 담는
+        # 파일이라 이런 행은 애초에 쓸 데가 없다. 실측해 보니 이런 행은
+        # 전부 진짜 수익률이 아니라 표 밖에서 우연히 걸린 잡음이었다
+        # (KR5123420049: 운용전문인력 표의 "운용역" 최근1·2년 수익률,
+        # KR5153420063: 그래프 Y축 눈금 5개, KR5172450019: 세액공제 소득
+        # 기준·총급여액 문구의 숫자). class_code를 못 찾았다고 억지로
+        # class_return 취급하지 말고 통째로 버린다 - "모르면 안 낸다"가
+        # "모르는데 클래스 수익률인 척 낸다"보다 안전하다. 비교지수/
+        # 변동성/투자신탁 합계처럼 class_code가 원래 없는 게 정상인
+        # 행 종류는 row_kind가 달라 이 필터에 안 걸린다.
+        final = [r for r in final
+                 if not (r["row_kind"] == "class_return" and not r["class_code"])]
+        # "종류 2024.11.01~ / 설정일 - - - 이후 / 2025.10.31"처럼 기간
+        # 헤더 자체가(설정 2년 미만이라 2y/3y/5y 칸이 전부 "-"인 신설
+        # 클래스 표 특유의 헤더 모양) 데이터 행으로 오인되는 문서가
+        # 있다(KR5118420006 실측: class_code="2024"(기간 문구의 연도
+        # 앞자리), inception_date="2025-10-31"(기간 문구의 끝날짜),
+        # 값은 전부 "-"인 가짜 행이 생겼다). 클래스 코드는 이 말뭉치에서
+        # 절대 4자리 연도 모양이 아니고, 값이 전부 빈 행은 애초에 아무
+        # 정보도 없다 - 둘 다 걸리는 행만 좁혀서 버린다.
+        final = [r for r in final
+                 if not (r["row_kind"] == "class_return"
+                         and r.get("class_code")
+                         and RE_BOGUS_YEAR_CODE.match(r["class_code"])
+                         and not any(v not in (None, "", "-")
+                                     for v in r["values"].values()))]
         # 합쳐진 행만 source_pages를 갖고 나머지는 없으면 스키마가 들쭉날쭉
         # 해진다(조회하는 쪽이 매번 존재 여부를 따져야 함) - 모든 행이
         # 갖도록 맞춘다(안 합쳐진 행은 자기 page 하나).
@@ -1576,16 +2060,32 @@ def _dedupe_and_merge(results):
     # 쪽에서 안 겹쳐도 비교지수/변동성/투자신탁 합계만 따로 반복되는
     # 경우도 있었다)을 포괄하도록 class_code 중복 제거와 독립적으로
     # 처리한다.
+    # 값만으로는 KR5120420091 케이스(서로 다른 클래스의 비교지수가
+    # 우연히 값까지 같음)와 진짜 중복을 못 가른다 - 최초설정일까지
+    # 같이 봐야 한다(서로 다른 클래스는 설정일도 보통 다르다). 그런데
+    # "값 + 설정일"을 통째로 그룹 키로 쓰면, 같은 줄이 반복된 두 표
+    # 중 한쪽에만 설정일이 찍히고(요약표) 다른 쪽엔 없는 문서에서
+    # (KR5153420105 실측: 4쪽엔 설정일 "2008-11-18"이 있고 47쪽 반복본엔
+    # 설정일 칸 자체가 없다) 두 그룹으로 갈라져 버려 진짜 중복이 둘 다
+    # 남는다. 그래서 값으로 먼저 묶은 뒤, 그 묶음 안에서 설정일이
+    # 실제로 서로 다른 값끼리 충돌할 때만(둘 다 있고 다를 때만)
+    # 별개의 행으로 보고, 그 외(설정일이 아예 없거나 하나만 있거나
+    # 전부 같음)에는 같은 줄의 반복으로 보고 합친다 - 페이지가 가장
+    # 뒤쪽이면서 설정일이 채워진 쪽을 남긴다(더 완전한 정보다).
     no_class_groups = defaultdict(list)
     for r in deduped:
         if not r["class_code"]:
-            no_class_groups[(r["row_kind"], tuple(sorted(r["values"].items())))].append(r)
+            no_class_groups[(r["row_kind"],
+                              tuple(sorted(r["values"].items())))].append(r)
     drop_ids = set()
     for group in no_class_groups.values():
-        pages_in_group = {r["page"] for r in group}
-        if len(pages_in_group) > 1:
-            latest_page = max(pages_in_group)
-            drop_ids.update(id(r) for r in group if r["page"] != latest_page)
+        if len(group) <= 1:
+            continue
+        incs = {r["inception_date"] for r in group if r.get("inception_date")}
+        if len(incs) > 1:
+            continue  # 설정일이 서로 다른 진짜 다른 행 - 지우지 않는다
+        latest = max(group, key=lambda r: (bool(r.get("inception_date")), r["page"]))
+        drop_ids.update(id(r) for r in group if r is not latest)
 
     final = []
     for r in deduped:

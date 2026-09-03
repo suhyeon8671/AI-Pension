@@ -12,8 +12,12 @@ extract_any(path)가 확장자를 보고 알맞은 함수로 위임한다.
 """
 
 import os
+import sys
 
 import pdfplumber
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pdf_words  # noqa: E402  (import만으로 Page.chars 전역 패치가 걸린다 - pdf_words.py 참고)
 
 
 # ---------------------------------------------------------------------------

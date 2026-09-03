@@ -49,8 +49,15 @@ DEFAULT_DB_PATH = os.path.join(REPO_ROOT, "structured_store.db")
 OUTPUT_JSON = os.path.join(REPO_ROOT, "asset_mix.json")
 DATA_DIR = os.path.join(REPO_ROOT, "data", "products")
 
-# 이 표를 다른 표와 가르는 낱말들. 넷이 한 표 안에 다 있어야 한다.
-SHAPE_WORDS = ("통화", "자산총액", "주식", "채권")
+# 이 표를 다른 표와 가르는 낱말들. 다 있어야 한다. "자산총액"은 한
+# 글자로 두지 않고 "자산"/"총액"으로 나눠 둔다 - 머리글이 물리적으로
+# 세 줄에 걸쳐 있는 문서가 있어서(KR5116501001 42쪽 실측: "자산"은
+# "단기대출및" 칸의 줄에, "총액"은 그보다 두 줄 아래인 "기타" 칸의
+# 줄에 있다) 표를 줄 순서로 이어붙이면 그 사이에 다른 칸 이름들이
+# 끼어들어 "자산총액"이 붙어 있지 않다. "통화"만으로도 이 표를 다른
+# 표와 가르기엔 충분히 특이해서(다른 표에는 안 쓰는 말이다), 나머지
+# 네 낱말이 어디에 있든 다 있기만 하면 이 표로 본다.
+SHAPE_WORDS = ("통화", "자산", "총액", "주식", "채권")
 
 # 큰 묶음 이름(윗줄)과 그 아래 세부 이름(아랫줄)
 GROUP_WORDS = ("증권", "파생상품", "부동산", "특별자산",
@@ -108,7 +115,14 @@ def _num(v):
 
 
 def _is_shape(rows):
-    flat = _squash(" ".join((c or "") for r in rows for c in r))
+    # 머리글이 아무리 여러 줄로 쪼개져도(KR555202013M 실측: 다섯 줄)
+    # 첫머리 몇 줄 안에는 다 들어 있다. 표 전체를 다 보면 상관없는
+    # 큰 표(투자한도·투자제한 설명 등)가 "자산"/"총액"/"주식"/"채권"
+    # 같은 흔한 낱말을 본문 어딘가에서 우연히 다 담고 있어 잘못 걸린다
+    # (KR5153451009 35쪽 실측 - 69행짜리 투자대상 설명표가 이 검사를
+    # 통과했다). 앞 8줄만 보면 진짜 표는 놓치지 않으면서 이런 오탐은
+    # 막는다.
+    flat = _squash(" ".join((c or "") for r in rows[:8] for c in r))
     return all(w in flat for w in SHAPE_WORDS)
 
 
@@ -198,9 +212,14 @@ def _amount_and_pct_rows(rows, start):
     numeric = _numeric_rows(rows, start)
     amounts = []          # 비율 줄이 없을 때 쓸 후보
     for k, (i, row) in enumerate(numeric):
-        head = _squash("".join((rows[r][0] or "") if rows[r] else ""
-                               for r in range(i, numeric[k + 1][0]
-                                              if k + 1 < len(numeric) else i + 1)))
+        # 이름표 칸이 통화 이름 자리가 밀려 첫 칸이 아니라 둘째 칸에
+        # 오는 문서가 있다(KR5153451009 실측 - "합계"가 col1에 있다).
+        # 첫 두 칸을 다 본다.
+        head = _squash("".join(
+            "".join((rows[r][c] or "") for c in (0, 1) if c < len(rows[r]))
+            if rows[r] else ""
+            for r in range(i, numeric[k + 1][0]
+                            if k + 1 < len(numeric) else i + 1)))
         # 이 줄 자신이 비율 줄이면 금액 후보가 아니다.
         last = next((v for v in (_num(c) for c in reversed(row))
                      if v is not None), None)
@@ -220,7 +239,14 @@ def _amount_and_pct_rows(rows, start):
             # 기타 -33.95%로 자산총액만 100이다).
             last_pct = next((v for v in (_num(c) for c in reversed(nxt))
                              if v is not None), None)
-            if last_pct is not None and abs(last_pct - 100) <= 1.0:
+            # 맨 오른쪽(자산총액) 칸 자체가 통째로 빈 문서가 있다
+            # (KR5156450026 실측) - 그러면 비율 줄의 "맨 오른쪽 값"도
+            # 100이 아니라 그 앞 칸(기타 등)의 값이 되어 위 신호를 못
+            # 쓴다. 비율 줄은 칸을 괄호로 감싸는 게 이 표의 관례이므로
+            # (docstring 참고), 값 있는 칸 대부분이 괄호로 싸여 있으면
+            # 그것도 비율 줄로 본다.
+            wrapped = sum(1 for c in nxt if (c or "").strip().startswith("("))
+            if (last_pct is not None and abs(last_pct - 100) <= 1.0) or wrapped >= 2:
                 pct = nxt
         if "합계" in head or "합" in head:
             return amt, pct
@@ -253,13 +279,43 @@ def _leaf_sequence(rows, hdr_end):
     값과 같은 순서로 놓이므로 순서로 맞춘다.
 
     묶음 이름(증권/파생상품/특별자산)은 잎이 아니라서 뺀다 - 그 아래
-    주식·채권·장내 같은 잎이 따로 있다."""
+    주식·채권·장내 같은 잎이 따로 있다.
+
+    머리글이 세 줄인 문서도 있다(KR5131420007 실측: 1행 "증권", 2행
+    "집합투자"(잘림), 3행 "증권" - "집합투자"와 "증권"이 서로 다른
+    줄에 있어야 "집합투자증권"이 완성된다). _header_labels는 "주식"이나
+    "장내"가 나오는 줄까지만 보고 멈추므로 이런 3행째를 놓친다. 그
+    다음 줄에 숫자가 하나도 없으면(진짜 데이터 줄이 아니면) 머리글의
+    이어지는 줄로 보고 마저 합친다.
+
+    머리글이 다섯 줄까지 늘어나는 문서도 있다(KR555202013M 실측 -
+    _header_labels가 gi 자체를 못 찾아 hdr_end=-1로 시작한다). 정해진
+    줄 수만큼만 더 보면 이런 문서를 또 놓치니, 숫자 있는 줄(진짜 데이터)
+    이 나올 때까지는 계속 이어붙인다 - 머리글이 아닌 글줄이 섞여도
+    LEAF_WORDS로 걸러지니 손해가 없다."""
+    end = hdr_end
+    for i in range(hdr_end + 1, len(rows)):
+        if any(_num(c) is not None for c in rows[i]):
+            break
+        end = i
     joined = {}
-    for row in rows[:hdr_end + 1]:
+    for row in rows[:end + 1]:
         for j, c in enumerate(row):
             t = _squash(c)
             if t:
                 joined[j] = joined.get(j, "") + t
+    # "증권"이 묶음칸(여러 열에 걸쳐야 할 자리)인데 첫 열에만 찍혀 잎
+    # 칸("주식")과 같은 열에 겹치는 표도 있다(KR555202013M 실측: "증권주식"
+    # 으로 합쳐진다). 반면 "집합투자"+"증권"처럼 같은 잎 이름을 완성하는
+    # 데 "증권"이 정말 필요한 경우도 있다(KR5131420007). 안 맞는 것부터
+    # 접두어 "증권"/"파생상품"을 떼고 다시 맞춰본다 - 진짜 필요한 경우는
+    # 이미 LEAF_WORDS와 맞아떨어져 여기까지 안 온다.
+    for j, t in list(joined.items()):
+        if t not in LEAF_WORDS and not t.startswith("단기대출"):
+            for prefix in ("증권", "파생상품"):
+                if t.startswith(prefix) and t[len(prefix):] in LEAF_WORDS:
+                    joined[j] = t[len(prefix):]
+                    break
     seq = []
     for j in sorted(joined):
         t = joined[j]
@@ -278,9 +334,26 @@ def _column_names(amt_row, rows, hdr_end):
     canon = CANONICAL_BY_LEN.get(len(value_cols))
     if canon:
         return dict(zip(value_cols, canon))
+    # 맨 끝 "자산총액" 칸 자체가 빈 채로 뽑히는 문서가 있다(KR5156450026
+    # 실측: 표 안 다른 칸은 다 있는데 합계 칸만 통째로 비어, 값 열이
+    # 표준(12개)보다 하나 적게 나온다). 개별 비중은 이미 100으로 맞아
+    # 떨어지므로(parse_asset_table의 검산이 잡는다) 자산총액 이름표 없이
+    # 나머지 칸만 순서로 붙인다 - parse_asset_table이 자산총액 금액을
+    # 개별 금액 합으로 채운다.
+    for base in (CANONICAL_COLUMNS, CANONICAL_COLUMNS_13):
+        if len(value_cols) == len(base) - 1:
+            return dict(zip(value_cols, base[:-1]))
     leaves = _leaf_sequence(rows, hdr_end)
     if len(leaves) == len(value_cols) and len(set(leaves)) == len(leaves):
         return dict(zip(value_cols, leaves))
+    # 표준 12/13칸이 아닌(특별자산·부동산 칸이 아예 없는) 문서에서도
+    # 자산총액 칸만 빌 수 있다(KR555202013M 실측 - 잎 이름은 9개인데
+    # 값 열은 8개, 마지막 잎 이름이 "자산총액"이다). 위와 같은 이유로
+    # 총액 이름표 없이 나머지만 순서로 붙인다.
+    if (leaves and leaves[-1] == "자산총액"
+            and len(leaves) - 1 == len(value_cols)
+            and len(set(leaves[:-1])) == len(leaves) - 1):
+        return dict(zip(value_cols, leaves[:-1]))
     # 마지막으로 머리글의 열 번호를 그대로 쓴다. 안 담은 자산을 "-"로
     # 비워 둔 문서는 값 열이 서너 개뿐이라 위 두 길에 안 걸린다.
     labels = {j: n for j, n in _header_labels(rows)[0].items() if j in value_cols}
@@ -307,20 +380,29 @@ def parse_asset_table(rows, page_text=""):
     if not names:
         return None
 
-    # 맨 오른쪽은 자산총액이고 그 비율은 100이어야 한다. 아니면 열을
+    # 맨 오른쪽은 보통 자산총액이고 그 비율은 100이어야 한다. 아니면 열을
     # 잘못 짚은 것이니 이 표는 쓰지 않는다 - 답변에 "주식 97.6%"처럼
     # 바로 나가는 값이라 한 칸만 밀려도 그대로 틀린 답이 된다.
+    #
+    # 자산총액 칸 자체가 표에서 통째로 비어 이름표를 못 붙인 경우도
+    # 있다(_column_names 실측 - 개별 자산 이름만 순서로 붙고 "자산총액"은
+    # 없다). 이때는 검산을 건너뛰고 총액을 개별 금액의 합으로 만든다 -
+    # 아래에서 개별 비중 합이 100인지 다시 검산하므로 안전하다.
     last = max(names)
-    if names[last] != "자산총액":
-        return None
-    total_amount = _num(amt_row[last]) if last < len(amt_row) else None
-    if pct_row is not None:
-        total_pct = _num(pct_row[last]) if last < len(pct_row) else None
-        if total_pct is None or abs(total_pct - 100) > 1.0:
+    has_total_col = names[last] == "자산총액"
+    total_amount = None
+    if has_total_col:
+        total_amount = _num(amt_row[last]) if last < len(amt_row) else None
+        if pct_row is not None:
+            total_pct = _num(pct_row[last]) if last < len(pct_row) else None
+            if total_pct is None or abs(total_pct - 100) > 1.0:
+                return None
+        elif not total_amount:
+            # 비율 줄이 없으면 자산총액으로 나눠 만들어야 하는데, 그 값이
+            # 없으면 만들 수가 없다.
             return None
-    elif not total_amount:
-        # 비율 줄이 없으면 자산총액으로 나눠 만들어야 하는데, 그 값이
-        # 없으면 만들 수가 없다.
+    elif pct_row is None:
+        # 자산총액 칸도 없고 비율 줄도 없으면 비율을 만들 방법이 없다.
         return None
 
     out, derived = [], False
@@ -355,32 +437,219 @@ def parse_asset_table(rows, page_text=""):
     got = sum(i["pct"] for i in out if i["pct"] is not None)
     if abs(got - 100) > 1.0:
         return None
+    if not has_total_col:
+        # 자산총액 칸이 없던 경우, 위 검산을 통과했으니(비중 합이 100)
+        # 개별 금액을 더해 총액을 만든다.
+        amounts = [i["amount"] for i in out if i["amount"] is not None]
+        total_amount = round(sum(amounts), 2) if amounts else None
     return {"items": out, "total_amount": total_amount,
             "pct_derived": derived,
             "as_of": _as_of(rows, page_text)}
 
 
+# "통화별" 칸 자체를 안 쓰고 파이차트 옆에 "금액"/"비중" 두 줄만 싣는
+# 문서가 있다(KR5172450019 실측: "주식 집합투자증권 단기대출 및 예금
+# 기타 자산 총액" / "금액 47,142 24 227 1,013 48,406" / "비중 97.39
+# 0.05 0.47 2.09 100.00"). "통화별"이 아예 없어 _is_shape를 못 지나고,
+# 표로도 안 잡혀(그림 옆 캡션 글자라 pdfplumber가 표로 안 본다) 표
+# 칸(rows) 기반 파서로는 손을 못 댄다. 페이지 글자를 직접 읽는다.
+_LEAF_NAME_ALTS = sorted([
+    "주식", "채권", "어음", "집합투자증권",
+    r"파생상품\s*\(\s*장내\s*\)", r"파생상품\s*\(\s*장외\s*\)",
+    r"특별자산\s*\(\s*실물자산\s*\)", r"특별자산\s*\(\s*기타\s*\)",
+    "부동산", r"단기대출\s*및\s*예금",
+    "기타", r"자산\s*총액",
+], key=len, reverse=True)
+RE_LEAF_NAME = re.compile("|".join(_LEAF_NAME_ALTS))
+RE_SIMPLE_CAPTION = re.compile(r"자산\s*구성\s*현황")
+RE_NUM_TOKEN = re.compile(r"-?[\d,]+(?:\.\d+)?")
+
+
+def _parse_simple_asset_text(text):
+    """페이지 글자에서 "자산구성 현황" 캡션 뒤 "금액"/"비중" 두 줄을
+    찾아 읽는다. 표 칸이 없어 값을 검산할 다른 수가 없으므로, 이름·
+    금액·비율 개수가 셋 다 같고 맨 끝이 "자산총액"이며 비율 합이
+    100인지를 평소보다 더 엄격히 확인한다."""
+    lines = (text or "").splitlines()
+    for i, line in enumerate(lines):
+        if not RE_SIMPLE_CAPTION.search(line):
+            continue
+        window = lines[i: i + 30]
+        amt_i = next((j for j, ln in enumerate(window)
+                      if ln.strip().startswith("금액")), None)
+        pct_i = next((j for j, ln in enumerate(window)
+                      if ln.strip().startswith("비중")), None)
+        if amt_i is None or pct_i is None or amt_i == 0:
+            continue
+        header = window[amt_i - 1]
+        names = [re.sub(r"\s+", "", m.group())
+                 for m in RE_LEAF_NAME.finditer(header)]
+        amounts = [_num(v) for v in RE_NUM_TOKEN.findall(window[amt_i])]
+        pcts = [_num(v) for v in RE_NUM_TOKEN.findall(window[pct_i])]
+        if not (names and len(names) == len(amounts) == len(pcts)):
+            continue
+        if names[-1] != "자산총액" or pcts[-1] is None or abs(pcts[-1] - 100) > 1.0:
+            continue
+        out = []
+        for name, amount, pct in zip(names[:-1], amounts[:-1], pcts[:-1]):
+            if (pct or 0) == 0 and (amount or 0) == 0:
+                continue
+            out.append({"asset": name, "amount": amount, "pct": pct})
+        if not out:
+            continue
+        got = sum(x["pct"] for x in out if x["pct"] is not None)
+        if abs(got - 100) > 1.0:
+            continue
+        return {"items": out, "total_amount": amounts[-1],
+                "pct_derived": False, "as_of": _as_of([], text)}
+    return None
+
+
+def _simple_tables_from_pdf(conn, code):
+    """_parse_simple_asset_text가 쓸 페이지 글자를 후보 쪽마다 넘긴다."""
+    import pdfplumber
+    import pdf_words
+
+    pdfs = glob.glob(os.path.join(DATA_DIR, code, "*.pdf"))
+    pages = _candidate_pages(conn, code)
+    if not pdfs or not pages:
+        return
+    with pdfplumber.open(pdfs[0]) as pdf:
+        for pno in pages:
+            if pno < 1 or pno > len(pdf.pages):
+                continue
+            text = pdf_words.extract_text(pdf.pages[pno - 1]) or ""
+            rec = _parse_simple_asset_text(text)
+            if rec:
+                yield pno, rec
+
+
+def _has_total_row(rows):
+    # "합계" 이름표가 항상 첫 칸에 있는 건 아니다(KR5153451009 실측:
+    # 통화 이름 칸이 빈 채로 한 칸 밀려 "합계"가 둘째 칸에 있다).
+    # 이름표가 든 칸(보통 첫 두 칸 중 하나)을 다 본다. "자산합계"처럼
+    # 앞에 다른 말이 붙는 문서도 있다(KR5129420031 실측) - 꽉 찬 낱말이
+    # 아니라 "합계"가 들어만 있으면 된다. 정확히 "합계"만 요구하면
+    # (KR5129420031 실측) 이미 합계 줄이 있는데도 없다고 보고 계속
+    # 뒤 페이지를 이어 붙이다 엉뚱한 문단(회사연혁 등)의 날짜를
+    # 기준일로 잘못 줍는다.
+    return any(r and any("합계" in _squash(c or "") for c in r[:2])
+               for r in rows)
+
+
+def _is_mother_fund_table(text):
+    """이 표가 상품 자신이 아니라, 상품이 투자하는 모투자신탁 하나의
+    참고용 자산구성표인가(KR5157450090 실측: "다. 집합투자기구의
+    자산구성" 절 안에 모투자신탁 두 개(마이다스 우량채권/마이다스
+    거북이)의 표가 먼저 나오고, 상품 자신("...자투자신탁...(운용)")의
+    표가 맨 뒤에 나온다 - 페이지 순서로 첫 표를 집으면 모투자신탁
+    쪽을 담아 총액이 완전히 다른 값(691,895)이 된다). 표 바로 위
+    캡션 줄("<이름> 모투자신탁(...) [<날짜> / 단위 : ...]")에만 있는
+    낱말을 본다 - "모투자신탁"이 다른 문단(클래스 이름 등)에서 그냥
+    스쳐 지나가는 것과 구분하기 위해 "단위"가 같은 줄에 있을 때만
+    본다."""
+    return any("모투자신탁" in line and "단위" in line
+               for line in (text or "").splitlines())
+
+
 def _tables_from_db(conn, code):
+    entries = []
     for page, dj in conn.execute(
             "SELECT page, data_json FROM tables WHERE doc_id = ? ORDER BY page",
             (code,)):
         try:
-            yield page, json.loads(dj)
+            rows = json.loads(dj)
         except (ValueError, TypeError):
             continue
+        entries.append((page, rows))
+
+    found = []
+    i = 0
+    while i < len(entries):
+        page, rows = entries[i]
+        i += 1
+        if not _is_shape(rows):
+            continue
+        # 통화가 여럿인 펀드는 "합계" 줄이 다음 쪽 표 조각에 떨어져
+        # 있을 수 있다(KR5153451009 실측: AUD~KRW가 47쪽 표 조각에,
+        # TWD~합계가 48쪽 표 조각에 있다 - pdfplumber가 표를 쪽마다
+        # 따로 잡는다). 합계 줄 없이 첫 조각만 보면 통화 하나(AUD)의
+        # 값만 쓰게 된다. 합계 줄이 나올 때까지(또는 새 머리글이
+        # 나올 때까지, 페이지가 몇 장 넘어갈 때까지) 뒤 조각을 이어
+        # 붙인다.
+        rows = list(rows)
+        ncols = max((len(r) for r in rows if r), default=0)
+        while (not _has_total_row(rows) and i < len(entries)
+               and entries[i][0] - page <= 3):
+            _npage, nrows = entries[i]
+            if _is_shape(nrows):
+                break
+            # 이어 붙는 조각이 원래 표와 칸 수가 다른 문서가 있다
+            # (KR5153451009 실측: 48쪽 조각이 빈 칸 하나가 왼쪽에 더
+            # 있어 47쪽 조각보다 칸이 하나 많다 - pdfplumber가 쪽마다
+            # 표 칸 경계를 따로 잡아서 생긴다). 왼쪽에 남는 빈 칸을
+            # 떼어 칸 수를 맞춘다 - 안 맞추면 값이 한 칸씩 밀려 엉뚱한
+            # 자산에 붙는다.
+            data_rows = [r for r in nrows
+                         if r and any(_num(c) is not None for c in r)]
+            extra = max((len(r) for r in nrows if r), default=0) - ncols
+            if extra > 0 and data_rows and all(
+                    not any((r[c] or "").strip() for c in range(extra))
+                    for r in data_rows):
+                nrows = [r[extra:] if r else r for r in nrows]
+            rows.extend(nrows)
+            i += 1
+        # 기준일("(2025년 04월 16일 기준 / ...)")은 표 자신의 칸이 아니라
+        # 표 바로 위 캡션 문장으로만 찍히는 문서가 많다 - 표 칸(rows)만
+        # 보면 기준일을 아예 못 찾는다(KR5111420047 실측: as_of가 통째로
+        # 빠짐). 같은 페이지의 본문 청크(chunks)를 이어붙여 같이 넘긴다.
+        # 캡션이 표보다 한 쪽 앞서 나오는 문서도 있다(KR5127450215 실측:
+        # "다. 집합투자기구의 자산 구성 현황(...기준일: 2025년 05월
+        # 17일)"이 39쪽 맨 끝에, 정작 표는 40쪽에 있다). 앞쪽 한 쪽의
+        # 글도 뒤에 이어 붙여 같이 넘긴다 - _as_of는 첫 매치만 쓰므로
+        # 이 페이지 글을 먼저 두어, 이 페이지 자체에 날짜가 있으면 그걸
+        # 우선하고 없을 때만 앞쪽 페이지의 날짜로 넘어가게 한다.
+        cur_text = " ".join(
+            t for (t,) in conn.execute(
+                "SELECT text FROM chunks WHERE doc_id = ? AND page = ?",
+                (code, page))
+        )
+        prev_text = " ".join(
+            t for (t,) in conn.execute(
+                "SELECT text FROM chunks WHERE doc_id = ? AND page = ?",
+                (code, page - 1))
+        )
+        page_text = f"{cur_text} {prev_text}"
+        found.append((page, rows, page_text, cur_text))
+
+    # 모투자신탁 참고표는 나중에 준다 - 상품 자신의 표가 있으면 그게
+    # 먼저 골라지도록 한다(extract()는 첫 성공을 그대로 쓴다). 이
+    # 판정은 반드시 이 페이지 자신의 글(cur_text)만 본다 - 기준일
+    # 보강용으로 앞쪽 페이지 글까지 합친 page_text로 보면, 바로 앞
+    # 페이지가 모투자신탁 표였을 때 그 캡션이 넘어와 지금 페이지까지
+    # 덩달아 모투자신탁으로 잘못 찍힌다(KR5157450090 67쪽 실측 - 상품
+    # 자신의 표인데 66쪽 모투자신탁 캡션이 앞서 붙어 있었다).
+    own = [f for f in found if not _is_mother_fund_table(f[3])]
+    mother = [f for f in found if _is_mother_fund_table(f[3])]
+    for page, rows, page_text, _cur_text in own + mother:
+        yield page, rows, page_text
 
 
 def _candidate_pages(conn, code):
     """이 표가 있을 만한 페이지 번호. 본문·표 어디든 "자산구성"이나
     "통화별"이 적힌 쪽과 그 다음 쪽을 후보로 본다(제목과 표가 페이지
-    경계로 갈리는 문서가 있다)."""
+    경계로 갈리는 문서가 있다). "자산 구성"처럼 낱말 사이에 띄어쓰기가
+    낀 문서도 있다(KR5172450019 실측 - "통화별" 칸 자체가 없는 표라
+    "자산총액"도 "자산 총액"으로 띄어 쓴다)."""
     pages = set()
     for sql in ("SELECT page FROM chunks WHERE doc_id = ? AND "
-                "(text LIKE '%자산구성%' OR text LIKE '%통화별%' "
-                "OR text LIKE '%자산총액%')",
+                "(text LIKE '%자산구성%' OR text LIKE '%자산 구성%' "
+                "OR text LIKE '%통화별%' OR text LIKE '%자산총액%' "
+                "OR text LIKE '%자산 총액%')",
                 "SELECT page FROM tables WHERE doc_id = ? AND "
-                "(row_text LIKE '%자산구성%' OR row_text LIKE '%통화별%' "
-                "OR row_text LIKE '%자산총액%')"):
+                "(row_text LIKE '%자산구성%' OR row_text LIKE '%자산 구성%' "
+                "OR row_text LIKE '%통화별%' OR row_text LIKE '%자산총액%' "
+                "OR row_text LIKE '%자산 총액%')"):
         for (pg,) in conn.execute(sql, (code,)):
             pages.add(pg)
             pages.add(pg + 1)
@@ -399,22 +668,62 @@ def _tables_from_pdf(conn, code):
     글자가 흩어진 문서는 페이지 글자로 걸러 봐야 "통화별"이 붙어 있지도
     않아서 소용이 없다."""
     import pdfplumber
+    import pdf_words
 
     pdfs = glob.glob(os.path.join(DATA_DIR, code, "*.pdf"))
     pages = _candidate_pages(conn, code)
-    if not pdfs or not pages:
+    if not pdfs:
         return
-    settings = {"vertical_strategy": "lines", "horizontal_strategy": "text"}
+    # "lines/text"가 못 잡는 문서가 있다(KR555202013M 35쪽 실측: 그
+    # 설정으론 표 왼쪽 "통화별" 칸과 오른쪽 "자산총액" 칸이 통째로
+    # 떨어져 나간 반쪽짜리 표만 잡히는데, 기본 설정으로는 그 두 칸을
+    # 포함한 온전한 표가 잡힌다). 반대로 기본 설정으로는 아예 표가 안
+    # 잡히는 문서도 있다(KR5111450067). 그래서 둘 다 시도한다 - 값
+    # 검산(parse_asset_table)이 있어 잘못 잡은 표는 어차피 걸러진다.
+    settings_variants = (
+        {"vertical_strategy": "lines", "horizontal_strategy": "text"},
+        None,  # pdfplumber 기본 설정
+    )
     with pdfplumber.open(pdfs[0]) as pdf:
+        if not pages:
+            # 회전 잡음이 본문 글자 자체를 깨서 DB에 저장된 chunks/tables
+            # 텍스트에 "자산구성"/"통화별"이 아예 안 남는 문서가 있다
+            # (KR5172450019/KR555202013M 실측 - build_structured_store.py가
+            # 쓰는 기본 extract_text()로는 못 읽지만 pdf_words의 회전
+            # 보정판으로는 읽힌다). DB 후보가 하나도 없을 때만 전 쪽을
+            # pdf_words로 다시 훑는다 - 느려서 평소엔 안 쓴다.
+            pages = [
+                pno for pno, page in enumerate(pdf.pages, start=1)
+                if any(w in _squash(pdf_words.extract_text(page) or "")
+                       for w in ("자산구성", "통화별", "자산총액"))
+            ]
+            pages = sorted({p for pno in pages for p in (pno, pno + 1)})
+        if not pages:
+            return
         for pno in pages:
             if pno < 1 or pno > len(pdf.pages):
                 continue
             page = pdf.pages[pno - 1]
-            text = page.extract_text() or ""
-            for t in page.find_tables(table_settings=settings):
-                rows = t.extract()
-                if rows:
-                    yield pno, rows, text
+            # 회전 잡음으로 글자가 한 자씩 흩어지는 문서가 있다(KR5120420091
+            # 실측: "다.집합투자기구의자산구성현황"만 멀쩡하고 기준일
+            # 캡션은 "통\n대\n자\n(주\n..."처럼 통째로 깨진다 - 기본
+            # extract_text()로는 기준일을 못 찾는다). extract_class_fees.py
+            # 등에서 이미 검증된 보정 함수를 그대로 쓴다 - 정상 문서는
+            # 결과가 완전히 같다.
+            #
+            # 캡션이 표보다 한 쪽 앞서기도 한다(KR5127450215 실측 -
+            # _tables_from_db와 같은 이유). 이 쪽에 날짜가 없을 때만
+            # 앞쪽 쪽의 날짜로 넘어가도록 이 페이지 글을 먼저 둔다.
+            prev_text = (pdf_words.extract_text(pdf.pages[pno - 2]) or ""
+                         if pno > 1 else "")
+            text = (pdf_words.extract_text(page) or "") + " " + prev_text
+            for settings in settings_variants:
+                tabs = (page.find_tables(table_settings=settings)
+                        if settings else page.find_tables())
+                for t in tabs:
+                    rows = t.extract()
+                    if rows:
+                        yield pno, rows, text
 
 
 def extract(db_path=DEFAULT_DB_PATH):
@@ -424,8 +733,8 @@ def extract(db_path=DEFAULT_DB_PATH):
     out, fallback = [], []
     for code in codes:
         got = None
-        for page, rows in _tables_from_db(conn, code):
-            rec = parse_asset_table(rows)
+        for page, rows, page_text in _tables_from_db(conn, code):
+            rec = parse_asset_table(rows, page_text)
             if rec:
                 got = dict(rec, product_code=code, page=page, method="cell_grid")
                 break
@@ -437,6 +746,12 @@ def extract(db_path=DEFAULT_DB_PATH):
                                method="pdf_text_rows")
                     fallback.append(code)
                     break
+        if got is None:
+            for page, rec in _simple_tables_from_pdf(conn, code):
+                got = dict(rec, product_code=code, page=page,
+                           method="pdf_simple_text")
+                fallback.append(code)
+                break
         if got:
             out.append(got)
     conn.close()

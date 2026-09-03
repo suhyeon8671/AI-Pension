@@ -152,6 +152,14 @@ def _fee_lines(fees, meaning):
     for edge in (shown[-1], shown[0]):
         if edge not in picked:
             picked = [edge] + picked if edge is shown[0] else picked + [edge]
+    # "총보수 얼마?"처럼 클래스를 안 짚은 질문은 대개 가장 기본형(온라인·
+    # 연금 같은 조건 없이 그냥 "A"/"C")을 궁금해하는 것이다(KR5147430065
+    # 실측: PROD-08 검증 실패 - 연금 계좌 클래스만 앞세우다 보니 정작
+    # 가장 기본적인 "A" 클래스(0.443%)가 범위 설명에만 녹아들고 숫자로는
+    # 안 나왔다). 연금 클래스에 밀려도 기본형 A/C는 항상 보인다.
+    base = next((f for f in shown if f["class_code"] in ("A", "C")), None)
+    if base is not None and base not in picked:
+        picked = picked + [base]
     picked = sorted(picked, key=lambda f: f["total_fee"])
 
     for f in picked:

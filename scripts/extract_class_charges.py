@@ -80,6 +80,76 @@ RE_HAS_LABEL = re.compile(r"수수료(선취|미징구|후취)-")
 # (extract_class_fees.py의 DETAIL_FEE_CLASS_CODE_JONGRYU_RE와 같은 취지).
 RE_JONGRYU_CODE = re.compile(
     r"^종류([A-Za-z](?:[A-Za-z0-9\-]{0,5}[A-Za-z0-9])?)(?![A-Za-z0-9])")
+# 클래스 여러 개를 한 줄에 "C1~C5"처럼 묶어 적는 표가 있다(_row_class_code
+# 참고). 뒤쪽 코드가 앞쪽과 같은 접두사를 다시 쓰는 표기만 받는다
+# ("C1~5"처럼 접두사를 한 번만 쓰는 표기는 이 말뭉치에서 실측되지
+# 않았다 - 나오면 그때 넓힌다).
+RE_CLASS_BUNDLE = re.compile(r"([A-Za-z\-]+)(\d+)~\1(\d+)")
+# 코드가 괄호에만 덩그러니 든 칸("(A)")도 있다(KR5169950018 실측: 이름표
+# ("수수료선취-오프라인" 등)는 줄바꿈 때문에 별도의 pdfplumber 행으로
+# 떨어져 나가고, 정작 이 값 행에는 코드 칸에 "(A)"만 남는다). _parse는
+# 이름표+코드가 한 칸에 다 있는 형식만 읽으므로 이런 칸은 못 찾는다.
+RE_PAREN_ONLY_CODE = re.compile(r"^\(([A-Za-z][A-Za-z0-9\-]{0,12})\)$")
+
+
+def _expand_class_range(code, known_codes):
+    """"C1~C5" 같은 묶음 코드를 개별 클래스 코드로 펼친다.
+
+    class_fees에 이미 있는 개별 코드로 전부 확인될 때만 펼친다 -
+    묶음 안에 실제로 몇 클래스가 있는지 표기만으로 추측하면 위험하다
+    (예: C1~C5인데 실제로는 C1,C2,C3만 있고 C4,C5는 폐지됐을 수 있다).
+    확인이 안 되면 원래 코드를 그대로 하나만 돌려준다 - 그러면 뒤쪽
+    known_codes 대조 단계에서 "모르는 코드"로 걸러지므로, 틀린 값을
+    엉뚱한 클래스에 붙이는 것보다 안전하다."""
+    m = RE_CLASS_BUNDLE.fullmatch(code)
+    if not m:
+        return [code]
+    prefix, start, end = m.group(1), int(m.group(2)), int(m.group(3))
+    if start > end or end - start > 20:
+        return [code]
+    expanded = [f"{prefix}{n}" for n in range(start, end + 1)]
+    if known_codes and not all(c in known_codes for c in expanded):
+        return [code]
+    return expanded
+
+
+def _is_code_cell(text, code):
+    """이동값(table_shift) 보정이 그 줄 자신의 코드 칸을 값으로 오인하지
+    않게 막는 검사. 코드 칸이 "C"처럼 맨몸일 때도, "(C)"처럼 괄호로
+    싸여 있을 때도(_row_class_code의 RE_PAREN_ONLY_CODE 갈래 참고 -
+    KR5169950018 실측: 괄호를 벗겨 코드를 "C"로 돌려주고 나면, 이동값
+    채점이 원래 칸의 "(C)"와 "C"를 다른 문자열로 보고 자기 코드 칸을
+    그대로 값으로 세어버려 이동값이 엉뚱하게 잡힌다) 둘 다 자기 코드로
+    본다."""
+    s = _squash(text)
+    return s == code or s == f"({code})"
+
+
+RE_ONLY_DASHES = re.compile(r"^[-–—−\s]+$")
+
+
+def _looks_like_fee_cell(x):
+    """"왼쪽부터 순서대로" 맞추기(아래 raw)는 헤더에 없는 가입자격 칸이
+    끼어 있으면 깨진다(KR5118420036 실측: "가입자격" 이름표 자체가
+    없는 서술형 안내문 칸이 코드·이름표 다음, 진짜 수수료 값 앞에 끼어
+    있어 순서가 통째로 한 칸씩 밀렸다 - "선취판매수수료징구"가
+    front_load_fee 자리로, 진짜 값 "0.2%"가 back_load_fee 자리로 잘못
+    들어갔다). 수수료 값은 늘 숫자(요율·금액)를 담거나 "없음"류 표기
+    그 자체이고, 가입자격 안내문은 길든 짧든 그 자체로는 숫자가 없다 -
+    길이가 아니라 이 모양으로 가른다("제한없음"/"온라인가입자"처럼
+    짧아도 숫자가 없는 안내문은 길이만으로는 못 걸러진다).
+
+    다만 숫자만으로는 모자란다 - 가입자격 문장도 금액·법조문 번호로
+    숫자를 담을 수 있다(KR5118420036 실측: "최초 납입금액 50억원 이상인
+    법인"에 "50", "소득세법 제20조의3..."에 "20", "3"이 있어 숫자
+    검사만으로는 못 걸렀다). 수수료 값은 늘 "%"나 "100분의"나 "이내"
+    중 하나를 달고 나온다 - 그 표시가 하나도 없이 숫자만 있으면
+    가입자격 쪽으로 본다."""
+    if _squash(x) in NONE_MARKS:
+        return True
+    if not re.search(r"\d", x):
+        return False
+    return any(k in x for k in ("%", "100분의", "이내"))
 
 
 def _clean(v):
@@ -90,15 +160,41 @@ def _clean(v):
     # "선취판매수수료: 수수료선취-오프라인" 같은 말이 안 되는 답이 나갔다.
     if RE_HAS_LABEL.search(_squash(v)):
         return None
+    # 한 칸에 "-"가 줄바꿈으로 겹쳐 찍혀 "- -"가 되는 표가 있다
+    # (KR5144450095 실측 - PDF 렌더링 중복으로 보인다). 대시로만 된
+    # 칸은 개수·간격에 관계없이 다 "없음"으로 본다.
+    if RE_ONLY_DASHES.match(v):
+        return "없음"
+    # "납입금액"이 "납임금액"으로 나오는 문서가 있다(KR5111420047/
+    # KR5111450067 실측 - 같은 페이지에 정상 표기 "납입금액"도 같이
+    # 나와서 원문 자체의 글꼴/렌더링 오류로 보인다. 다른 뜻의 낱말이
+    # 아니라 같은 낱말의 오식이라 값을 바꾸지 않고 표기만 바로잡는다).
+    v = v.replace("납임금액", "납입금액")
     return "없음" if _squash(v) in NONE_MARKS else v
+
+
+
+# 헤더 다음 줄이 진짜 데이터 줄(헤더의 이어지는 줄이 아니라)인지 보는
+# 신호. 헤더 칸은 이름표뿐이라 퍼센트·"납입금액"·"-" 같은 값이 안 나온다.
+RE_FEE_VALUE = re.compile(r"\d+(?:\.\d+)?\s*%|납입금액|환매금액|이익금")
+
+
+def _looks_like_data_row(row):
+    for c in row:
+        cs = (c or "").strip()
+        if not cs:
+            continue
+        if _squash(cs) in NONE_MARKS or RE_FEE_VALUE.search(cs):
+            return True
+    return False
 
 
 def _header_map(rows):
     """열 번호 -> 우리가 쓸 이름. 못 찾으면 빈 dict.
 
-    헤더 줄은 "환매수수료"가 칸 하나로 짧게 들어 있는 줄로 찾는다.
-    처음엔 '가입자격'이나 '선취' 같은 말이 있는 줄을 다 헤더로 봤는데,
-    표 첫 줄의 본문 문장("...가입자격에 따라 수수료가 다릅니다")이 걸려서
+    헤더 줄은 "환매"가 칸 하나로 짧게 들어 있는 줄로 찾는다. 처음엔
+    '가입자격'이나 '선취' 같은 말이 있는 줄을 다 헤더로 봤는데, 표 첫
+    줄의 본문 문장("...가입자격에 따라 수수료가 다릅니다")이 걸려서
     엉뚱한 열이 가입자격으로 잡혔다. 헤더 칸은 문장이 아니라 이름표라
     짧다는 점을 쓴다."""
     ncols = max((len(r) for r in rows), default=0)
@@ -106,23 +202,54 @@ def _header_map(rows):
         return {}, 0
 
     # 표 위쪽에 설명 문단이 여러 줄 붙는 문서가 많아서 앞부분만 보면
-    # 헤더를 놓친다. 전체를 훑는다.
+    # 헤더를 놓친다. 전체를 훑는다. "환매수수료"가 아니라 "환매"까지만
+    # 요구한다 - "환매"와 "수수료"가 서로 다른 줄에 떨어진 문서가 있어서
+    # (아래 참고) "환매수수료"를 통째로 요구하면 그런 문서는 애초에
+    # 앵커조차 못 잡는다.
+    #
+    # 다만 "환매"로 시작하는 짧은 칸이 진짜 머리글 밖에도 있다 - "부과
+    # 기준" 각주 줄이 "매입시/환매시/환매시/전환시"처럼 부과 시점을
+    # 적기도 한다(KR515302022M 실측: 이 줄이 앵커로 잘못 잡혀 세로형
+    # 이어붙이기 표를 통째로 못 읽었다). "환매시"도 "환매"로 시작해서
+    # 걸리지만 "수수료" 자리가 아니라 "시점" 자리다. 한 줄에 선취/후취/
+    # 환매/전환 중 적어도 둘이 있고("...시"로 끝나는 시점 칸은 안 친다)
+    # 진짜 머리글로 본다 - 부과기준 각주 줄은 "환매"가 둘 걸려도(환매시
+    # 두 칸) 전부 "시"로 끝나 하나도 안 세어진다.
     anchor = None
     for i, row in enumerate(rows):
+        cats = set()
         for cell in row:
             s = _squash(cell or "")
-            if s.startswith("환매수수료") and len(s) <= MAX_HEADER_CELL:
-                anchor = i
-                break
-        if anchor is not None:
+            if not s or len(s) > MAX_HEADER_CELL or s.endswith("시"):
+                continue
+            for prefix in ("선취", "후취", "환매", "전환"):
+                if s.startswith(prefix):
+                    cats.add(prefix)
+        if len(cats) >= 2:
+            anchor = i
             break
     if anchor is None:
         return {}, 0
 
-    # 헤더는 그 줄과 바로 윗줄까지만 본다(구분/가입자격/수수료율 밑에
-    # 선취판매수수료/후취판매수수료/환매수수료/전환수수료가 오는 두 줄 구조).
+    # 헤더가 두 줄(구분/가입자격/수수료율 밑에 선취판매수수료/후취판매
+    # 수수료/환매수수료/전환수수료)인 문서도 있고, "선취판매/후취판매/
+    # 환매/전환"과 그 아래 "수수료"(네 칸에 똑같이 반복)가 서로 다른
+    # 줄로 갈라진 세 줄짜리 헤더인 문서도 있다(KR5123420015/
+    # KR5147430065 실측: 앵커 줄엔 "환매"만 있고 "수수료"가 한 줄
+    # 아래에 있다 - 옛 코드는 "환매수수료"가 한 칸에 다 있다고 가정해서
+    # 이런 문서를 통째로 못 찾았다. 32개 상품이 이 모양이었다). 앞뒤로
+    # 몇 줄 더 살펴보되, 진짜 데이터 줄(퍼센트·"납입금액"·"-" 같은 값이
+    # 있는 줄)이 나오면 거기서 멈춘다 - 안 그러면 진짜 값이 헤더 글자와
+    # 섞여 열 이름 매칭이 깨진다.
+    start = max(0, anchor - 2)
+    end = anchor
+    for i in range(anchor, min(anchor + 3, len(rows))):
+        if i > anchor and _looks_like_data_row(rows[i]):
+            break
+        end = i
+
     joined = [""] * ncols
-    for row in rows[max(0, anchor - 1): anchor + 1]:
+    for row in rows[start: end + 1]:
         for j, cell in enumerate(row[:ncols]):
             s = _squash(cell or "")
             if len(s) <= MAX_HEADER_CELL:
@@ -138,10 +265,10 @@ def _header_map(rows):
                 mapping[j] = name
                 used.add(j)
                 break
-    return mapping, anchor + 1
+    return mapping, end + 1
 
 
-def _row_class_code(row):
+def _row_class_code(row, allow_bare_paren=False):
     """행 앞부분에서 클래스 코드를 읽는다.
 
     표 모양이 두 갈래다. 첫 칸에 이름표가 통째로 든 것,
@@ -159,9 +286,36 @@ def _row_class_code(row):
     cells = [c for c in (row or []) if (c or "").strip()][:3]
     if not cells:
         return None
+    # "C1~C5"처럼 클래스 여러 개를 한 줄에 묶어 적는 표가 있다
+    # (KR5172450019 실측: "수수료미징구-오프라인-보수체감(C1~C5)" 한
+    # 줄이 C1,C2,C3,C4,C5 다섯 클래스 전부를 가리킨다). "~"가 낀
+    # 코드는 _parse가 못 읽으므로(코드 문자 집합에 "~"가 없음) 먼저
+    # 따로 본다 - 묶음 표기 그대로 돌려주고, 실제 펼치는 일은 호출부
+    # (_expand_class_range)가 known_codes와 대조하며 안전하게 한다.
+    bundle = RE_CLASS_BUNDLE.search(_squash(cells[0]))
+    if bundle:
+        return bundle.group(0)
     found = _parse(cells[0])
     if len(found) == 1:
         return next(iter(found))
+    if allow_bare_paren:
+        # "(A)"처럼 코드가 괄호에만 덩그러니 든 칸은 _parse_table을 쓰는
+        # 가로형 표에서만 받는다 - _parse_tall_table/_parse_transposed_table
+        # 같은 다른 표 모양에서는 이름표가 줄바꿈으로 흩어지며 "(C-G)"
+        # 같은 코드 조각만 남은 무관한 줄이 섞여 있어서(KR5160420009
+        # 실측: 이 조각이 진짜 클래스 행으로 오인되면서 가입자격이
+        # "(C-G)" 문자열 그대로 들어가고 그 뒤 뒤집힌 표 파서로 넘어가지도
+        # 못해 상품 전체가 깨졌다), 이 갈래를 켜면 위험하다.
+        m = RE_PAREN_ONLY_CODE.match(_squash(cells[0]))
+        if m:
+            return m.group(1)
+        # 이름표가 앞, 괄호 코드가 뒤로 순서가 바뀐 칸도 있다
+        # (KR5144420081 31쪽 실측: "수수료미징구-오프라인 | (C) | - | -
+        # | - | -"). 코드가 이름표 뒤에 별도 칸으로 오는 경우다.
+        if len(cells) > 1 and RE_HAS_LABEL.search(_squash(cells[0])):
+            m = RE_PAREN_ONLY_CODE.match(_squash(cells[1]))
+            if m:
+                return m.group(1)
     # 코드 칸과 이름표 칸이 나뉜 경우
     head = _squash(cells[0])
     if len(cells) > 1 and RE_BARE_CODE.match(head) and RE_HAS_LABEL.search(
@@ -176,6 +330,15 @@ def _row_class_code(row):
     m = RE_JONGRYU_CODE.match(head)
     if m:
         return m.group(1)
+    # 코드 칸 옆이 "수수료선취-..." 식 공식 명칭이 아니라 그냥 가입자격을
+    # 풀어 쓴 문장인 표도 있다(KR5147430065 실측: "A | 선취판매수수료가
+    # 징구되는 집합투자증권 | ..." - 옆 칸이 서술형이라 RE_HAS_LABEL이
+    # 안 걸려 위 갈래에서 못 찾는다). 글자를 하나라도 포함한 짧은 코드면
+    # 그대로 받아준다 - 순수 숫자만은 뺀다(각주 번호 등과 헷갈릴 수
+    # 있다). 이미 검증된 수수료·가입자격 표 안에서만 불리는 함수라
+    # 안전하다.
+    if RE_BARE_CODE.match(head) and re.search(r"[A-Za-z]", head):
+        return head
     return None
 
 
@@ -192,23 +355,346 @@ def _table_header(rows):
     return mapping, header_end
 
 
-def _parse_table(rows, carried=None):
+# 클래스마다 표를 가로 한 줄이 아니라 세로로 네 줄(선취/후취/전환/
+# 환매판매수수료 각각 한 줄씩)에 걸쳐 싣는 문서도 있다(KR5185450009
+# 실측: 머리글이 "클래스 | 가입자격 | 구분 | 부과비율(또는 부과금액) |
+# 부과시기"이고, "구분" 칸에 수수료 종류 이름이, "부과비율" 칸에 그
+# 값이 들어간다 - 클래스 이름·가입자격은 그 클래스의 첫 줄에만 있고
+# 나머지 세 줄은 비어 있다). COLUMNS 기반 가로형 매핑과 표 모양
+# 자체가 달라 같은 방식으로는 못 읽는다 - 열이 밀린 걸로 오판해서
+# 선취판매수수료 값이 가입자격 칸에 들어가는 등 완전히 엉뚱하게
+# 읽혔다.
+TALL_KIND_TO_FIELD = {
+    "선취판매수수료": "front_load_fee",
+    "후취판매수수료": "back_load_fee",
+    "환매수수료": "redemption_fee",
+    "전환수수료": "switch_fee",
+}
+
+
+def _parse_tall_table(rows, known_codes=()):
+    """세로형 표를 읽는다. 열 번호가 아니라 "구분" 칸의 내용(선취판매
+    수수료/후취판매수수료/환매수수료/전환수수료 중 하나와 정확히
+    같음)으로 그 줄이 수수료 줄인지 스스로 밝혀지므로, 머리글 유무와
+    무관하게 쓸 수 있다 - 표가 다음 쪽으로 이어지면서 머리글이 반복되지
+    않는 경우도(KR5185450009 27쪽 실측) 이 방식으로 그대로 읽힌다.
+
+    클래스 구분 없이 펀드 전체가 클래스 하나뿐인 모자형 펀드는 "구분"
+    칸이 줄 맨 앞이라 그 앞에 이름표 칸 자체가 없다(KR5123365001
+    실측: "선취판매수수료 | - | 매입시"처럼 구분 칸부터 시작 - class_fees
+    에도 클래스 코드가 "투자신탁" 하나뿐이다). known_codes가 정확히
+    하나뿐인 상품에서만, 이름표 없는 구분 줄을 그 하나뿐인 코드로
+    본다 - 클래스가 둘 이상인 상품에서 이러면 어느 클래스 것인지 몰라
+    위험하므로 그때는 그대로 건너뛴다(기존 동작 유지)."""
+    out = {}
+    cur_rec = None
+    seen_kinds = set()
+    single_code = next(iter(known_codes)) if len(known_codes) == 1 else None
+    for row in rows:
+        if not row:
+            continue
+        kind_col = next((j for j, c in enumerate(row)
+                          if _squash(c or "") in TALL_KIND_TO_FIELD), None)
+        pre_cells = row[:kind_col] if kind_col is not None else row
+        if any((c or "").strip() for c in pre_cells):
+            code = _row_class_code(row)
+            if code:
+                cur_rec = out.setdefault(code, {})
+                # 가입자격은 이름표 칸(공식 명칭, "수수료선취-..." 꼴이라
+                # RE_HAS_LABEL에 걸린다) 앞뒤의 서술형 문장이다.
+                for c in pre_cells:
+                    cs = (c or "").strip()
+                    if not cs or RE_HAS_LABEL.search(_squash(cs)):
+                        continue
+                    elig = _clean(cs)
+                    if elig and not cur_rec.get("eligibility"):
+                        cur_rec["eligibility"] = elig
+                    break
+            elif kind_col is None:
+                # 이름표도 구분 칸도 없는 줄 - 이 표와 무관한 문단이다.
+                cur_rec = None
+        elif kind_col is not None and cur_rec is None and single_code:
+            cur_rec = out.setdefault(single_code, {})
+        if kind_col is None or cur_rec is None:
+            continue
+        seen_kinds.add(_squash(row[kind_col]))
+        field = TALL_KIND_TO_FIELD[_squash(row[kind_col])]
+        val = row[kind_col + 1] if kind_col + 1 < len(row) else None
+        cv = _clean(val)
+        if cv and not cur_rec.get(field):
+            cur_rec[field] = cv
+    # "구분" 칸 신호가 어쩌다 한 번만(예: 각주 문장에 우연히 낱말이
+    # 그대로 박힌 경우) 걸린 건 이 표 모양이라는 근거가 못 된다 - 진짜
+    # 세로형 표라면 네 가지 구분이 최소 두 가지는 나온다.
+    if len(seen_kinds) < 2:
+        return {}
+    return out
+
+
+def _transposed_data_rows(rows, class_order, out, seen_kinds_total):
+    """class_order(왼쪽부터 클래스 순서)를 이미 아는 데이터 구간을
+    읽어 out에 채운다. 칸 번호가 머리글 줄과 값 줄 사이에서 클래스마다
+    다르게(어떤 칸은 +1, 어떤 칸은 +0) 밀리는 문서가 실측됐다 - 정확한
+    칸 번호 대신 "왼쪽부터 순서대로" 클래스 개수와 값 개수를 맞춰
+    짝짓는다(값이 "해당사항 없음"처럼 한 칸에만 병합돼 있으면 그 값을
+    전 클래스에 똑같이 적용한다 - 환매수수료 행이 흔히 이렇다)."""
+    for row in rows:
+        if not row:
+            continue
+        kind_col = next((j for j, c in enumerate(row)
+                          if _squash(c or "") in TALL_KIND_TO_FIELD), None)
+        if kind_col is None:
+            continue
+        seen_kinds_total.add(_squash(row[kind_col]))
+        field = TALL_KIND_TO_FIELD[_squash(row[kind_col])]
+        values = [cv for j, c in enumerate(row) if j > kind_col
+                  for cv in [_clean(c)] if cv]
+        if len(values) == len(class_order):
+            for code, v in zip(class_order, values):
+                if not out[code].get(field):
+                    out[code][field] = v
+        elif len(values) == 1:
+            for code in class_order:
+                if not out[code].get(field):
+                    out[code][field] = values[0]
+
+
+def _parse_transposed_table(rows, carried_class_order=None):
+    """가로/세로가 모두 뒤집힌 표 - 클래스가 "종류" 줄에 열로 나열되고,
+    수수료 종류(선취/후취/환매/전환)는 그 아래 행으로 내려간다(반대로
+    _parse_table이 다루는 표는 클래스가 행, 수수료 종류가 열이다 -
+    KR5160420009 실측:
+        종류 | | | 수수료미징구-오프라인(C) | | | 수수료미징구-온라인(C-E) | ...
+        선취판매수수료 | - | - | ...
+        후취판매수수료 | - | - | ...
+        환매수수료 | 해당사항 없음
+    클래스명 자체도 한 칸에 안 들어가 여러 줄(행)에 걸쳐 나뉜다("수수료
+    미징구-" / "오프라인-" / "무권유저비용" / "(C-G)" 넉 줄) - 값 행이
+    나오기 전까지의 모든 줄을 칸 번호별로 이어 붙여야 클래스명이
+    완성된다. 클래스가 많으면 "종류" 표가 같은 표 안에서 한 번 더
+    반복되며 나머지 클래스를 잇는다 - 표 하나에 이런 블록이 여러 개일
+    수 있고, 그중 마지막 블록은 자기 데이터 행 없이 헤더만 찍힌 채
+    페이지가 끝나기도 한다(KR5160420009 실측: 14쪽 두 번째 "종류" 블록
+    (C-P2e/C-P/C-Pe/S/S-P/A)의 헤더까지만 14쪽에 있고 값 행은 다음 표
+    (15쪽)의 첫 줄부터 곧바로 시작한다 - 그 표엔 "종류" 줄 자체가 없다).
+    이런 미완성 블록은 (out, 다음에 넘겨줄 class_order)로 함께 돌려주고,
+    호출부가 다음 표 호출 때 carried_class_order로 넘겨주면 이어 읽는다.
+
+    반환값은 (out, pending_class_order) - pending_class_order는 데이터를
+    한 줄도 못 찾은 마지막 블록의 클래스 순서(다음 표로 넘겨줄 것,
+    없으면 None)."""
+    out = {}
+    seen_kinds_total = set()
+    pending = None
+
+    if carried_class_order:
+        # "종류" 줄 없이 곧바로 데이터로 시작하는 표 - 앞서 넘어온
+        # class_order를 그대로 쓴다.
+        for code in carried_class_order:
+            out.setdefault(code, {})
+        _transposed_data_rows(rows, carried_class_order, out, seen_kinds_total)
+
+    header_positions = [i for i, row in enumerate(rows)
+                         if row and _squash(row[0] or "") == "종류"]
+    for bi, header_idx in enumerate(header_positions):
+        block_end = (header_positions[bi + 1] if bi + 1 < len(header_positions)
+                     else len(rows))
+        col_texts = {}
+        data_start = None
+        for i in range(header_idx, block_end):
+            row = rows[i]
+            kind_col = next((j for j, c in enumerate(row)
+                              if _squash(c or "") in TALL_KIND_TO_FIELD), None)
+            if kind_col is not None and i > header_idx:
+                data_start = i
+                break
+            for j, c in enumerate(row):
+                cs = (c or "").strip()
+                if cs and j > 0:
+                    col_texts[j] = (col_texts.get(j, "") + " " + cs).strip()
+
+        col_to_code = {}
+        for j, text in col_texts.items():
+            code = _row_class_code([text])
+            if code:
+                col_to_code[j] = code
+        if not col_to_code:
+            continue
+        class_order = [code for _j, code in sorted(col_to_code.items())]
+
+        if data_start is None:
+            # 이 블록은 헤더만 있고 데이터가 없다 - 마지막 블록이면
+            # 다음 표로 넘겨준다(그 앞의 블록이면 그냥 못 찾은 것).
+            if bi == len(header_positions) - 1:
+                pending = class_order
+            continue
+
+        for code in class_order:
+            out.setdefault(code, {})
+        _transposed_data_rows(rows[data_start:block_end], class_order, out,
+                               seen_kinds_total)
+
+    if len(seen_kinds_total) < 2:
+        return {}, None
+    return out, pending
+
+
+def _parse_table(rows, carried=None, carried_cols=None):
     """carried: 앞 페이지에서 확인된 열매핑. 표가 페이지를 넘어가면
     이어지는 쪽엔 머리글이 없어서, 그것만 보고 버리면 뒷장 클래스를
     통째로 잃는다(KR515302022M 실측: 가.표가 31~33쪽에 걸쳐 있는데
     32·33쪽에 머리글이 없어 C-P2/S-P/S-I/C-Pe/AG/CG/A1/C-Pe2가 빠졌다)."""
     mapping, header_end = _table_header(rows)
+    used_carried = False
     if not mapping:
         if not carried:
             return {}
         mapping, header_end = carried, 0
+        used_carried = True
 
     order = [name for _j, name in sorted(mapping.items())]
+    # 표 전체에 한 번만 찍히고 아래 행들은 비워 두는 병합 칸이 있다
+    # (KR5118420062 실측: "환매수수료: 없음"이 A 클래스 줄에만 있고
+    # A2부터는 그 자리가 통째로 빈칸이다 - 표 전체에 공통으로 적용되는
+    # 값이라 매 줄 반복하지 않은 것이다). 뒤 칸이 아예 없어서 순서
+    # 맞추기(zip)로도 못 채우는 이름에 한해, 마지막으로 읽은 값을
+    # 그대로 이어받는다 - 그 클래스가 실제로 다른 값을 밝히면(zip으로
+    # 값을 얻으면) 그쪽이 항상 이긴다.
+    #
+    # 이어받기는 redemption_fee/switch_fee에만 한정한다 - 환매·전환
+    # 수수료는 상품 전체에 공통으로 적용되는 경우가 흔하지만(위 실측
+    # 근거), 선취·후취판매수수료는 애초에 클래스를 나누는 이유 그
+    # 자체라 클래스마다 값이 다른 게 정상이다. front_load_fee까지
+    # 이어받으면 바로 위 클래스 값이 빈 칸에 잘못 들어간다(KR5172450019
+    # 실측: Ae의 선취판매수수료 "0.5% 이내"가 바로 아래 Ce 줄의 빈
+    # 칸으로 새어 들어가, Ce도 선취판매수수료가 있는 것처럼 잘못
+    # 나왔다 - Ce는 원문에 실제로 그 값이 없다).
+    CARRY_FIELDS = {"redemption_fee", "switch_fee"}
+    # 헤더 칸 번호와 데이터 칸 번호가 표 전체에 걸쳐 똑같이 어긋나기도
+    # 한다(KR5172450019 25쪽 실측: 헤더는 선취/후취/환매가 2/5/8열인데
+    # 데이터 값은 항상 그보다 한 칸 왼쪽인 1/4/7열에 있다). 이런 표에서
+    # "왼쪽부터 있는 값만 순서대로" 맞추면(아래 raw 방식), 어떤 클래스는
+    # 앞쪽 열(front)이 비어 있고 뒤쪽 열(back)에만 값이 있어도 그 값이
+    # 무조건 order의 첫 이름(front)에 배정돼 틀린 칸에 들어간다(같은
+    # 문서 S클래스 실측: 후취판매수수료 값이 선취판매수수료로 잘못
+    # 나왔다). 표 전체에서 가장 값을 많이 맞히는 고정 칸 이동값을 미리
+    # 재 두면, 어느 칸이 비어 있어도 실제 열 위치를 그대로 지킨다.
+    # 이동값을 재는 동안, 그 줄 자신의 코드 칸(맨 앞)까지 우연히 "값"
+    # 처럼 읽혀서 이동값이 코드 칸까지 거슬러 올라가면 안 된다(KR5116501001
+    # 실측: "C-P" 코드 칸 자체가 선취판매수수료 값으로 잘못 읽혀
+    # front_load_fee="C-P"가 됐다 - 코드 칸엔 "-"나 %같은 진짜 수수료
+    # 모양이 없는데도 _clean이 그냥 문자열이라 통과시켜서 생긴 문제다).
+    # 그 줄의 코드 문자열과 정확히 같은 칸은 값 후보에서 뺀다.
+    def _shift_val(row, jj, name, code):
+        # 이동값이 다른 필드의 원래 헤더 칸과 우연히 겹치면, 그건 이
+        # 필드 값이 아니라 그 다른 필드가 이미 (직접매핑으로) 갖고 있는
+        # 제 몫의 값을 훔쳐오는 것이다(KR5169950018 실측: 가입자격은
+        # 헤더 칸 그대로 항상 맞는데, 선취판매수수료 칸에 이동값 -2를
+        # 적용하면 하필 가입자격의 헤더 칸(5-2=3)과 겹쳐서 가입자격
+        # 문장이 그대로 선취판매수수료로 잘못 채점/적용됐다). 그 칸이
+        # 다른 필드의 제 칸이면(이름이 다르면) 후보에서 뺀다.
+        if not (0 <= jj < len(row)):
+            return None
+        # 이 "다른 필드의 제 칸" 방어는 매핑 칸 번호를 믿을 수 있을
+        # 때만 뜻이 있다 - 물려받은 매핑(used_carried)은 애초에 이
+        # 표가 아니라 앞 페이지 것이라, 매핑에 적힌 칸 번호 자체가
+        # 이 표에서는 전부 다른(밀리기 전) 자리를 가리킨다. 그런데도
+        # 이 방어를 그대로 적용하면, 표 전체가 진짜로 한 칸씩 밀린
+        # 경우(KR5153420318 31쪽 실측) 이동값이 정확해도 "그 칸은
+        # 매핑상 다른 필드 것"이라며 매번 걸러내 진짜 이동값이 아예
+        # 점수를 못 받는다 - 결국 우연히 자리채움 값("-")이 많이
+        # 겹치는 이동값 0이 이겨버린다. 물려받은 매핑에서는 이 방어를
+        # 끈다.
+        if not used_carried and jj in mapping and mapping[jj] != name:
+            return None
+        if _is_code_cell(row[jj], code):
+            return None
+        cv = _clean(row[jj])
+        # 이동값으로 훔쳐오는 값도 수수료 칸이면 수수료값 모양을
+        # 갖춰야 한다(가입자격 칸은 원래 서술형이라 이 검사에서 뺀다) -
+        # 안 그러면 위 라벨-겹침 방어를 피해간 다른 자리의 서술형
+        # 문장도 그대로 넘어온다(KR5118420036/C-P1e 실측: 이동값이
+        # "소득세법 제20조의3..." 문장 칸을 짚어 front_load_fee로
+        # 들어갔다 - 다른 필드의 제 칸은 아니었지만 여전히 수수료
+        # 모양이 아니었다).
+        if name != "eligibility" and cv and not _looks_like_fee_cell(cv):
+            return None
+        return cv
+
+    def _score_row(row, code, s):
+        n = 0
+        for j, name in mapping.items():
+            jj = j + s
+            if _shift_val(row, jj, name, code):
+                n += 1
+        return n
+
+    table_shift = None
+    best_score = 1  # 최소 두 칸 이상 맞아야 우연이 아니라고 본다
+    # 물려받은 매핑을 쓰는데 이 표의 칸 수가 원래 표(carried_cols)와
+    # 다르면, 이동값 0(안 밀림)은 애초에 성립할 수 없다 - 칸 수 자체가
+    # 다른데 필드 위치가 그대로일 리 없다. 그런데도 채점만으로는 0이
+    # 이길 수 있다("-"류 자리채움 값은 어느 칸에 있어도 모양 검사를
+    # 통과해, 진짜 값 하나(예: "3년미만...")가 진짜 이동값에서 맞히는
+    # 점수를 0이 우연한 자리채움 일치로 따라잡거나 앞서기도 한다 -
+    # KR5153420318 31쪽 실측: 진짜 이동값 +1은 2점인데, 밀리지 않은
+    # 0이 우연히 3점을 냈다). 칸 수가 다르다는 구조적 근거가 이미 있으니
+    # 0은 아예 후보에서 뺀다.
+    carried_mismatch = (
+        used_carried and carried_cols is not None
+        and max((len(r) for r in rows), default=0) != carried_cols)
+    exclude_zero_shift = carried_mismatch
+    for row in rows[header_end:]:
+        if not row:
+            continue
+        row_code = _row_class_code(row, allow_bare_paren=True)
+        if not row_code:
+            # 코드가 아예 없는 줄(값 행이 코드 행보다 먼저 나오는 표의
+            # 그 값 행 - KR5127420034 실측)은 이동값을 잴 기준이 못 된다.
+            # 그 행의 값이 실제로 어느 칸에 있는 게 맞는지(원래 코드가
+            # 있는 행 기준으로 어떤 이동값이어야 하는지)조차 모르는
+            # 상태라, 우연히 다른 필드 칸에 값이 걸리면 이동값이 통째로
+            # 엉뚱한 곳으로 튄다. 코드가 확인된 행만으로 이동값을 잰다.
+            continue
+        for s in range(-4, 5):
+            if s == 0 and exclude_zero_shift:
+                continue
+            score = _score_row(row, row_code, s)
+            # 점수가 같으면 0에 더 가까운(절댓값이 작은) 이동값을 쓴다
+            # (KR5122420005 실측: 진짜 이동값은 -1인데, 우연히 -4도 같은
+            # 점수가 나온다 - 선취판매수수료의 진짜 값이 하필 이동값
+            # -4에서는 후취판매수수료 칸으로, 환매수수료의 "없음"이
+            # 전환수수료 칸으로 동시에 잘못 걸려 우연히 점수가 같아진다.
+            # 표 밀림은 대개 한두 칸 정도라 절댓값이 작은 쪽이 진짜일
+            # 가능성이 훨씬 높다 - range가 -4부터 돌아 더 큰 이동값을
+            # 먼저 만나면 그게 먼저 자리를 차지해 버렸었다).
+            if score > best_score or (
+                    score == best_score and table_shift is not None
+                    and abs(s) < abs(table_shift)):
+                best_score, table_shift = score, s
+    # 어떤 칸은 표 전체에서 늘 어긋나 있지만(위 KR5122420005), 어떤
+    # 칸은 대부분 줄에서 헤더 그대로 맞고 특정 줄 하나만 진짜로 빈칸인
+    # 경우도 있다(KR5194450018 18쪽 실측: RP/RP-e 등 다른 클래스는
+    # 환매수수료가 헤더 칸 그대로 "없음"으로 잘 잡히는데 S 클래스만
+    # 그 칸이 진짜로 비어 있다 - 그런데도 이동값을 적용하면 바로 옆
+    # 후취판매수수료 칸 값을 환매수수료로 잘못 끌어온다). 필드별로
+    # "이 표 안 어디서든 헤더 칸 그대로 값을 찾은 적이 있는지"를 먼저
+    # 봐서, 있으면 그 필드는 이동값 보정 대상에서 뺀다 - 정말로 표
+    # 전체가 어긋난 필드에만 이동값을 쓴다.
+    fields_ever_direct = set()
+    for row in rows[header_end:]:
+        if not row:
+            continue
+        for j, name in mapping.items():
+            if j < len(row) and _clean(row[j]):
+                fields_ever_direct.add(name)
+
+    last_value = {}
     out = {}
     for row in rows[header_end:]:
         if not row:
             continue
-        code = _row_class_code(row)
+        code = _row_class_code(row, allow_bare_paren=True)
         if not code or code in out:
             continue
 
@@ -216,18 +702,138 @@ def _parse_table(rows, carried=None):
         for j, name in mapping.items():
             if j < len(row):
                 v = _clean(row[j])
+                # 물려받은 매핑(carried)은 앞 페이지 칸 번호를 그대로
+                # 쓰는데, 이어지는 쪽 표가 칸 하나가 더(또는 덜) 찍혀
+                # 전체가 밀려 있으면 그 칸 번호가 더 이상 맞지 않는다
+                # (KR5153420318 31쪽 실측: 30쪽은 6칸인데 31쪽은 맨 앞에
+                # 빈 칸이 하나 더 있어 7칸 - 물려받은 "가입자격" 칸
+                # 번호가 실제로는 클래스 이름표를 가리키고, "선취판매
+                # 수수료" 칸 번호는 실제로는 가입자격 문장을 가리켰다.
+                # 이 밀림은 아래 이동값(table_shift) 보정이 바로잡아야
+                # 하는데, 직접매핑이 먼저 값을 채워버리면(칸이 밀렸어도
+                # 그 칸 자체는 빈칸이 아니라 다른 필드의 값이 들어있어
+                # "값 있음"으로 통과한다) 이동값 보정 단계 자체를 안
+                # 타서 서술형 문장이 그대로 수수료 값으로 굳어진다).
+                # 물려받은 매핑일 때만, 가입자격이 아닌 필드는 수수료
+                # 값 모양을 갖췄는지 먼저 확인한다 - 제 칸을 찾은 표는
+                # (used_carried가 아닐 때) 이 검사 없이 그대로 믿는다.
+                if v and used_carried and name != "eligibility" \
+                        and not _looks_like_fee_cell(v):
+                    v = None
                 if v:
                     rec[name] = v
 
-        # 헤더 칸 번호와 데이터 칸 번호가 어긋난 표가 많다(헤더는 4/7/10,
-        # 데이터는 3/6에 들어 있는 식). 열 번호로 아무것도 못 읽었으면
-        # 값이 있는 칸을 왼쪽부터 순서대로 열 이름에 맞춘다.
-        if not rec:
-            raw = [x for x in row[1:] if (x or "").strip()]
-            for name, v in zip(order, raw):
-                cv = _clean(v)
+        rec_corrected = False
+        if carried_mismatch:
+            # 물려받은 매핑을 쓰는데 칸 수 자체가 원래 표와 다르면, 그건
+            # 한 칸씩 고르게 밀린 게 아니라 사이사이 장식용 빈 칸이
+            # 통째로 빠진(또는 늘어난) 경우일 수도 있다 - 그러면 이동값
+            # (하나의 고정 칸수)으로는 안 맞는다(KR5120450015 43쪽 실측:
+            # 42쪽 머리글은 10칸(장식용 빈 칸 여럿 포함)인데 43쪽 이어지는
+            # 줄은 그 장식 칸이 다 빠진 6칸짜리로, 선취는 3칸, 후취는
+            # 4칸을 밀어야 맞는 등 필드마다 밀린 양이 다르다). 이럴 땐
+            # "왼쪽부터 순서대로"(order와 값 개수를 맞추는 방식)가
+            # 이동값보다 먼저다 - 개수가 정확히 맞으면 그게 더 믿을
+            # 만하고, 직접매핑이 우연히 채운 값(아래 참고, 자리는
+            # 틀렸는데 모양만 맞는 경우)보다 앞세운다.
+            raw = [x for x in row[1:]
+                   if (x or "").strip() and not RE_HAS_LABEL.search(_squash(x))
+                   and _looks_like_fee_cell(x)]
+            if len(raw) == len(order):
+                rec = {}
+                for idx, name in enumerate(order):
+                    cv = _clean(raw[idx])
+                    if cv:
+                        rec[name] = cv
+                rec_corrected = True
+
+        if used_carried and table_shift not in (None, 0) and (
+                not carried_mismatch or len(rec) < len(order)):
+            # 물려받은 매핑이 표 전체에서 일정하게 밀려 있다고 이미
+            # 확인됐다면(table_shift), 칸별로 부분적으로만 맞는 직접
+            # 매핑 결과를 그대로 두면 안 된다 - 우연히 값이 있어서(예:
+            # "-") 위 모양 검사는 통과하지만 실제로는 다른 필드의 값을
+            # 읽은 칸도 있다(KR5153420318 31쪽 실측: 밀린 그대로 읽은
+            # 후취판매수수료 칸이 실제로는 환매수수료 자리라 "3년미만
+            # 환매시..."가 environment redemption_fee로 잘못 들어갔다 -
+            # "없음"류처럼 모양은 맞아도 자리가 틀렸다). 이동값이 이미
+            # 확인된 표에서는 처음부터 이동값 기준으로 전 필드를 다시
+            # 채운다 - 부분적으로만 맞는 직접매핑보다 일관되게 보정된
+            # 값이 더 믿을 만하다. 다만 위 순서맞추기가 이미 전 필드를
+            # (칸 개수가 정확히 맞아) 다 채웠으면 그쪽을 그대로 둔다.
+            rec = {}
+            for j, name in mapping.items():
+                jj = j + table_shift
+                cv = _shift_val(row, jj, name, code)
                 if cv:
                     rec[name] = cv
+            rec_corrected = True
+
+        if carried_mismatch and not rec_corrected:
+            # 칸 수가 원래 표와 다른데도(carried_mismatch) 순서맞추기·
+            # 이동값 둘 다 확신을 못 얻었다면(개수가 안 맞고, 이동값도
+            # None), 위에서 직접매핑이 채운 값은 옛 칸 번호를 그대로
+            # 믿은 것이라 위치가 맞다는 근거가 없다 - 우연히 모양만
+            # 맞는 값을 그대로 내보내면 틀린 자리에 값이 들어간다
+            # (KR5118420036 39쪽 실측: 직접매핑이 4번 칸을 그대로 읽어
+            # S클래스의 환매수수료 문구 "3년미만..."이 선취판매수수료로
+            # 잘못 나왔다 - 표 자체엔 이동값이 명확하지 않았을 뿐 값은
+            # 분명 있었는데, 어느 필드인지 모른다면 아예 안 내는 게
+            # 틀리게 내는 것보다 낫다). 확신이 없으면 이 줄은 빈 채로
+            # 둔다.
+            rec = {}
+
+        if not rec:
+            # 코드 칸(row[0]) 바로 다음에 클래스 이름표 칸("수수료선취-
+            # 오프라인" 등)이 하나 더 오는 표가 있다(KR5118420062 실측).
+            # 이 이름표까지 순서에 끼워 넣으면 그 뒤 진짜 값들이 한 칸씩
+            # 밀려 선취판매수수료 값이 후취판매수수료 칸으로 들어간다
+            # (실측: A 클래스 선취 0.05%가 후취 칸에 저장되고 선취는
+            # None이 됐다). 순서를 맞추기 전에 이름표 칸부터 뺀다.
+            #
+            # 이 "왼쪽부터 순서대로" 맞추기는 값 개수가 필드 개수와
+            # 정확히 같을 때만 믿는다 - 개수가 안 맞으면(일부 필드가
+            # 진짜로 빈 칸이라 값이 모자란 경우) 어느 값이 어느 필드인지
+            # 순서만으로는 알 수 없다(위 참고) - 그럴 땐 표 전체에서
+            # 미리 잰 고정 이동값(table_shift)으로 실제 칸 위치를 그대로
+            # 찾는다.
+            raw = [x for x in row[1:]
+                   if (x or "").strip() and not RE_HAS_LABEL.search(_squash(x))
+                   and _looks_like_fee_cell(x)]
+            if len(raw) == len(order):
+                for idx, name in enumerate(order):
+                    cv = _clean(raw[idx])
+                    if cv:
+                        rec[name] = cv
+            elif table_shift is not None:
+                for j, name in mapping.items():
+                    jj = j + table_shift
+                    cv = _shift_val(row, jj, name, code)
+                    if cv:
+                        rec[name] = cv
+        elif table_shift is not None:
+            # 헤더 칸과 데이터 칸이 표 안에서 필드마다 다르게 어긋나는
+            # 표가 있다(KR5122420005 36쪽 실측: 환매수수료·전환수수료는
+            # 헤더 칸 그대로인데 선취·후취판매수수료만 한 칸 왼쪽에 있다).
+            # 위 "표 전체 이동값"은 rec가 통째로 비었을 때만 썼는데, 이런
+            # 표는 두 칸(환매·전환)이 헤더 그대로 맞아 rec가 비지 않아
+            # 이동값 보정 자체를 안 타서 선취·후취가 영영 안 채워졌다.
+            # 이미 직접 매핑으로 찾은 칸은 그대로 두고, 못 찾은 이름에만
+            # 이동값을 적용한다.
+            for j, name in mapping.items():
+                if name in rec or name in fields_ever_direct:
+                    continue
+                jj = j + table_shift
+                cv = _shift_val(row, jj, name, code)
+                if cv:
+                    rec[name] = cv
+        for name in order:
+            if name not in CARRY_FIELDS:
+                continue
+            if name in rec:
+                last_value[name] = rec[name]
+            elif name in last_value:
+                rec[name] = last_value[name]
         if rec:
             out[code] = rec
     return out
@@ -237,11 +843,38 @@ def _parse_table(rows, carried=None):
 # "(8) 환매수수료 / 이 투자신탁은 환매수수료를 부과하지 않습니다." 처럼
 # 절 하나로 적어 두는 문서가 많다. 클래스별 표가 없어도 이 문장이면
 # "환매수수료 나오나요?"에 답할 수 있다.
+#
+# "환매가능여부 및 환매수수료" 두 칸짜리 표 옆에 이 문장이 붙어 있는
+# 문서가 있는데, pdfplumber가 줄 단위로 텍스트를 읽으면서 그 표의 칸
+# 이름("환매수수료")이 문장 한가운데("...부과하지 환매수수료 않습니다")로
+# 끼어든다(KR5111420047/KR5111450067 실측 - "부과하지"와 "않습니다"
+# 사이에 낱말 하나가 더 있어서 원래 패턴이 못 읽고 상품 전체가 통째로
+# 빠졌다). 그 자리에 낀 "환매수수료"만 선택적으로 건너뛴다.
+#
+# "이 투자신탁은" 주어를 반드시 요구한다("전환한 후 환매를 청구하는
+# 경우 환매수수료를 징구하지 않습니다"처럼, 상품 전체가 아니라 특정
+# 상황 하나에만 해당하는 예외 조항도 "...하지 않습니다"로 끝나서 -
+# KR5127450117 실측: 이 상품은 실제로 S클래스에 환매수수료가 있는데,
+# 주어 없이 아무 문장이나 받으면 이 예외 조항이 "상품 전체에 환매수수료
+# 없음"으로 잘못 둔갑한다). 진짜 상품 전체 진술은 거의 항상 "이
+# 투자신탁은/집합투자기구는/펀드는"으로 시작하므로, 그 주어를 안전판으로
+# 계속 요구한다.
+#
+# 어미 한가운데 공백이 끼는 문서도 있다(KR5113420069/KR5113450401
+# 실측: "아니합니다"가 "아니합니 다"로 갈린다 - 줄바꿈 정렬 때 생기는
+# 잘못된 공백으로 보인다). 음절 사이마다 \s*를 둬서 흡수한다.
 RE_REDEMPTION_SENTENCE = re.compile(
-    r"이\s*(?:투자신탁|집합투자기구|펀드)[^.\n]{0,80}?환매수수료[^.\n]{0,80}?"
-    r"(?:부과|징구|발생)하지\s*(?:않습니다|아니합니다)"
-    r"|이\s*(?:투자신탁|집합투자기구|펀드)[^.\n]{0,80}?환매수수료[^.\n]{0,80}?"
-    r"(?:받지\s*아니합니다|부과합니다|부과하며)[^.\n]{0,40}")
+    r"이\s*(?:투자신탁|집합투자기구|펀드)[^.\n]{0,80}?환매수수료[^.\n]{0,15}?"
+    r"(?:부과|징구|발생)하지\s*(?:환매수수료\s*)?(?:않\s*습\s*니\s*다|아\s*니\s*합\s*니\s*다)"
+    r"|이\s*(?:투자신탁|집합투자기구|펀드)[^.\n]{0,80}?환매수수료[^.\n]{0,15}?"
+    r"(?:받지\s*아\s*니\s*합\s*니\s*다|부과합니다|부과하며)[^.\n]{0,40}"
+    # "(3) 환매수수료 환매수수료를 부과하지 않습니다."처럼 절 제목
+    # 글자가 그대로 한 번 더 겹쳐 찍히고 주어 없이 바로 끝나는 문서가
+    # 있다(KR5152420028 실측 - 절 제목과 진술이 한 줄에 붙어 있다).
+    # 절 번호+제목이 바로 앞에 있을 때만 예외로 주어 없이 받는다 -
+    # 그래야 무관한 위치에서 시작하지 않는다.
+    r"|\(\d+\)\s*환매수수료\s*환매수수료(?:를)?\s*(?:부과|징구)하지\s*"
+    r"(?:않\s*습\s*니\s*다|아\s*니\s*합\s*니\s*다)")
 # "(3) 환매수수료 - 해당사항 없음"처럼 절 제목 뒤에 값만 적는 문서도 있다.
 # 조사와 어미가 문서마다 다르다: "해당사항 없음" / "해당사항이 없습니다" /
 # "해당 사항 없음". 앞의 것만 잡고 있어서 한 상품을 마지막까지 놓쳤다.
@@ -285,17 +918,67 @@ def _redemption_cell_note(conn, code):
     return None
 
 
+# 낱말 한가운데 공백 하나가 잘못 낀 문서가 있다(KR5114420046 실측:
+# "재 산으로", KR518101012M 실측: "부과 된 환매수수료"). 의미는 안
+# 바뀌는 단순 OCR/정렬 공백이라 눈에 띄는 것만 정리한다 - 아무 공백이나
+# 지우면 진짜 띄어쓰기(조사 등)까지 붙어버릴 위험이 있어, 실측된 자리만
+# 좁혀서 고친다.
+WORD_SPLIT_FIXES = (("재 산", "재산"), ("부과 된", "부과된"))
+# "(3) 환매수수료 환매수수료를 부과하지..."처럼 절 제목이 겹쳐 찍힌
+# 채로 그대로 반환된 문장(RE_REDEMPTION_SENTENCE의 절 제목 예외 갈래
+# 참고)은 절 번호까지 노출할 필요가 없다 - 뒤에 남는 "환매수수료..."만
+# 보여준다.
+RE_LEADING_SECTION_DUP = re.compile(r"^\(\d+\)\s*환매수수료\s*(?=환매수수료)")
+
+
+def _fix_word_split_spaces(text):
+    text = RE_LEADING_SECTION_DUP.sub("", text)
+    for bad, good in WORD_SPLIT_FIXES:
+        text = text.replace(bad, good)
+    return text
+
+
+# "가. 투자자에게 직접 부과되는 수수료" 절 제목 바로 뒤에 클래스별 표
+# 없이 "해당사항 없음"이라고만 적어 둔 문서가 있다(KR516702010M/
+# KR5174420011 실측 - 이 표 자체가 통째로 없어서 선취·후취·환매·전환
+# 수수료 전부 이 절 하나로 판정된다). 이런 문서는 클래스별 표가 없으니
+# 위 표 파서들이 전부 못 찾아 상품이 통째로 빠진다 - 절 제목이 "가."
+# 없이 오는 문서도 있어 그 앞부분은 선택으로 둔다.
+RE_NO_DIRECT_FEE = re.compile(
+    r"직접\s*부과되는\s*수수료[^.\n]{0,10}해당\s*사항\s*(?:이\s*)?없")
+
+
+def product_has_no_direct_fee(conn, code):
+    for (text,) in conn.execute(
+            "SELECT text FROM chunks WHERE doc_id = ? "
+            "AND text LIKE '%직접 부과되는 수수료%'", (code,)):
+        if RE_NO_DIRECT_FEE.search(" ".join(text.split())):
+            return True
+    return False
+
+
 def product_redemption_note(conn, code):
     """펀드 전체에 적용되는 환매수수료 문장. 없으면 None."""
-    for (text,) in conn.execute(
-            "SELECT text FROM chunks WHERE doc_id = ? AND text LIKE '%환매수수료%' "
-            "ORDER BY page", (code,)):
-        flat = " ".join(text.split())
+    chunks = [" ".join(text.split()) for (text,) in conn.execute(
+        "SELECT text FROM chunks WHERE doc_id = ? AND text LIKE '%환매수수료%' "
+        "ORDER BY page", (code,))]
+    # 문장 규칙(RE_REDEMPTION_SENTENCE)을 페이지 순서대로 전체 청크에
+    # 먼저 다 돌려 본 뒤에야 "없음" 규칙(RE_REDEMPTION_NONE)으로 넘어간다
+    # - 청크 하나씩 번갈아 가며 두 규칙을 다 시도하면, 클래스별로 다른
+    # 문서(예: 특정 클래스만 "환매수수료 없음"인 예외 각주)에서 그 각주가
+    # 앞쪽 청크에 먼저 걸려, 뒤쪽 청크에 있는 진짜 상품 전체 문장("...
+    # 클래스별로... 환매수수료를 부과합니다")을 보기도 전에 "없음"으로
+    # 잘못 확정돼 버린다(KR5194450018 실측: "*종류RP, RP-e, S-P, CP,
+    # CP-e: 환매수수료 없음"이라는 특정 클래스 예외 각주가 먼저 걸려서,
+    # 상품 대부분이 실제로는 보유기간별로 수수료를 부과한다는 사실이
+    # 통째로 "환매수수료 없음"으로 뒤집혔다).
+    for flat in chunks:
         for m in RE_REDEMPTION_SENTENCE.finditer(flat):
             sent = m.group(0).strip()
             if any(n in sent for n in REDEMPTION_NOISE):
                 continue
-            return sent
+            return _fix_word_split_spaces(sent)
+    for flat in chunks:
         m = RE_REDEMPTION_NONE.search(flat)
         if m:
             return f"환매수수료 {m.group(1)}"
@@ -310,10 +993,14 @@ def extract(db_path=DEFAULT_DB_PATH):
     out = []
     for code in codes:
         merged, pages, best_n = {}, {}, {}
+        known_codes = {r[0] for r in conn.execute(
+            "SELECT DISTINCT class_code FROM class_fees "
+            "WHERE product_code = ? AND class_code IS NOT NULL", (code,))}
         # 머리글이 있는 표에서 열 구성을 확인해 두고, 바로 다음 페이지에
         # 같은 열 개수로 이어지는 표에 물려준다. 그래서 "환매수수료"가
         # 적힌 표만 보는 게 아니라 전부 훑는다.
         carried, carried_cols, carried_page = None, None, None
+        carried_transposed, carried_transposed_page = None, None
         for page, dj in conn.execute(
                 "SELECT page, data_json FROM tables WHERE doc_id = ? ORDER BY page",
                 (code,)):
@@ -322,17 +1009,54 @@ def extract(db_path=DEFAULT_DB_PATH):
             except (ValueError, TypeError):
                 continue
             ncols = max((len(r) for r in rows), default=0)
-            mapping, _end = _table_header(rows)
-            if mapping:
-                got = _parse_table(rows)
-                carried, carried_cols, carried_page = mapping, ncols, page
-            elif (carried and ncols == carried_cols
-                  and carried_page is not None and page - carried_page <= 1):
-                got = _parse_table(rows, carried=carried)
-                if got:
-                    carried_page = page  # 또 이어질 수 있다
+            # 세로형(클래스마다 4줄) 표를 먼저 본다. 가로형 머리글 탐색은
+            # "환매"로 시작하는 짧은 칸을 찾는데, 세로형 표의 "구분" 칸
+            # 값("환매수수료" 등)도 이 조건에 걸려서 가로형 쪽이 먼저
+            # 걸리면 세로형 표를 완전히 잘못 읽는다(KR5185450009 실측:
+            # 가입자격 문장이 통째로 front_load_fee 칸에 들어갔다).
+            tall_got = _parse_tall_table(rows, known_codes)
+            if tall_got:
+                got = tall_got
             else:
-                continue
+                mapping, _end = _table_header(rows)
+                if mapping:
+                    got = _parse_table(rows)
+                    carried, carried_cols, carried_page = mapping, ncols, page
+                elif (carried and carried_cols is not None
+                      and abs(ncols - carried_cols) <= 10
+                      and carried_page is not None and page - carried_page <= 1):
+                    # 열 개수가 똑같아야 한다고 너무 엄격히 요구하면, 이어지는
+                    # 쪽에 빈 칸 하나가 더(또는 덜) 찍혀 전체가 한 칸 밀린
+                    # 표를 통째로 놓친다(KR5153420318 31쪽 실측: 30쪽은 6칸,
+                    # 31쪽은 앞에 빈 칸이 하나 더 붙어 7칸 - S/C-P/C-Pe 등
+                    # 뒷쪽 클래스 9개가 전부 사라졌었다). 장식용 빈 칸이
+                    # 아예 통째로 빠지는(하나만 밀리는 게 아니라) 표도
+                    # 있다(KR5120450015 43쪽 실측: 42쪽 10칸 -> 43쪽 6칸).
+                    # 이런 어긋남은 _parse_table 안의 순서맞추기·이동값
+                    # 보정이 스스로 바로잡으므로, 열 개수가 완전히 같을
+                    # 필요는 없다 - 다만 무관한 뒤쪽 표까지 잘못 이어붙지
+                    # 않도록 어느 정도 상한은 둔다.
+                    got = _parse_table(rows, carried=carried, carried_cols=carried_cols)
+                    if got:
+                        carried_page = page  # 또 이어질 수 있다
+                else:
+                    # 클래스가 열, 수수료 종류가 행인 뒤집힌 표도 있다
+                    # (_parse_transposed_table 참고) - 위 두 방식 다
+                    # 실패했을 때만 시도한다(정상 표를 잘못 걸러낼 위험을
+                    # 줄이기 위해 마지막 순서로 둔다). 이런 표의 마지막
+                    # "종류" 블록이 헤더만 찍고 페이지가 끝나면(데이터는
+                    # 다음 표 첫 줄부터) carried_transposed로 이어 받는다
+                    # - 바로 다음 표일 때만(무관한 뒤쪽 표까지 잘못 번지지
+                    # 않도록 wide-format의 carried와 같은 인접성 조건).
+                    carry_in = (carried_transposed
+                                if (carried_transposed_page is not None
+                                    and page - carried_transposed_page <= 1)
+                                else None)
+                    got, pending = _parse_transposed_table(rows, carry_in)
+                    carried_transposed = pending
+                    carried_transposed_page = page if pending else None
+                    if not got:
+                        continue
             for cc, rec in got.items():
                 # 같은 클래스가 여러 표에 나온다. 먼저 나온 걸 쓰면 안 된다 -
                 # 앞쪽에 가입자격 칸이 없는 비슷한 표가 있는 문서가 있어서
@@ -340,14 +1064,35 @@ def extract(db_path=DEFAULT_DB_PATH):
                 # 가입자격이 33개 상품에서 11개로 줄었다), 칸별로 합친다.
                 # 근거 페이지는 이 클래스에 대해 가장 많은 칸을 채운 표로
                 # 잡는다 - 고객이 열어 볼 자리는 거기다.
-                cur = merged.setdefault(cc, {})
-                for k, v in rec.items():
-                    if v and not cur.get(k):
-                        cur[k] = v
-                if len(rec) > best_n.get(cc, 0):
-                    best_n[cc] = len(rec)
-                    pages[cc] = page
+                for real_cc in _expand_class_range(cc, known_codes):
+                    cur = merged.setdefault(real_cc, {})
+                    for k, v in rec.items():
+                        if v and not cur.get(k):
+                            cur[k] = v
+                    if len(rec) > best_n.get(real_cc, 0):
+                        best_n[real_cc] = len(rec)
+                        pages[real_cc] = page
+
+        if not merged and known_codes and product_has_no_direct_fee(conn, code):
+            # 클래스별 표 자체가 없이 "가. 투자자에게 직접 부과되는
+            # 수수료: 해당사항 없음"이라고 절 하나로 끝내는 문서다
+            # (KR516702010M/KR5174420011 실측) - 표가 없으니 위 어떤
+            # 파서도 이 상품에서 아무것도 못 찾아, known_codes가 있는데도
+            # 상품이 통째로 빠졌었다. 절 진술 그대로 전 클래스에 "없음"을
+            # 채운다(가입자격은 이 절에 안 나오므로 그대로 비워 둔다).
+            for cc in known_codes:
+                merged[cc] = {"front_load_fee": "없음", "back_load_fee": "없음",
+                               "redemption_fee": "없음", "switch_fee": "없음"}
         for cc, rec in sorted(merged.items()):
+            if not any(rec.get(k) for k in (
+                    "eligibility", "front_load_fee", "back_load_fee",
+                    "redemption_fee", "switch_fee")):
+                # 표는 찾았지만 칸 위치가 어긋나 값을 하나도 못 건진
+                # 클래스다(KR5123365001 실측: "투자신탁" 단일클래스 표의
+                # 부과비율 칸이 "-" 값 앞에 병합된 빈 칸을 여럿 끼고 있어
+                # kind_col+1로는 못 읽는다). 아무 정보도 없는 빈 레코드를
+                # 그대로 내보내면 잡음만 된다.
+                continue
             out.append({
                 "product_code": code,
                 "class_code": cc,

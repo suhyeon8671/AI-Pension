@@ -44,6 +44,17 @@ ASSET_TYPE_VOCAB = [
 # 표 헤더 텍스트가 명칭에 섞여 들어온 걸 감지하는 신호 (이런 게 보이면 confidence를 낮춘다)
 TABLE_LEAK_MARKERS = ["펀드코드", "금융투자협회"]
 
+# "1. 집합투자기구 명칭" 절을 문장이 아니라 표로 적는 문서가 있다
+# ("명 칭 | 금융투자협회 펀드코드" 헤더 줄 다음에 "실제 이름 | 코드"
+# 데이터 줄이 오는 2행 표 - KR5116501001 실측). 그대로 이어 붙이면
+# 헤더 글자와 펀드코드 숫자까지 이름에 섞인다.
+RE_NAME_TABLE_HEADER = re.compile(
+    r"^명\s*칭\s*금융투자협회\s*펀드코드\s*[\r\n]+\s*(.+?)\s+[A-Za-z0-9]+\s*$", re.S)
+# "...KCGI코리아증권투자신탁1호[주식] (펀드코드 : AJ437)"처럼 이름 끝에
+# 펀드코드 괄호가 한 번 더 붙는 문서가 있다(KR515302022M 실측) - 이름이
+# 아니라 식별자라 떼어낸다.
+RE_FUND_CODE_SUFFIX = re.compile(r"\s*\(\s*펀드코드\s*[:：]\s*[A-Za-z0-9]+\s*\)\s*$")
+
 
 def load_json(path):
     if not os.path.exists(path):
@@ -63,7 +74,14 @@ def extract_product_name(page1):
     if not m:
         return {"value": None, "page": None, "evidence": None, "method": "name_regex", "confidence": 0.0}
 
-    raw = re.sub(r"\s+", " ", m.group(1)).strip()
+    method = "name_regex"
+    m2 = RE_NAME_TABLE_HEADER.match(m.group(1).strip())
+    if m2:
+        raw = re.sub(r"\s+", " ", m2.group(1)).strip()
+        method = "name_regex_table"
+    else:
+        raw = re.sub(r"\s+", " ", m.group(1)).strip()
+        raw = RE_FUND_CODE_SUFFIX.sub("", raw).strip()
     confidence = 1.0
     notes = []
 
@@ -81,7 +99,7 @@ def extract_product_name(page1):
         "value": raw,
         "page": 1,
         "evidence": raw[:150],
-        "method": "name_regex" + (" +review_flag" if notes else ""),
+        "method": method + (" +review_flag" if notes else ""),
         "confidence": confidence,
         **({"note": "; ".join(notes)} if notes else {}),
     }
