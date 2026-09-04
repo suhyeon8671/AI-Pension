@@ -1217,6 +1217,104 @@ def product_has_no_direct_fee(conn, code):
     return False, None
 
 
+# "구분|보유기간|부과비율|부과시기" 요약표 - 클래스별 표(가.투자자에게
+# 직접 부과되는 수수료)와 별도로, 환매수수료만 "보유기간에 따라 몇 %"로
+# 여러 클래스를 한 칸에 묶어 요약하는 표가 있다(KR5194450018 30쪽 실측).
+# 이 표에 이름이 있는 클래스 대부분(A/F/S 등)은 34~37쪽 클래스별 상세
+# 표에도 자기 행이 따로 있어 거기서 이미 환매수수료를 얻지만, "I"(고액
+# 전용)만은 상세표 어디에도 자기 행이 없다 - 이 요약표가 "I"에 대해
+# 문서가 갖고 있는 유일한 정보다. 상세표에서 이미 얻은 값은 덮어쓰지
+# 않고, 상세표에 아예 없던 클래스만 이 요약표로 채운다.
+RE_HOLDING_PERIOD_HEADER = re.compile(r"^구분$")
+
+
+def _holding_period_redemption_fallback(conn, code):
+    """{class_code: 환매수수료 문구} - 이 표가 없으면 빈 dict."""
+    out = {}
+    for (dj,) in conn.execute(
+            "SELECT data_json FROM tables WHERE doc_id = ? ORDER BY page",
+            (code,)):
+        try:
+            rows = json.loads(dj)
+        except (ValueError, TypeError):
+            continue
+        if not rows:
+            continue
+        header = [_squash(c or "") for c in rows[0]]
+        if header[:4] != ["구분", "보유기간", "부과비율", "부과시기"]:
+            continue
+        cur_codes, cur_bucket = [], []
+        for row in rows[1:]:
+            cells = list(row) + [""] * max(0, 4 - len(row))
+            head = (cells[0] or "").strip()
+            if head:
+                found = _parse(head)
+                if not found:
+                    # 이 표 모양이지만 클래스 이름이 아닌 줄(각주 등) -
+                    # 더 이상 이 표로 안 본다.
+                    break
+                if cur_codes:
+                    for c in cur_codes:
+                        out.setdefault(c, []).extend(cur_bucket)
+                cur_codes, cur_bucket = list(found.keys()), []
+            period = (cells[1] or "").strip()
+            rate = (cells[2] or "").strip()
+            if period and rate and cur_codes:
+                cur_bucket.append(f"{period} : {rate}")
+        if cur_codes:
+            for c in cur_codes:
+                out.setdefault(c, []).extend(cur_bucket)
+        if out:
+            return {c: " ".join(v) for c, v in out.items() if v}
+    return {}
+
+
+# "종류|가입자격" 2칸짜리 표 - "가.투자자에게 직접 부과되는 수수료" 절
+# 앞에 미리 붙는 안내표로, 수수료 칸이 아예 없어 _table_header가 이 표를
+# 수수료 표로 인정하지 않는다(그래서 이 표만으로는 _parse_table이 안
+# 불린다). 그런데 클래스 이름표가 두 줄에 걸쳐 있어("...(고액)\n
+# (C-P2I(퇴직\n연금))") 정작 수수료 값 표에서는 같은 이름표가 한 줄만
+# 잘려 나오는 문서가 있다(KR5144420020 실측: 값 표 코드가 "...(C-P2I(퇴직연"
+# 에서 끊겨 어느 파서도 코드를 못 읽는다 - 값 자체는 넷 다 "-"로 멀쩡히
+# 있는데 코드가 없어 행 전체가 버려진다). 이 2칸 표는 줄바꿈이 안 잘려서
+# 코드가 온전하다 - 수수료 값 표 어디서도 못 찾은 클래스만, 적어도
+# 가입자격 문장이라도 이 표에서 건진다(수수료 값 자체를 지어내진 않는다 -
+# "잘렸다고 다 -겠거니" 하는 추측은 위험하다).
+def _eligibility_only_fallback(conn, code, known_codes):
+    """{class_code: 가입자격 문장} - 없으면 빈 dict."""
+    out = {}
+    for (dj,) in conn.execute(
+            "SELECT data_json FROM tables WHERE doc_id = ? ORDER BY page",
+            (code,)):
+        try:
+            rows = json.loads(dj)
+        except (ValueError, TypeError):
+            continue
+        for row in rows:
+            # 반드시 정확히 2칸짜리 행이어야 한다 - "종류|가입자격" 안내표는
+            # 항상 이 모양이고, 다른 표(비용예시표 등)는 칸 수가 더 많다.
+            # 헤더 글자로 표를 가리려 했더니 표가 페이지 경계에서 이어질
+            # 때 헤더 줄 자체가 없는 경우를 놓쳐서(KR5144420020 실측),
+            # 칸 수 하나만으로 가른다 - 비용예시표(7칸)에서 코드가 우연히
+            # 맞아떨어져 옆 칸("판매수수료 및 보수ㆍ비용")을 가입자격으로
+            # 잘못 낸 사고가 실제로 났었는데, 그 표는 칸 수부터 다르다.
+            if not row or len(row) != 2:
+                continue
+            cc = _row_class_code(row, allow_bare_paren=True)
+            if not cc or cc not in known_codes or cc in out:
+                continue
+            elig = _clean(row[1])
+            # 이 표는 클래스마다 칸이 독립된 진짜 표라(좌표 폴백처럼 여러
+            # 줄을 누적하다 다른 클래스 문구와 섞일 위험이 없다) 150~200자
+            # 문턱을 그대로 가져올 필요가 없다 - 실측(KR5144420020 S-P2
+            # (퇴직연금))으로 246자짜리 정상 문장이 있었다. 괄호짝만
+            # 맞으면(_elig_looks_cut) 받는다.
+            if (elig and re.search(r"[가-힣]", elig) and len(elig) <= 400
+                    and not _elig_looks_cut(elig)):
+                out[cc] = elig
+    return out
+
+
 def product_redemption_note(conn, code):
     """펀드 전체에 적용되는 환매수수료 문장. 없으면 None."""
     chunks = [" ".join(text.split()) for (text,) in conn.execute(
@@ -2102,6 +2200,56 @@ def extract(db_path=DEFAULT_DB_PATH):
                 merged[cc] = {"front_load_fee": "없음", "back_load_fee": "없음",
                                "redemption_fee": "없음", "switch_fee": "없음"}
                 pages[cc] = no_direct_fee_page
+
+        # known_codes는 class_fees.json 기준이라, class_fees도 그 클래스의
+        # 상세표를 못 찾은 경우(바로 아래 "I" 사례)엔 known_codes 자체에도
+        # 없어 이 두 폴백이 대상으로조차 못 본다. class_meaning(종류형
+        # 명칭표 - 이 상품에 실제로 있는 클래스 코드의 더 넓은 원천)에는
+        # 있는 코드까지 아울러야 이런 클래스도 폴백 대상이 된다. 이 둘만
+        # 쓰는 좁은 폴백이라 known_codes 자체를 넓히지 않고 여기서만 쓴다 -
+        # 다른 파서(접두/접미/대소문자 흔들림 병합 등)까지 이 넓은 집합을
+        # 쓰면 class_fees와 class_meaning이 실제로 다르게 아는 표기를
+        # 뭉갤 위험이 있다(merge_class_spelling.py가 따로 존재하는 이유이기도
+        # 하다).
+        meaning_codes = {r[0] for r in conn.execute(
+            "SELECT DISTINCT class_code FROM class_meaning "
+            "WHERE product_code = ? AND class_code IS NOT NULL", (code,))}
+        fallback_known = known_codes | meaning_codes
+
+        # 클래스별 상세표에 자기 행이 아예 없는 클래스가 있다(KR5194450018
+        # "I" 실측 - 요약정보의 "구분|보유기간|부과비율|부과시기" 환매수수료
+        # 표에만 이름이 있고 34~37쪽 클래스별 상세표엔 없다. class_fees.json
+        # 도 이 클래스를 못 찾는다 - 문서 자체가 이 클래스의 가입자격·선취/
+        # 후취/전환수수료를 어디에도 안 밝혔다는 뜻이므로 지어내지 않는다).
+        # merged에 아예 없는(=어떤 파서도 못 찾은) 클래스만, 이 요약표에
+        # 환매수수료가 있으면 그것만 채운다 - 상세표에서 이미 뭐라도 찾은
+        # 클래스는 건드리지 않는다.
+        missing_codes = fallback_known - set(merged)
+        if missing_codes:
+            redemption_fallback = _holding_period_redemption_fallback(conn, code)
+            for cc in missing_codes & set(redemption_fallback):
+                merged[cc] = {"redemption_fee": redemption_fallback[cc]}
+
+        # 여전히 안 채워진 클래스는 "종류|가입자격" 안내표에서라도 이름표를
+        # 찾는다(KR5144420020 C-P2I(퇴직연금)/S-P2(퇴직연금) 실측 - 값 표의
+        # 코드가 줄바꿈에 잘려 코드 자체를 못 읽었을 뿐, 이 안내표는 줄바꿈이
+        # 안 잘려 코드가 온전하다). 수수료 값은 값 표에서 못 읽은 그대로
+        # 지어내지 않고 가입자격만 채운다.
+        missing_codes = fallback_known - set(merged)
+        if missing_codes:
+            elig_fallback = _eligibility_only_fallback(conn, code, missing_codes)
+            for cc in missing_codes & set(elig_fallback):
+                merged[cc] = {"eligibility": elig_fallback[cc]}
+
+        # 위 두 폴백으로 새로 채운 코드는 class_meaning에만 있고
+        # known_codes(class_fees 기준)엔 없을 수 있다 - 그대로 두면 바로
+        # 아래 표기 정규화 단계가 "known_codes에 없는 코드"로 보고 다른
+        # known 코드에 억지로 합치려 하거나(엉뚱한 병합 시도) 매칭
+        # 실패로 지워 버린다(방금 채운 걸 도로 잃는다). class_meaning이
+        # 실제로 검증한 코드이므로 known_codes에 편입해 정식 코드로
+        # 인정한다.
+        known_codes |= fallback_known & set(merged)
+
         # known_codes에 없는 표기를 정식 코드로 합쳐 넣는다. 표가 페이지
         # 경계나 줄바꿈으로 갈리면서 코드 글자 일부가 잘려 나가는 표가
         # 있다(KR5127420034 실측: "C-퇴직연금"의 마지막 글자 "금"이 다른
