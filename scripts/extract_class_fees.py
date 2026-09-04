@@ -3212,6 +3212,18 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
 # 비용예시표는 5칸이 다 있다 - KR5113420069 실측).
 COST_AFTER_RE = re.compile(r"^(\d+)년\s*후?$")
 
+# 클래스명이 여러 줄로 쪼개진 셀 안에서, 그 줄들 "사이"에 캡션
+# ("판매수수료 및 보수·비용", "(모투자신탁의 총보수·비용 포함)")이
+# 끼어 있는 문서가 있다(KR5113420013 실측: "인-퇴직연금,기관(C-" 다음
+# 줄이 캡션, 그 다음 줄이 "RF)" - top좌표로 정렬하면 캡션이 코드 조각
+# 사이에 끼어 "(C-판매수수료및보수·비용RF)"처럼 코드가 두 동강 난다).
+# 각 줄 자체는 항상 이 고정 문구 그대로이므로, 라벨을 모을 때 이
+# 캡션 낱말만 미리 걸러내면 코드 조각들이 다시 붙는다.
+CAPTION_NOISE_RE = re.compile(
+    r"^\(?판매수수료$|^및$|^보수[·‧･]?비용$"
+    r"|^\(?모투자신탁의$|^총보수[·‧･]?비용$|^포함\)?$"
+)
+
 
 def _detail_cost_grids(pdf):
     """상세 비용예시표를 셀 격자로 읽어
@@ -3389,11 +3401,23 @@ def _detail_cost_grids(pdf):
                 if len(col_x0s) == len(prev_cols):
                     year_by_col = dict(prev_years)
                 else:
+                    # 앞 페이지 표가 머리글 줄에서는 연도 칸 사이사이에
+                    # (한 글자씩 줄바꿈되며 생긴) 잔가지 칸이 더 끼어
+                    # prev_cols 전체 칸 수가 더 많은 문서가 있다
+                    # (KR5113420013 46/47쪽 실측: 46쪽 12칸 중 연도 칸은
+                    # {2,4,6,8,10} 5개뿐인데, 나머지 비연도 칸이 마침
+                    # 연도 칸과 거의 같은 거리(약 5.3~5.5pt 차이)에 있어,
+                    # 이어지는 47쪽의 성긴 칸(7개)과 가장 가까운 칸을
+                    # prev_cols "전체"에서 찾으면 매번 비연도 칸이 근소한
+                    # 차이로 먼저 걸려 연도 칸 5개 중 4개를 통째로
+                    # 놓쳤다). 전체 칸이 아니라 "연도로 이미 확인된 칸"
+                    # 중에서만 가장 가까운 것을 찾는다 - 비연도 칸은
+                    # 애초에 후보에서 빠지므로 이 근접 오탐이 안 생긴다.
+                    prev_year_cols = [(prev_cols[k], v) for k, v in prev_years.items()]
                     for ci, x in enumerate(col_x0s):
-                        near = min(range(len(prev_cols)),
-                                   key=lambda k: abs(prev_cols[k] - x))
-                        if abs(prev_cols[near] - x) <= 8 and near in prev_years:
-                            year_by_col[ci] = prev_years[near]
+                        px, y = min(prev_year_cols, key=lambda kv: abs(kv[0] - x))
+                        if abs(px - x) <= 8:
+                            year_by_col[ci] = y
             if len(set(year_by_col.values())) < 4:
                 continue
 
@@ -3428,7 +3452,8 @@ def _detail_cost_grids(pdf):
                 lim = col_x0s[first_val] - 2
                 ws = [w for w in words
                       if (w["x0"] + w["x1"]) / 2 < lim
-                      and r["top"] - 1 <= (w["top"] + w["bottom"]) / 2 <= r["bottom"] + 1]
+                      and r["top"] - 1 <= (w["top"] + w["bottom"]) / 2 <= r["bottom"] + 1
+                      and not CAPTION_NOISE_RE.match(w["text"])]
                 ws.sort(key=lambda w: (round(w["top"] / 3), w["x0"]))
                 label = " ".join(w["text"] for w in ws)
                 code = _label_class_code(label)
@@ -3448,7 +3473,8 @@ def _detail_cost_grids(pdf):
                     prev_bottom = grid[ridx - 1]["bottom"] if ridx > 0 else r["top"] - 40
                     ws2 = [w for w in words
                            if (w["x0"] + w["x1"]) / 2 < lim
-                           and prev_bottom - 1 <= (w["top"] + w["bottom"]) / 2 <= r["bottom"] + 1]
+                           and prev_bottom - 1 <= (w["top"] + w["bottom"]) / 2 <= r["bottom"] + 1
+                           and not CAPTION_NOISE_RE.match(w["text"])]
                     ws2.sort(key=lambda w: (round(w["top"] / 3), w["x0"]))
                     code = _label_class_code(" ".join(w["text"] for w in ws2))
                 if not code and r is grid[-1] and i + 1 < len(pdf.pages):
@@ -3483,9 +3509,18 @@ def _detail_cost_grids(pdf):
                 # 같은 클래스가 "판매수수료 및 보수·비용"과 "(피투자
                 # 집합투자기구 포함)" 두 줄로 나오는데 앞줄이 기본값이다.
                 by_code.setdefault(code, vals)
+            # 이 페이지 표의 값 행이 전부 코드 인식에 실패해 by_code가
+            # 비어도(KR5113420013 46쪽 실측: 유일한 값 행의 이름표가
+            # "판매수수료및보수·비용" 캡션과 뒤섞여 코드를 못 찾음),
+            # 이 표 자체가 유효한 연도 칸 구성(year_by_col)을 가졌다면
+            # 다음 페이지가 이어받을 수 있게 carry는 별도로 남긴다 -
+            # by_code에 묶어 두면 이런 페이지에서 carry가 끊겨, 자기
+            # 머리글이 없는 다음 페이지(47쪽)가 연도 칸을 못 물려받고
+            # 표 전체(C-F 등 5개 클래스)가 통째로 스킵됐다.
+            if year_by_col:
+                carry = (year_by_col, col_x0s, page_num, tx1)
             if by_code:
                 out.append((page_num, by_code))
-                carry = (year_by_col, col_x0s, page_num, tx1)
     return out
 
 
@@ -3771,6 +3806,7 @@ def _label_class_code(label):
     문서마다 다르다."""
     flat = label.replace(" ", "")
     for regex in (CLASS_CODE_RE, DETAIL_FEE_CLASS_CODE_NESTED_RE,
+                  DETAIL_FEE_CLASS_CODE_NESTED_UNCLOSED_RE,
                   CLASS_CODE_NESTED_RE, DETAIL_FEE_CLASS_CODE_JONGRYU_RE):
         mm = [x for x in regex.finditer(flat)
               if not _is_bad_code(x.group(1))]
