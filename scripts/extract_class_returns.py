@@ -1475,6 +1475,17 @@ def _normalize_class_code(code, known_classes):
     ]
     if len(dash_candidates) == 1:
         return dash_candidates[0]
+    # 반대 방향(이 표만 붙임표를 더 찍는 문서)도 있다(KR5123490013/16/17
+    # 실측: 가입자격·수익률 표는 전부 "A-e"/"C-e"인데 class_fees.json이
+    # 아는 정식 표기는 "Ae"/"Ce" - 표마다 붙임표를 넣거나 빼는 게 이
+    # 문서만의 습관이다. class_charges.py에서 이미 겪은 것과 같은 종류의
+    # 표기 흔들림). 이 코드에서 붙임표를 지운 모양이 아는 코드와 유일하게
+    # 일치할 때만 바꾼다.
+    no_dash_candidates = [
+        k for k in known_classes if k != code and code.replace("-", "") == k
+    ]
+    if len(no_dash_candidates) == 1:
+        return no_dash_candidates[0]
     # 수익률 표는 "연금"/"퇴직연금" 같은 괄호 구분자를 통째로 생략하고
     # 찍는 문서가 있다(KR5120420091 실측: 가.연평균/상세표 둘 다 그냥
     # "Class C-P" / "Class C-R"인데, 정식 코드(보수표·class_fees.json)는

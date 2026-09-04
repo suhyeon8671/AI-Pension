@@ -55,6 +55,20 @@ RE_NAME_TABLE_HEADER = re.compile(
 # 아니라 식별자라 떼어낸다.
 RE_FUND_CODE_SUFFIX = re.compile(r"\s*\(\s*펀드코드\s*[:：]\s*[A-Za-z0-9]+\s*\)\s*$")
 
+# 운용전환일 전/후로 자산유형·이름 자체가 바뀌는 목표전환형 상품이 있다
+# (KR5147430065 실측: "1. 집합투자기구 명칭"이 "...4호[채권혼합](운용전환일
+# 이후) KCGI코리아목표전환형증권투자신탁4호[채권]"처럼 전환 전·후 이름
+# 둘을 하나로 이어 붙여 등록했다 - 증권신고서 원문 자체가 그렇게 적는다).
+# 이 하나를 그대로 두면 asset_type이 뒤쪽(전환 "후") 괄호 "[채권]"에
+# 걸리는데, risk_level은 별도 표에서 이미 전환 "전" 값(4등급)을 정확히
+# 읽어 온다 - 서로 다른 시점의 값이 한 레코드에 섞인다. 100개 상품 중
+# 실제로 운용전환이 있는 상품은 이거 하나뿐이라("증권전환형"이라는
+# 이름이 붙은 다른 상품들은 다른 펀드로 갈아탈 수 있다는 뜻일 뿐 자산
+# 유형·위험등급이 전후로 갈리지 않는다), 전용 스키마를 새로 만들기보다
+# 지금 이 문서 하나에서 "전환 전"(=지금 신규설정 상태) 이름만 골라
+# 나머지 필드(asset_type)와 시점을 맞춘다.
+RE_CONVERSION_SPLIT = re.compile(r"\s*\(\s*운용전환일\s*이후\s*\)\s*.*$", re.S)
+
 
 def load_json(path):
     if not os.path.exists(path):
@@ -84,6 +98,16 @@ def extract_product_name(page1):
         raw = RE_FUND_CODE_SUFFIX.sub("", raw).strip()
     confidence = 1.0
     notes = []
+    full_raw = raw
+
+    conv = RE_CONVERSION_SPLIT.search(raw)
+    if conv:
+        # 운용전환 전(=지금 신규설정 상태) 이름만 남긴다 - risk_level이
+        # 이미 그 시점 값을 쓰고 있으므로 asset_type도 같은 시점을
+        # 가리켜야 한다. 원문 전체(전환 후 이름 포함)는 evidence에
+        # 그대로 남겨 근거를 잃지 않는다.
+        raw = raw[:conv.start()].strip()
+        notes.append("운용전환일 이후 별도 이름 있음 - 전환 전(현재) 명칭만 씀")
 
     if any(marker in raw for marker in TABLE_LEAK_MARKERS):
         confidence = 0.4
@@ -98,7 +122,7 @@ def extract_product_name(page1):
     return {
         "value": raw,
         "page": 1,
-        "evidence": raw[:150],
+        "evidence": full_raw[:150],
         "method": method + (" +review_flag" if notes else ""),
         "confidence": confidence,
         **({"note": "; ".join(notes)} if notes else {}),
