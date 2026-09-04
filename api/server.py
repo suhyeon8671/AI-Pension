@@ -46,6 +46,7 @@ from product_facts import detect_intents, product_facts  # noqa: E402
 import input_guard  # noqa: E402
 import query_analyzer  # noqa: E402
 import tax_calculator  # noqa: E402
+import product_ranking  # noqa: E402
 
 app = FastAPI(title="연금 Agent 평가용 API")
 
@@ -210,6 +211,32 @@ def answer_payload(question_id: str, question: str) -> dict:
             ),
             "answer": answer,
             "route": "tax_calculation",
+        }
+
+    # 여러 상품을 조건으로 걸러 정렬하는 질의("총보수가 가장 낮은 상품
+    # 5개", "위험등급 4 이하이고 총보수가 낮은 상품")는 지목된 상품이
+    # 없다. product_lookup.GENERIC_WORDS가 "채권형"/"혼합형" 같은
+    # 분류어를 상품 이름으로 안 보므로 find_products는 이런 질문에서
+    # 어차피 못 찾는다 - 그러면 RAG로 빠져 엉뚱한 텍스트 조각만 나오게
+    # 되므로, 상품 조회보다 먼저 랭킹 질의인지부터 본다.
+    rank_conditions = product_ranking.detect(question)
+    if rank_conditions is not None:
+        summary, evidence = product_ranking.rank_products(rank_conditions)
+        answer, how = compose_answer(question, summary, summary)
+        return {
+            "question_id": question_id,
+            "question": question,
+            "retrieved_context": summary,
+            "think_trace": (
+                f"1. 질의 분류: 상품 랭킹/조건 검색 (조건: {rank_conditions})\n"
+                "2. semantic_search 대신 구조화 DB(product_master/class_fees/"
+                "class_returns/fund_aum) 전체를 조건으로 걸러 정렬 (일반 고객이 "
+                "가입 가능한 클래스만 사용)\n"
+                f"   - 조회 근거: {evidence[:5]}\n"
+                f"3. 답변 생성: {how}"
+            ),
+            "answer": answer,
+            "route": "ranking",
         }
 
     # 상품을 이름으로도 찾는다. 예전엔 질의에 상품코드(KR...)가 문자
