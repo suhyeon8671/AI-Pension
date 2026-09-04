@@ -109,6 +109,14 @@ INTENT_KEYWORDS = {
                     "담을 수", "연금저축계좌로", "IRP로", "IRP에서",
                     "연금저축용", "퇴직연금용", "어떤 클래스", "무슨 클래스",
                     "클래스가 있", "클래스는 뭐"),
+    # "자산유형이 뭐야?"/"주식형이야 채권형이야?"/"상품코드가 뭐야?"
+    # (220문항 테스트셋 2/3/8번) - product_master의 분류·위험등급은 이미
+    # lines 맨 위 머리글에 항상 나가는데(intents와 무관하게), 정작 이
+    # 질문들 자체를 못 알아봐서 단일 상품 경로를 안 타고 semantic_search로
+    # 새 버려 상관없는 청크가 답으로 나갔었다. 새 코드 없이 머리글만으로
+    # 이미 답이 되므로 아래 route 화이트리스트에만 추가한다.
+    "identity": ("자산유형", "무슨 유형", "어떤 유형", "주식형이야", "채권형이야",
+                 "혼합형이야", "상품코드", "펀드코드", "종목코드"),
 }
 
 
@@ -580,6 +588,20 @@ def product_facts(code, class_code=None, intents=None, db_path=DEFAULT_DB_PATH):
                            "page": a.get("page")})
             else:
                 lines.append("  규모: 정보를 찾지 못했습니다.")
+
+        # "이 수익률/AUM은 언제 기준이야?" 질문에 답하려면 fee 의도가 아닐
+        # 때도 자료 기준일이 나가야 한다(220문항 테스트셋 179~184번, 기준일
+        # 범주 - "fee" 의도일 때만 작성기준일을 붙이던 위 코드는 총보수를
+        # 안 물은 질문(수익률/AUM/위험등급만 물은 질문)에서는 기준일 자체가
+        # 통째로 빠졌다). 투자설명서 한 건에 작성기준일은 하나뿐이라
+        # class_fees 아무 행에서나 가져와도 같다 - 위에서 이미 fee로 못
+        # 찾았을 때만 새로 조회한다.
+        if "fee" not in intents and "cost_projection" not in intents:
+            doc_as_of = conn.execute(
+                "SELECT as_of FROM class_fees WHERE product_code = ? "
+                "AND as_of IS NOT NULL LIMIT 1", (code,)).fetchone()
+            if doc_as_of and doc_as_of["as_of"]:
+                lines.append(f"  (자료 기준일: {doc_as_of['as_of']})")
 
         return "\n".join(lines), ev
     finally:
