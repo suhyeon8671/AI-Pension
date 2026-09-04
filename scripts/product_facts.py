@@ -315,11 +315,21 @@ def _return_caveat(v):
     return "(문서 원문 그대로의 수치이나 상식적인 범위를 크게 벗어나 확인이 필요합니다)"
 
 
-def _benchmark_for(conn, code):
-    r = conn.execute(
-        "SELECT * FROM class_returns WHERE product_code = ? AND row_kind = 'benchmark' LIMIT 1",
-        (code,)).fetchone()
-    return dict(r) if r else None
+def _benchmark_for(conn, code, near_page=None):
+    """이 상품의 비교지수 행. 한 상품에 클래스 그룹(개인연금/퇴직연금
+    등)마다 별도 비교지수 행이 여러 개 있는 문서가 있다(같은 페이지에
+    묶여 나온다 - 그룹을 가르는 별도 칸은 없다). class_code로 어느
+    그룹인지 알 길이 없으므로, 지금 보여주는 클래스 행이 있던 페이지에
+    가장 가까운 비교지수 행을 고른다 - 아무거나 하나 집으면 엉뚱한
+    그룹의 비교지수가 붙을 수 있다."""
+    rows = [dict(r) for r in conn.execute(
+        "SELECT * FROM class_returns WHERE product_code = ? AND row_kind = 'benchmark'",
+        (code,))]
+    if not rows:
+        return None
+    if near_page is None or len(rows) == 1:
+        return rows[0]
+    return min(rows, key=lambda r: abs((r.get("page") or 0) - near_page))
 
 
 def product_facts(code, class_code=None, intents=None, db_path=DEFAULT_DB_PATH):
@@ -547,7 +557,7 @@ def product_facts(code, class_code=None, intents=None, db_path=DEFAULT_DB_PATH):
                     lines.append(f"    - {r['class_code']}: {txt}{note}")
                     ev.append({"table": "class_returns", "product_code": code,
                                "class_code": r["class_code"], "page": r.get("page")})
-                bm = _benchmark_for(conn, code)
+                bm = _benchmark_for(conn, code, near_page=rets[0].get("page"))
                 if bm:
                     got = [(lbl, bm.get(col)) for lbl, col in
                            (("1년", "return_1y"), ("3년", "return_3y"),

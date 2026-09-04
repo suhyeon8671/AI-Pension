@@ -186,6 +186,56 @@ def _clean(v):
     return "없음" if _squash(v) in NONE_MARKS else v
 
 
+RE_BARE_PCT_NUM = re.compile(r"^[\d]+(?:\.[\d]+)?$")
+RE_TRUNCATED_PAYMENT = re.compile(r"^(납입금액|납입액)(의)?$")
+RE_PCT_NUM = re.compile(r"[\d]+(?:\.[\d]+)?\s*%")
+RE_BUNBUI_NUM = re.compile(r"100분\s*의\s*[\d]+(?:\.[\d]+)?")
+
+
+def _clean_front_load_fee(v):
+    """선취판매수수료 값을 최종적으로 한 번 더 본다. 이 칸은 값이
+    클래스마다 다른 게 정상이라(위 CARRY_FIELDS 주석 참고) 다른 클래스
+    값을 이어받는 걸로는 못 고치는 세 가지 결함이 실측됐다.
+
+    1. 숫자에 "%"가 안 붙고 홀로 찍힘(KR5160420009 실측: "0.10"/
+       "0.05" - 이 문서만 % 글자가 따로 떨어져 나가 못 붙었다). "%"를
+       붙여 준다.
+    2. "납입금액의"에서 그대로 끊김(KR514X450008/KR5131420007 실측:
+       뒤에 와야 할 요율 숫자가 통째로 없다). 숫자를 지어낼 수 없으니
+       모른다고 남긴다.
+    3. 가입자격 문장이나 다른 클래스 글자가 섞여 뒤죽박죽 길어짐
+       (KR5120451001 실측: A1은 자기 가입자격 "제한없음"이, Ae는 바로
+       위 클래스의 긴 가입자격 문장까지 끼어들었다). "납입금액"|
+       "납입액"과 %(또는 100분의 N) 표기가 둘 다 있으면 그 사이·뒤에
+       낀 군더더기를 걷어내고 "납입금액의 N%[이내]" 꼴로 되살린다.
+       실마리가 없으면 문장을 그대로 내보내지 않고 버린다 - 틀린
+       문장보다 모른다는 쪽이 낫다."""
+    if v is None:
+        return v
+    s = v.strip()
+    squashed = _squash(s)
+    if not s or squashed in NONE_MARKS:
+        return v
+    if RE_BARE_PCT_NUM.match(squashed):
+        return f"{squashed}%"
+    if RE_TRUNCATED_PAYMENT.match(squashed):
+        return None
+    if len(s) <= 20:
+        return v
+    base = "납입금액" if "납입금액" in s else ("납입액" if "납입액" in s else None)
+    if not base:
+        return v
+    m = RE_PCT_NUM.search(s)
+    if m:
+        tail = " 이내" if "이내" in squashed else ""
+        return f"{base}의 {m.group(0).replace(' ', '')}{tail}"
+    m2 = RE_BUNBUI_NUM.search(s)
+    if m2:
+        tail = " 이내" if "이내" in squashed else ""
+        frac = re.sub(r"\s+", "", m2.group(0))
+        return f"{base}의 {frac}{tail}"
+    return None
+
 
 # 헤더 다음 줄이 진짜 데이터 줄(헤더의 이어지는 줄이 아니라)인지 보는
 # 신호. 헤더 칸은 이름표뿐이라 퍼센트·"납입금액"·"-" 같은 값이 안 나온다.
@@ -550,6 +600,46 @@ def _parse_transposed_table(rows, carried_class_order=None):
     if len(seen_kinds_total) < 2:
         return {}, None
     return out, pending
+
+
+def _merge_wrapped_continuation_rows(rows):
+    """칸 안 줄바꿈이 별개 물리 행으로 떨어져 나오는 표가 있다
+    (KR514X450008 32쪽 실측: "명칭A|가입자격제한없음|...|납입금액의"
+    다음 물리 행이 "||...|1.0%이내"로, "납입금액의"와 "1.0%이내"는
+    같은 셀 안에서 줄바꿈된 것뿐인데 표 추출기가 별도 행으로 갈랐다 -
+    이걸 안 이으면 "납입금액의"에서 끊긴 채로 남아 정작 중요한 요율
+    숫자를 통째로 잃는다). 이런 "칸 하나만 채워지고 나머지는 전부 빈"
+    행은 새 데이터 행이 아니라 바로 위 행의 이어지는 줄이므로, 그
+    칸의 텍스트를 이어붙이고 이 행 자체는 없앤다.
+
+    새 클래스 행과 헷갈리면 안 된다 - 클래스 코드만 있고 가운데
+    칸들은 아직 안 채워진 진짜 새 행(예: ['A2','','','',...])도 "칸
+    하나만 채워짐"이라 겉모습이 같다. 그래서 채워진 칸이 맨 앞
+    (0번째, 이름표·클래스코드 자리)이면 절대 이어붙이지 않는다 -
+    이어붙일 대상은 항상 그보다 뒤쪽 칸(수수료율 등 값 칸)이다.
+    이어붙일 위 행의 같은 칸이 비어 있으면(이어질 대상 자체가 없다)도
+    손대지 않는다.
+
+    1번째 칸(0번째 바로 다음)도 이름표 자리로 쓰는 표가 있다
+    (KR5156450026 실측: ['','수수료미징구-오프라인','','-',...] 다음
+    행이 ['','-보수체감형(C1)','','',...]로, 이름표가 0번째가 아니라
+    1번째 칸에서 줄바꿈된다 - 여기까지 이어 붙이면 표 파서가 이
+    클래스를 "찾아낸" 것으로 착각해서, 정작 이 표엔 없는 전환수수료
+    칸을 마저 찾으러 가는 좌표 재스캔(_coord_fee_table_page, 훨씬
+    꼼꼼하게 훑는 경로)을 건너뛰게 된다 - 그 결과 반쪽짜리(전환수수료
+    빠진) 데이터로 조용히 "완결됐다"고 오판해서 오히려 더 나쁜
+    결과를 냈다). 그래서 0·1번째 칸은 둘 다 건드리지 않고, 그보다
+    뒤쪽(수수료율 등 값 칸)만 이어 붙인다."""
+    out = []
+    for row in rows:
+        filled = [(j, c) for j, c in enumerate(row) if (c or "").strip()]
+        if len(filled) == 1 and out:
+            j, c = filled[0]
+            if j > 1 and j < len(out[-1]) and (out[-1][j] or "").strip():
+                out[-1][j] = out[-1][j].rstrip() + c.strip()
+                continue
+        out.append(list(row))
+    return out
 
 
 def _parse_table(rows, carried=None, carried_cols=None, carried_last_value=None):
@@ -1086,12 +1176,14 @@ RE_NO_DIRECT_FEE = re.compile(
 
 
 def product_has_no_direct_fee(conn, code):
-    for (text,) in conn.execute(
-            "SELECT text FROM chunks WHERE doc_id = ? "
+    """이 상품이 "가.투자자에게 직접 부과되는 수수료: 해당사항 없음"
+    절 하나로 끝나는지, 그렇다면 그 절이 있는 페이지 번호도 같이."""
+    for page, text in conn.execute(
+            "SELECT page, text FROM chunks WHERE doc_id = ? "
             "AND text LIKE '%직접 부과되는 수수료%'", (code,)):
         if RE_NO_DIRECT_FEE.search(" ".join(text.split())):
-            return True
-    return False
+            return True, page
+    return False, None
 
 
 def product_redemption_note(conn, code):
@@ -1788,6 +1880,7 @@ def extract(db_path=DEFAULT_DB_PATH):
                 rows = json.loads(dj)
             except (ValueError, TypeError):
                 continue
+            rows = _merge_wrapped_continuation_rows(rows)
             ncols = max((len(r) for r in rows), default=0)
             # 세로형(클래스마다 4줄) 표를 먼저 본다. 가로형 머리글 탐색은
             # "환매"로 시작하는 짧은 칸을 찾는데, 세로형 표의 "구분" 칸
@@ -1947,7 +2040,10 @@ def extract(db_path=DEFAULT_DB_PATH):
                         if not _unresolved_codes():
                             break
 
-        if not merged and known_codes and product_has_no_direct_fee(conn, code):
+        no_direct_fee, no_direct_fee_page = (
+            product_has_no_direct_fee(conn, code) if not merged and known_codes
+            else (False, None))
+        if no_direct_fee:
             # 클래스별 표 자체가 없이 "가. 투자자에게 직접 부과되는
             # 수수료: 해당사항 없음"이라고 절 하나로 끝내는 문서다
             # (KR516702010M/KR5174420011 실측) - 표가 없으니 위 어떤
@@ -1957,6 +2053,7 @@ def extract(db_path=DEFAULT_DB_PATH):
             for cc in known_codes:
                 merged[cc] = {"front_load_fee": "없음", "back_load_fee": "없음",
                                "redemption_fee": "없음", "switch_fee": "없음"}
+                pages[cc] = no_direct_fee_page
         for cc, rec in sorted(merged.items()):
             # 표가 페이지 경계나 줄바꿈으로 갈리면서 코드 글자 일부가
             # 잘려 나가는 표가 있다(KR5127420034 실측: "C-퇴직연금"의
@@ -1986,12 +2083,56 @@ def extract(db_path=DEFAULT_DB_PATH):
                               if k != cc and k.startswith(cc)
                               and len(k) - len(cc) <= 3]
                 target = min(candidates, key=len) if candidates else None
+                if not target:
+                    # 반대 방향으로 잘리는 표도 있다 - 코드 칸이 줄바꿈으로
+                    # 두 줄에 걸쳐 있어서 앞쪽 글자("C-")가 다른 셀로
+                    # 떨어져 나가고 뒤쪽 조각("P2e")만 이 행의 코드로
+                    # 잡히는 경우다(KR514X450008 실측: "C-P2e"의 앞
+                    # 두 글자가 떨어져 나가 "P2e"라는 존재하지 않는 코드가
+                    # 하나 더 생겼다). known 코드가 cc로 "끝나면"(cc가
+                    # 순수 접미사) 잘린 뒤쪽 조각일 가능성이 커서 그
+                    # known 코드 쪽에 합친다.
+                    suffix_candidates = [k for k in known_codes
+                                         if k != cc and k.endswith(cc)
+                                         and len(k) - len(cc) <= 3]
+                    target = min(suffix_candidates, key=len) if suffix_candidates else None
+                if not target:
+                    # 대소문자만 다른 표기도 있다(KR514X450008 실측:
+                    # "C-pe"가 이 표에서만 소문자로 찍히는데 정식 표기는
+                    # "C-Pe" - class_meaning/class_fees가 아는 진짜 클래스와
+                    # 같은 것이다. 별개 코드로 남기면 같은 클래스가 두
+                    # 줄로 중복된다).
+                    ci_candidates = [k for k in known_codes
+                                     if k != cc and k.lower() == cc.lower()]
+                    target = ci_candidates[0] if len(ci_candidates) == 1 else None
+                if not target:
+                    # 붙임표(-) 유무만 다른 표기도 있다(KR5123490013 실측:
+                    # 이 표(가입자격·수수료율)는 "A-e"/"C-e"인데 class_fees가
+                    # 아는 정식 표기는 "Ae"/"Ce" - 표마다 붙임표를 넣거나
+                    # 빼는 게 이 문서만의 습관이다). 이걸 반영 안 하면 위
+                    # 셋(접두/접미 잘림, 대소문자) 어디에도 안 걸려서
+                    # "Class"/"No" 같은 진짜 가짜 코드와 똑같이 버려지는데,
+                    # 이건 표기만 다른 진짜 클래스라 잃으면 안 된다.
+                    dash_candidates = [k for k in known_codes
+                                       if k != cc and k.replace("-", "") == cc.replace("-", "")]
+                    target = dash_candidates[0] if len(dash_candidates) == 1 else None
                 if target:
                     tgt_rec = merged.setdefault(target, {})
                     for k2, v2 in rec.items():
                         if v2 and not tgt_rec.get(k2):
                             tgt_rec[k2] = v2
                     continue
+                # 위 세 갈래(접두/접미 잘림, 대소문자) 어디에도 안 걸리면
+                # 이 상품의 진짜 클래스가 아닐 가능성이 크다 - 표 헤더
+                # 글자("Class"/"No" 같은 열 이름)가 데이터 행으로 잘못
+                # 읽힌 경우가 실측됐다(KR5144420020/KR5156450026/
+                # KR555202013M의 "Class", KR514X450008의 "No" - 전부
+                # 보수 및 비용 표의 열 머리글 "명칭(Class)"/번호열
+                # "No."가 가입자격 표 파서에 잘못 걸린 것으로 확인).
+                # known_codes(class_fees.json이 이미 검증한 이 상품의
+                # 진짜 클래스 목록)에 전혀 없는 코드는 근거로 못 쓰므로
+                # 버린다 - 있는 척 답에 내보내는 것보다 빼는 게 안전하다.
+                continue
             if not any(rec.get(k) for k in (
                     "eligibility", "front_load_fee", "back_load_fee",
                     "redemption_fee", "switch_fee")):
@@ -2005,7 +2146,7 @@ def extract(db_path=DEFAULT_DB_PATH):
                 "product_code": code,
                 "class_code": cc,
                 "eligibility": rec.get("eligibility"),
-                "front_load_fee": rec.get("front_load_fee"),
+                "front_load_fee": _clean_front_load_fee(rec.get("front_load_fee")),
                 "back_load_fee": rec.get("back_load_fee"),
                 "redemption_fee": rec.get("redemption_fee"),
                 "switch_fee": rec.get("switch_fee"),

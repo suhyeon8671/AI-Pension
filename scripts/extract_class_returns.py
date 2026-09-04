@@ -633,6 +633,28 @@ def find_return_rows_on_page(page, page_num, section="가", known_classes=None,
         date_m = INCEPTION_DATE_RE.search(pre_text)
         inception_date = _normalize_date(date_m.group()) if date_m else None
 
+        # 클래스 코드 칸과 최초설정일 칸이 붙어 있어서, 설정일 앞자리
+        # 숫자("20"/"201"/"2016" 등, 몇 글자가 새는지는 문서마다 다르다)가
+        # 코드 뒤에 그대로 눌어붙는 문서가 있다(KR5118420062 13개 클래스
+        # 실측: "C-Pe" 뒤에 "20"이 붙어 "C-Pe20"이 되면서, 정작 진짜
+        # "C-Pe" 행은 설정일이 빈 채로 따로 남았다 - 가짜 클래스 13개가
+        # 한꺼번에 생기고 진짜 클래스 13개는 설정일을 잃는 회귀였다).
+        # 코드 끝을 무작정 숫자만큼 떼면 "A2"처럼 진짜 숫자로 끝나는
+        # 클래스와 헷갈린다(A22016 -> A2까지만 떼야지 A까지 떼면 안 됨).
+        # 이 행이 이미 자기 설정일을 올바로 읽어 뒀으므로(위 inception_date),
+        # 그 연도와 실제로 일치하는 접미사만 떼어 known_classes에 있는
+        # 코드가 나오면 그걸로 본다 - 우연히 숫자로 끝나는 진짜 코드를
+        # 잘못 건드릴 위험이 없다.
+        if class_code and inception_date and class_code not in known_classes:
+            year_prefix = inception_date[:4]
+            for n in (4, 3, 2, 1):
+                suffix = year_prefix[:n]
+                if len(class_code) > n and class_code.endswith(suffix):
+                    candidate = class_code[: -n]
+                    if candidate in known_classes:
+                        class_code = candidate
+                        break
+
         # 아직 수익률이 없는 신규 클래스 등은 원본이 그 칸에 "-"를 직접
         # 찍어서 "값이 없다"는 걸 명시적으로 밝힌다. 이걸 그냥 None으로
         # 뭉개면 "추출을 못 해서 모른다"와 "원본이 확인해서 없다고
@@ -1350,6 +1372,28 @@ def return_rows_for_doc(doc_id, pdf, pages, known_classes=None):
                         if dm:
                             inception = _normalize_date(dm.group())
                             break
+
+                # 클래스명 칸과 최초설정일 칸이 붙어 있어서, 설정일 앞자리
+                # 숫자가 코드 뒤에 그대로 눌어붙는 문서가 있다(KR5118420062
+                # 실측: "ClassC-Pe 2017.08.29 ClassC-Pe ..."처럼 같은 라벨이
+                # 두 번 찍히는데, 앞쪽은 날짜와 붙어 "C-Pe20"으로, 뒤쪽은
+                # 정상 "C-Pe"로 갈라져 값은 같은데 코드만 다른 행 2개가
+                # 생겼다 - 13개 클래스에서 한꺼번에 재현됨). 코드 끝을
+                # 무작정 숫자만큼 떼면 "A2"처럼 진짜 숫자로 끝나는 클래스와
+                # 헷갈리므로, 이 행 자신의 설정일(연도)과 실제로 일치하는
+                # 접미사만 떼어 known_classes에 있는 코드가 나올 때만
+                # 받아들인다. 값이 같은 정상 "C-Pe" 행은 아래 dedup에서
+                # (row_kind, class_code, values)가 같아져 자동으로 하나로
+                # 합쳐진다.
+                if class_code and inception and class_code not in (known_classes or ()):
+                    year_prefix = inception[:4]
+                    for n in (4, 3, 2, 1):
+                        suffix = year_prefix[:n]
+                        if len(class_code) > n and class_code.endswith(suffix):
+                            candidate = class_code[: -n]
+                            if candidate in (known_classes or ()):
+                                class_code = candidate
+                                break
 
                 rows.append({
                     "row_kind": kind,

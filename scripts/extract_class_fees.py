@@ -3409,7 +3409,7 @@ def _detail_cost_grids(pdf):
             # 벗어나는 어긋남은 없다고 보고 문턱을 20pt로 둔다.
             year_by_x = {col_x0s[ci]: y for ci, y in year_by_col.items()}
             by_code = {}
-            for r in grid:
+            for ridx, r in enumerate(grid):
                 vals = {}
                 for ci, txt in r["cells"].items():
                     v = txt.replace(" ", "").replace(",", "")
@@ -3432,6 +3432,25 @@ def _detail_cost_grids(pdf):
                 ws.sort(key=lambda w: (round(w["top"] / 3), w["x0"]))
                 label = " ".join(w["text"] for w in ws)
                 code = _label_class_code(label)
+                if not code:
+                    # 클래스명이 값 행과 같은 띠 한 줄이 아니라 여러
+                    # 줄에 걸쳐 있고, 코드를 담은 괄호 자체가 줄바꿈으로
+                    # 쪼개지는 문서가 있다(KR5113420013 47쪽 실측: 값 행
+                    # "19 39 59 104 235"의 클래스명이 "수수료미징구-
+                    # 오프라"/"인-개인연금,기관(C-"/"F)" 세 줄로 나뉘고,
+                    # 위 판정은 값 행과 같은 띠(맨 아래 "F)" 조각)만 보므로
+                    # 앞 두 줄을 놓쳐 코드를 못 찾는다 - 비용예시 값은
+                    # 5개 다 있는데 코드가 없어 클래스 자체가 통째로
+                    # 빠졌다). 바로 앞 값 행의 아래쪽 경계(없으면 40pt
+                    # 위)까지 범위를 넓혀 같은 칸의 글자를 다시 모은다 -
+                    # 좁은 범위로 이미 실패했을 때만 넓히므로, 한 줄에
+                    # 다 있는 정상 표에는 영향이 없다.
+                    prev_bottom = grid[ridx - 1]["bottom"] if ridx > 0 else r["top"] - 40
+                    ws2 = [w for w in words
+                           if (w["x0"] + w["x1"]) / 2 < lim
+                           and prev_bottom - 1 <= (w["top"] + w["bottom"]) / 2 <= r["bottom"] + 1]
+                    ws2.sort(key=lambda w: (round(w["top"] / 3), w["x0"]))
+                    code = _label_class_code(" ".join(w["text"] for w in ws2))
                 if not code and r is grid[-1] and i + 1 < len(pdf.pages):
                     # 이 표의 마지막 행은 이름표가 "코드" 조각만 남기고
                     # 페이지 경계에서 끊길 수 있다(KR5113470030/S 실측:
