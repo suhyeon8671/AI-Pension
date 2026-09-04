@@ -12,11 +12,63 @@
 - 없는 값은 없다고 말한다(추정하지 않는다).
 """
 
+import json
 import os
 import sqlite3
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB_PATH = os.path.join(REPO_ROOT, "structured_store.db")
+CLASS_FEES_JSON_PATH = os.path.join(REPO_ROOT, "class_fees.json")
+
+# 보수 세부 내역(운용보수/신탁보수/일반사무관리회사보수 등)은 상세표
+# 보강으로만 채워지고, build_product_facts_db.load_class_fees의 결정에
+# 따라 SQL 스키마에는 안 들어간다(6축 숫자 비교엔 안 쓰이는 항목이라
+# JSON에만 남겨 둔 것) - 그래서 필요할 때 class_fees.json에서 직접
+# 읽는다. 사람이 알아볼 이름표도 여기서 붙인다.
+_BREAKDOWN_LABELS = {
+    "management_fee": "운용보수(집합투자업자보수)",
+    "trustee_fee": "신탁보수(신탁업자보수)",
+    "admin_fee": "일반사무관리회사보수",
+    "other_expense": "기타비용",
+    "transaction_cost": "매매·중개수수료 등 거래비용",
+}
+_BREAKDOWN_ORDER = ["management_fee", "trustee_fee", "admin_fee",
+                    "other_expense", "transaction_cost"]
+
+_FEE_BREAKDOWN_CACHE = None
+
+
+def _load_fee_breakdown(path=CLASS_FEES_JSON_PATH):
+    """(product_code, class_code) -> {label: 값 문자열} 사전.
+
+    같은 라벨이 서로 다른 값으로 두 번 나오면(KR5116501001 실측:
+    management_fee가 0.2와 0.02로 두 번 찍힘 - 추출이 그 문서에서 애매
+    했다는 뜻) 그 라벨은 통째로 버린다. 어느 쪽이 맞는지 모르면서 하나를
+    골라 답하면 근거 없이 숫자를 지어내는 것과 같다. 라벨을 아예 못 읽은
+    항목(label=None, 106건)도 같은 이유로 안 쓴다."""
+    global _FEE_BREAKDOWN_CACHE
+    if _FEE_BREAKDOWN_CACHE is not None:
+        return _FEE_BREAKDOWN_CACHE
+    out = {}
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            records = json.load(f)
+        for r in records:
+            values, bad = {}, set()
+            for item in r.get("fee_breakdown") or []:
+                label, v = item.get("label"), item.get("value")
+                if label not in _BREAKDOWN_LABELS or v is None:
+                    continue
+                if label in values and values[label] != v:
+                    bad.add(label)
+                else:
+                    values[label] = v
+            for label in bad:
+                values.pop(label, None)
+            if values:
+                out[(r["product_code"], r["class_code"])] = values
+    _FEE_BREAKDOWN_CACHE = out
+    return out
 
 # 답변에 펼쳐 보일 클래스 줄 수. 열몇 개를 다 늘어놓으면 고객이 못 읽는다.
 MAX_CLASS_LINES = 5
@@ -25,6 +77,12 @@ MAX_CLASS_LINES = 5
 # 수익률을 같이 묻는 경우가 흔하다).
 INTENT_KEYWORDS = {
     "fee": ("총보수", "보수", "수수료", "비용", "판매보수", "얼마나 떼", "비싸", "싸"),
+    # "총보수"(fee)와 겹쳐서 항상 같이 걸린다 - 의도적이다. "운용보수
+    # 얼마야?"에 총보수 범위만 답하고 정작 물어본 세부 항목(운용보수
+    # 그 자체)은 답 어디에도 없던 게 갭이었다(220문항 테스트셋
+    # 38~41/48번). fee 블록은 그대로 두고 이 블록이 세부 내역만 더 낸다.
+    "fee_breakdown": ("운용보수", "신탁보수", "사무관리", "기타비용",
+                      "거래비용", "총보수비용", "보수비용", "비용비율"),
     "return": ("수익률", "성과", "얼마나 벌", "수익", "실적", "올랐", "떨어졌"),
     # "작년에 얼마 벌었어?" - 연평균(누적)과 다른 값이라 따로 낸다.
     "yearly": ("작년", "재작년", "해마다", "연도별", "년도별", "매년", "해별",
@@ -238,19 +296,73 @@ def product_facts(code, class_code=None, intents=None, db_path=DEFAULT_DB_PATH):
         meaning = _meaning_for(conn, code)
         charges = _charges_for(conn, code)
 
+        fee_shown = []
         if "fee" in intents or "cost_projection" in intents:
             fees = _classes_for(conn, code, class_code)
             if not fees:
                 lines.append("  보수: 해당 클래스 정보를 찾지 못했습니다.")
             else:
-                fee_lines, shown = _fee_lines(fees, meaning)
+                fee_lines, fee_shown = _fee_lines(fees, meaning)
                 lines.extend(fee_lines)
                 as_of = next((f.get("as_of") for f in fees if f.get("as_of")), None)
                 if as_of:
                     lines.append(f"    (작성 기준일 {as_of})")
-                for f in shown:
+                for f in fee_shown:
                     ev.append({"table": "class_fees", "product_code": code,
                                "class_code": f["class_code"], "page": f.get("page")})
+
+        if "fee_breakdown" in intents:
+            # "fee" 의도가 이미 뽑아 둔 클래스 목록을 그대로 쓴다 - "운용보수"도
+            # "보수"를 포함해서 항상 "fee"와 같이 걸리므로 보통 비어 있지
+            # 않다. 혹시 비어 있으면(단독으로만 걸린 드문 경우) 새로 조회한다.
+            bd_classes = fee_shown or [
+                f for f in _classes_for(conn, code, class_code)
+                if (meaning.get(f["class_code"]) or {}).get("retail")]
+            breakdown = _load_fee_breakdown()
+            per_class = []
+            for f in bd_classes:
+                vals = breakdown.get((code, f["class_code"]))
+                if vals:
+                    per_class.append((f["class_code"], vals))
+                    ev.append({"table": "class_fees.fee_breakdown",
+                               "product_code": code, "class_code": f["class_code"]})
+            if not per_class:
+                lines.append("  [보수 세부 내역] 운용보수·신탁보수 등 세부 항목은 "
+                             "문서에서 확인하지 못했습니다.")
+            else:
+                # 운용보수/신탁보수/일반사무관리회사보수는 클래스별로 갈리는
+                # 판매 방식이 아니라 펀드 전체에서 걷는 몫이라 클래스마다
+                # 달라질 이유가 없다(실측: 조회된 클래스 전부 동일). 값
+                # 조합이 하나뿐이면 클래스마다 반복해서 늘어놓지 않고
+                # 한 번만 말한다. 실제로 클래스별로 갈리는 문서가 있으면
+                # (조합이 둘 이상) 그때만 클래스별로 나눠 보인다.
+                combos = {tuple(sorted(v.items())) for _cc, v in per_class}
+                if len(combos) == 1:
+                    vals = per_class[0][1]
+                    parts = [f"{_BREAKDOWN_LABELS[k]} {vals[k]}%"
+                             for k in _BREAKDOWN_ORDER if k in vals]
+                    lines.append("  [보수 세부 내역] (모든 클래스 공통)")
+                    lines.append("    - " + ", ".join(parts))
+                else:
+                    lines.append("  [보수 세부 내역] (클래스별로 다릅니다)")
+                    for cc, vals in per_class[:MAX_CLASS_LINES]:
+                        parts = [f"{_BREAKDOWN_LABELS[k]} {vals[k]}%"
+                                 for k in _BREAKDOWN_ORDER if k in vals]
+                        lines.append(f"    - {_label(cc, meaning)}: "
+                                     + ", ".join(parts))
+
+            # 총보수비용(total_fee_and_cost)은 총보수(total_fee)와 다른
+            # 숫자다(기타비용까지 합친 값) - 헷갈리기 쉬운 자리라 이름을
+            # 명시하고 총보수와 나란히 안 섞이게 별도 줄로 낸다.
+            tfc = [(f["class_code"], f.get("total_fee_and_cost")) for f in bd_classes
+                   if f.get("total_fee_and_cost") is not None]
+            if tfc:
+                lines.append("  [총보수비용] (총보수에 기타비용 등을 더한 값 - "
+                             "총보수와 같은 숫자가 아닙니다)")
+                for cc, v in tfc[:MAX_CLASS_LINES]:
+                    lines.append(f"    - {_label(cc, meaning)}: {v}%")
+                    ev.append({"table": "class_fees", "product_code": code,
+                               "class_code": cc})
 
         if "redemption" in intents:
             # 값을 문장 그대로 담아 둔 이유가 여기서 드러난다. "90일미만

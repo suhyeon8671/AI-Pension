@@ -285,7 +285,7 @@ def answer_payload(question_id: str, question: str) -> dict:
     # 정확히 뽑아 두었다.
     if len(product_codes) == 1:
         intents = detect_intents(question)
-        if set(intents) & {"fee", "return", "risk", "aum", "cost_projection"}:
+        if set(intents) & {"fee", "return", "risk", "aum", "cost_projection", "fee_breakdown"}:
             code = product_codes[0]
             summary, ev = product_facts(code, find_class_code(question), intents)
             answer, how = compose_answer(question, summary, summary)
