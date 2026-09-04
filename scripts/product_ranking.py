@@ -154,7 +154,7 @@ def detect(question):
     has_return_kw = any(w in qn for w in ("수익률", "성과", "수익"))
     has_fee_kw = ("총보수" in qn or "보수" in qn or "수수료" in qn) and fee_filter is None
     has_aum_kw = any(w in qn for w in ("설정액", "순자산", "규모", "자산총액"))
-    has_risk_kw = ("위험등급" in qn or "위험" in qn) and risk_filter is None
+    has_risk_kw = (any(w in qn for w in ("위험등급", "위험", "안전")) and risk_filter is None)
 
     if has_return_kw and rank_signal:
         sort_metric = "return"
@@ -171,7 +171,20 @@ def detect(question):
         sort_direction = _direction(qn, default="desc")
     elif has_risk_kw and rank_signal:
         sort_metric = "risk"
-        sort_direction = _direction(qn, default="asc")
+        # 위험등급 숫자와 실제 위험 정도는 방향이 반대다(1등급이 가장
+        # 위험, 등급 숫자가 클수록 안전 - 실측: 100% 주식형인 "미래에셋
+        # 코어테크"가 1등급, 단기채권형이 6등급). "등급"이 붙은 표현은
+        # 등급 숫자 자체를 묻는 것이라 숫자 오름차순이 "낮은 순"이 맞다.
+        # 하지만 "위험도가 가장 낮은 상품"/"가장 안전한 상품"처럼 "등급"
+        # 없이 실제 위험을 묻는 표현은 그 반대다 - 그대로 오름차순을
+        # 쓰면 "가장 안전한 상품"을 물었는데 가장 위험한(1등급) 상품을
+        # 돌려주는 정반대의 오답이 된다(실측 재현: "위험도가 가장 낮은
+        # 상품은?"이 위험등급 1등급 상품을 답했었다).
+        if "등급" in qn:
+            sort_direction = _direction(qn, default="asc")
+        else:
+            wants_safe = "안전" in qn or any(w in qn for w in LOW_WORDS)
+            sort_direction = "desc" if wants_safe else "asc"
 
     if sort_metric is None and risk_filter is None and fee_filter is None:
         return None
@@ -346,6 +359,13 @@ def rank_products(conditions, db_path=DEFAULT_DB_PATH, named_codes=None):
             cond_bits.append(f"정렬: {metric_label} {'낮은' if not reverse else '높은'} 순")
         lines.append("■ 조건: " + (", ".join(cond_bits) if cond_bits else "(없음)"))
         lines.append(f"  조건에 맞는 상품 {total_matched}개 중 {len(codes)}개 표시")
+        if metric == "risk" or conditions["risk_filter"] is not None:
+            # LLM이 이 근거만 보고 "6등급이 제일 위험하다"처럼 등급 방향을
+            # 거꾸로 답하지 않도록, 방향을 매번 근거에 직접 적는다 - LLM이
+            # 이 도메인 상식을 스스로 알고 있다고 기대하지 않는다.
+            lines.append("  (참고: 위험등급은 숫자가 작을수록 위험이 크고 "
+                         "1등급이 가장 위험합니다. 숫자가 큰 등급일수록 "
+                         "안전한 편입니다)")
 
         evidence = []
         if not codes:
