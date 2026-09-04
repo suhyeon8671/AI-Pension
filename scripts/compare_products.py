@@ -24,6 +24,8 @@ import sqlite3
 # 된다. 구조화 DB 조회는 벡터 검색과 무관하므로 끊어 둔다.
 from product_lookup import PRODUCT_CODE_RE  # noqa: E402
 from build_product_facts_db import DEFAULT_DB_PATH
+from product_facts import (  # noqa: E402
+    _return_caveat, _is_known_source_error, KNOWN_SOURCE_ERROR_NOTE)
 
 # 나란히 견줄 조건 줄 수. 조건마다 상품 수만큼 줄이 늘어난다.
 MAX_COMPARE_CONDITIONS = 2
@@ -203,7 +205,9 @@ def compare_products(product_codes, db_path=DEFAULT_DB_PATH, fields=None):
                              if r[col] is not None]
                     if got_r:
                         bits.append("수익률 " + ", ".join(
-                            f"{lbl} {x}%" for lbl, x in got_r))
+                            f"{lbl} {x}%{_return_caveat(x)}" for lbl, x in got_r))
+                        if _is_known_source_error(code, cc):
+                            bits.append(KNOWN_SOURCE_ERROR_NOTE)
                 lines.append(" | ".join(bits))
                 evidence.append({"product_code": code, "type": "class_fees",
                                  "class_code": cc})

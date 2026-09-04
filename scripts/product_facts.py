@@ -266,6 +266,55 @@ def _fee_lines(fees, meaning):
     return lines, shown
 
 
+# verify_data.check_returns_range와 같은 기준(-100%~500%)을 그대로
+# 쓴다. 다만 이 범위만으로는 못 잡는 오류도 있다 - KR5131420025의
+# class C는 연도별 수익률표(최근2년차 3,260.76%)뿐 아니라 연평균
+# 수익률표(최근2년 469.56%, 최근3년 226.05%, 최근5년 99.93%, 설정후
+# 45.30%)까지 두 표 모두에서 형제 클래스들(전부 한 자릿수)과 동떨어진
+# 값이다. 원본 PDF의 글자 좌표까지 직접 확인했지만 추출 버그가 아니라
+# 원본 문서 자체의 오류였다(같은 행의 비교지수도 다른 클래스들의
+# 비교지수와 다르다 - 문서 제작 과정에서 이 클래스 행 전체가 다른
+# 버전에서 잘못 옮겨진 것으로 보인다). 추출 버그가 아니므로 임의로
+# 고치지 않는다(근거에 없는 숫자로 "정정"하면 그것도 지어내는 것과
+# 같다) - 대신 값은 원문 그대로 내보내되, 상식 밖이면 그렇다고 밝혀서
+# 사실처럼 보이지 않게 한다. 나머지 4개 항목(최근5년/최근3년의 일부
+# 등)은 범위 안에 들어와 있어도, 같은 행 전체가 이미 의심스러우므로
+# 이 클래스는 통째로 확인 대상으로 둔다.
+SANE_RETURN_RANGE = (-100.0, 500.0)
+
+# 사람이 원본 PDF까지 직접 확인해서 "추출 버그가 아니라 문서 자체의
+# 오류"라고 판정한 (상품코드, 클래스코드). 새로 추가할 때는 반드시
+# PDF 원문 좌표 확인 후 왜 추출 버그가 아닌지 근거를 남긴다 - 확인
+# 없이 이 목록에 넣으면 진짜 추출 버그를 "원본 문제"로 덮어버릴 위험이
+# 있다.
+_KNOWN_SOURCE_ERRORS = {
+    ("KR5131420025", "C"),
+}
+
+
+def _is_known_source_error(product_code, class_code):
+    return (product_code, class_code) in _KNOWN_SOURCE_ERRORS
+
+
+# 확인된 원본 오류 클래스(_KNOWN_SOURCE_ERRORS)는 한 줄에 값이 여러 개
+# 나오는데, 숫자마다 이 문구를 반복하면 못 읽는 답이 된다(실측: 값
+# 5개짜리 한 줄이 문구 5번 반복으로 화면을 채움) - 그 클래스를 보여줄
+# 때 한 번만 달아 준다(_yearly/_return 블록 참고). 여기서는 범위 밖
+# 숫자에만 개별로 꼬리말을 붙인다.
+KNOWN_SOURCE_ERROR_NOTE = ("(참고: 이 클래스는 문서 자체에 오류로 보이는 "
+                           "값이 섞여 있어 참고용으로만 보시기 바랍니다)")
+
+
+def _return_caveat(v):
+    """수익률 값이 상식 밖이면 붙일 꼬리말(개별 숫자용). 정상이면 빈 문자열."""
+    if v is None:
+        return ""
+    lo, hi = SANE_RETURN_RANGE
+    if lo <= v <= hi:
+        return ""
+    return "(문서 원문 그대로의 수치이나 상식적인 범위를 크게 벗어나 확인이 필요합니다)"
+
+
 def _benchmark_for(conn, code):
     r = conn.execute(
         "SELECT * FROM class_returns WHERE product_code = ? AND row_kind = 'benchmark' LIMIT 1",
@@ -421,9 +470,12 @@ def product_facts(code, class_code=None, intents=None, db_path=DEFAULT_DB_PATH):
                              and (meaning.get(c) or {}).get("retail")),
                             next(iter(by_class)))
                 lines.append(f"  [연도별 수익률] {_label(pick, meaning)} 기준")
+                if _is_known_source_error(code, pick):
+                    lines.append(f"    {KNOWN_SOURCE_ERROR_NOTE}")
                 for r in by_class[pick]:
+                    caveat = _return_caveat(r["return_pct"])
                     lines.append(f"    - 최근 {r['year_rank']}년차"
-                                 f"({r['period']}): {r['return_pct']}%")
+                                 f"({r['period']}): {r['return_pct']}%{caveat}")
                     ev.append({"table": "yearly_returns", "product_code": code,
                                "class_code": pick, "page": r["page"]})
                 if len(by_class) > 1:
@@ -489,8 +541,10 @@ def product_facts(code, class_code=None, intents=None, db_path=DEFAULT_DB_PATH):
                            if r.get(col) not in (None, "")]
                     if not got:
                         continue
-                    txt = ", ".join(f"{lbl} {v}" for lbl, v in got)
-                    lines.append(f"    - {r['class_code']}: {txt}")
+                    txt = ", ".join(f"{lbl} {v}{_return_caveat(v)}" for lbl, v in got)
+                    note = (f" {KNOWN_SOURCE_ERROR_NOTE}"
+                            if _is_known_source_error(code, r["class_code"]) else "")
+                    lines.append(f"    - {r['class_code']}: {txt}{note}")
                     ev.append({"table": "class_returns", "product_code": code,
                                "class_code": r["class_code"], "page": r.get("page")})
                 bm = _benchmark_for(conn, code)
