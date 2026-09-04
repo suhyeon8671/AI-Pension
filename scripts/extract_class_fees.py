@@ -2619,6 +2619,127 @@ def enrich_with_transposed_fee_table(doc_id, existing_rows):
     return existing_rows + new_rows
 
 
+# 전환 후 표 제목("[운용전환일부터 해지일까지]")만 걸러 낸다 - 전환 전
+# 제목("[최초설정일부터 운용전환일 전일까지]")은 "전일까지"로 끝나고
+# 전환 후 제목은 "해지일까지"로 끝나 겹치지 않는다.
+POST_CONVERSION_MARKER_RE = re.compile(r"해지일까지")
+
+
+def _fill_transposed_after_conversion(doc_id, rows):
+    """운용전환 전후로 뒤집힌 보수표가 통째로 두 번 나오는 문서가 있다
+    (KR5147430065 - "목표전환형" 펀드, 전수 조사 기준 이 상품 하나뿐).
+    요약표("가.")에 있는 A/C/Ae/Ce는 전환 전/후 값이 한 행에 같이 있어
+    total_fee_after_conversion 등이 이미 채워지는데, 뒤집힌 상세표에만
+    있는 클래스(AG/CI/CG/CW/C-P/C-Pe/C-P2/C-Pe2)는 enrich_with_
+    transposed_fee_table이 요약표 클래스로 검증하는 첫 번째 표("[최초
+    설정일부터 운용전환일 전일까지]")만 만들고, 바로 뒤에 이어지는 두
+    번째 표("[운용전환일부터 해지일까지]")는 요약표에 없는 클래스뿐이라
+    검증 기준이 없어 통째로 못 읽는다 - 전환후 필드가 죄다 빈다.
+
+    500줄짜리 그 함수를 다시 고치는 대신, 별도의 좁은 후처리로 채운다.
+    "전환 전"/"전환 후" 어느 표인지는 값 대조가 아니라, 문서에 그대로
+    찍혀 있는 표 제목("[최초설정일부터 운용전환일 전일까지]"/"[운용
+    전환일부터 해지일까지]")으로 가른다 - 이미 total_fee_after_
+    conversion이 있는 클래스(A/C/Ae/Ce)만 정답지로 쓰면, 그 네 클래스가
+    아예 안 나오는 열 묶음(CG/CW/C-P/C-Pe/C-P2/C-Pe2)은 대조할 수단이
+    없어 전환 전/후를 구분 못 한다(실측:가장 처음 시도에서 이 표기가
+    없어 전환 "전" 값을 전환 "후" 필드에 잘못 채웠었다). 표 제목은
+    문서 전체에 걸쳐 이 두 문구만 번갈아 나오므로, 그 위치(y좌표)를
+    지나칠 때마다 "지금부터는 전환 후 구간"으로 상태를 넘기면 어느
+    클래스 열 묶음이든 안전하게 가른다. 기존 행의 다른 필드는 절대
+    건드리지 않는다(이미 값이 있으면 건너뜀)."""
+    if not any(r.get("total_fee_after_conversion") for r in rows
+               if r.get("class_code")):
+        return rows
+    by_code = {r["class_code"]: r for r in rows if r.get("class_code")}
+    if not any(r.get("total_fee") and not r.get("total_fee_after_conversion")
+               for r in rows if r.get("class_code")):
+        return rows
+    pdfs = glob.glob(os.path.join(DATA_DIR, doc_id, "*.pdf"))
+    if not pdfs:
+        return rows
+
+    def x0s_match(a, b, tol=2):
+        return len(a) == len(b) and all(abs(x - y) <= tol for x, y in zip(a, b))
+
+    filled = 0
+    is_post = False  # 문서 맨 앞은 항상 "전환 전" 구간에서 시작한다
+    carry = None  # (codes, value_cols, col_x0s) - 바로 앞 덩이의 구성(페이지 경계로 갈린 항목 행 이어받기용)
+    with pdfplumber.open(pdfs[0]) as pdf:
+        for page_num, header_rows, grid_rows, col_x0s in _detail_fee_grids(pdf):
+            page = pdf.pages[page_num - 1]
+            # 표 제목("[...전일까지]"/"[...해지일까지]")이 한 페이지
+            # 안에 여러 번(전환전 표 꼬리 + 전환후 표 시작) 나올 수
+            # 있다(KR5147430065 34쪽 실측) - y좌표 순으로 모아 둔다.
+            markers = sorted(
+                (w["top"], bool(POST_CONVERSION_MARKER_RE.search(w["text"])))
+                for w in page.extract_words(x_tolerance=2, keep_blank_chars=False)
+                if "전일까지" in w["text"] or "해지일까지" in w["text"])
+            marker_idx = 0
+            blocks = _transposed_blocks(grid_rows)
+            prev_bottom = (min(h["top"] for h in header_rows) - 1
+                           if header_rows else None)
+            for block in blocks:
+                by_field = {f: r for f, r in block if f}
+                top = prev_bottom if prev_bottom is not None else block[0][1]["top"] - 120
+                data_top = block[0][1]["top"] - 1
+                prev_bottom = block[-1][1]["bottom"]
+                while marker_idx < len(markers) and markers[marker_idx][0] <= data_top:
+                    is_post = markers[marker_idx][1]
+                    marker_idx += 1
+                if "total_fee" in by_field:
+                    code_line, _ = _code_line_in_band(page, top, data_top, col_x0s)
+                    codes = [c for _x, c, _t in code_line]
+                    value_cols = sorted(
+                        ci for ci, v in by_field["total_fee"]["cells"].items()
+                        if ci and DECIMAL_RE.match(v.replace(" ", "")) and "%" not in v)
+                    if codes and len(codes) == len(value_cols):
+                        carry = (codes, value_cols, col_x0s)
+                    else:
+                        carry = None
+                elif carry and x0s_match(col_x0s, carry[2]):
+                    # "총 보수" 행이 없는 덩이(이 페이지엔 판매회사보수/
+                    # 총보수·비용/동종유형 항목만 있는 이어지는 표)라도,
+                    # 칸 x좌표 구성이 방금 확인된 덩이와 같으면(같은
+                    # 물리적 표가 페이지 경계에서 이어지는 것) 그
+                    # codes/value_cols를 그대로 물려 쓴다(KR5147430065
+                    # 34/35쪽 실측: "총 보수" 행은 34쪽에, "총보수·비용"/
+                    # "동종유형 총보수" 행은 35쪽 맨 위 이어지는 덩이에
+                    # 떨어져 있다).
+                    codes, value_cols = carry[0], carry[1]
+                else:
+                    continue
+                if not is_post:
+                    continue
+                for src_field, dst_field in (
+                        ("total_fee", "total_fee_after_conversion"),
+                        ("distribution_fee", "distribution_fee_after_conversion"),
+                        ("total_fee_and_cost", "total_fee_and_cost_after_conversion"),
+                        ("peer_avg_fee", "peer_avg_fee_after_conversion")):
+                    src_row = by_field.get(src_field)
+                    if src_row is None:
+                        continue
+                    for code, vc in zip(codes, value_cols):
+                        r = by_code.get(code)
+                        if r is None or r.get(dst_field):
+                            continue
+                        v = src_row["cells"].get(vc)
+                        if not v:
+                            continue
+                        r[dst_field] = v
+                        if dst_field == "total_fee_after_conversion":
+                            r.setdefault("fee_period",
+                                         "최초설정일부터 운용전환일 전일까지")
+                            r.setdefault("field_source_pages", {})[
+                                "total_fee_after_conversion"] = page_num
+                            pages = r.setdefault(
+                                "source_pages", [r.get("page", page_num)])
+                            if page_num not in pages:
+                                pages.append(page_num)
+                            filled += 1
+    return rows
+
+
 def _remap_columns(carry, col_x0s, tol=8):
     """앞 페이지에서 검증된 열 번호를 이 페이지의 열 번호로 옮긴다.
 
@@ -5025,6 +5146,16 @@ def _backfill_from_value_sources(rows):
                     r[field] = s["value"]
                     r.setdefault("field_source_pages", {}).setdefault(
                         field, s["page"])
+                    # field_source_pages엔 이 값을 읽은 페이지가 남는데
+                    # source_pages(이 행 전체의 근거 페이지 목록)엔 안
+                    # 더해지는 문서가 있었다(KR5153420022 실측:
+                    # field_source_pages.total_fee_and_cost=27인데
+                    # source_pages=[3,14]로 27이 빠짐) - 근거 페이지를
+                    # 보여줄 때 실제로 값을 읽은 페이지가 목록에서
+                    # 통째로 빠지는 문제였다.
+                    pages = r.setdefault("source_pages", [r["page"]])
+                    if s["page"] not in pages:
+                        pages.append(s["page"])
                     break
     return rows
 
@@ -5135,6 +5266,15 @@ def main():
         rows = enrich_with_transposed_fee_table(doc_id, rows)
         if len(rows) > before:
             detail_enriched += 1
+        # 운용전환 전/후로 뒤집힌 상세표가 통째로 두 번 나오는 문서는
+        # 위 enrich_with_transposed_fee_table이 (요약표로 검증되는)
+        # 전환 "전" 표만 읽고 전환 "후" 표는 못 읽는다.
+        rows = _fill_transposed_after_conversion(doc_id, rows)
+        if any("total_fee_after_conversion" in r for r in rows):
+            nav_price = conversion_trigger_nav_price(doc_id)
+            for r in rows:
+                if "total_fee_after_conversion" in r:
+                    r.setdefault("conversion_trigger_nav_price", nav_price)
         # "나" 상세표 보강으로 새로 생긴 클래스들의 sales_commission_desc
         # null을 "가.투자자에게 직접 부과되는 수수료" 표에서 채운다(확실한
         # "없음"만 - 위 enrich_sales_commission_from_ga_table 주석 참고).
