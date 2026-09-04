@@ -1644,21 +1644,38 @@ def _coord_fee_table_page(page, known_codes, carry=None):
         # 첫 줄("수수료선취-" 등)을 만나면, 그게 앞 클래스가 끝났다는
         # 신호다 - 이번 줄 내용이 앞 클래스 몫으로 섞이기 전에 먼저
         # 확정한다.
-        if pending_bare and re.fullmatch(r"\([가-힣]+\)", line_text):
+        if pending_bare:
             # 코드 자체가 두 조각으로 쪼개져 몇 줄 사이를 두고
             # 떨어져 나오는 문서가 있다(우리자산운용 KR5118201004
             # 실측: "S-P"가 먼저 알몸으로 나오고, 몇 줄 뒤(그 사이에
             # "가입한 자로서 퇴직연금" 등 가입자격 설명이 낀다)에
             # "(퇴직)"만 홀로 한 줄을 차지해 "S-P(퇴직)"를 완성한다 -
             # "S-P"도 그 자체로 이미 유효한 별개 코드라 여기서 코드가
-            # 끝났다고 오판하면 안 된다). 이번 줄이 "(한글)" 모양
-            # 하나뿐이고 지금 들고 있는 pending_bare 뒤에 그대로
-            # 붙였을 때 known과 맞는 코드가 되면, 새 블록이 아니라
-            # 코드 마무리로 본다 - 이 줄 자체는 버리고(가입자격 등
-            # 다른 용도가 아니라 코드 조각이므로) 다음 줄로 넘어간다.
-            if pending_bare + line_text in known_codes:
-                pending_bare = pending_bare + line_text
-                continue
+            # 끝났다고 오판하면 안 된다).
+            #
+            # "(퇴직)" 조각이 완전히 빈 줄을 혼자 차지하는 문서도 있지만
+            # (KR5118201004), 이름표 칸에는 "(퇴직)"만 있고 같은 줄
+            # 가입자격 칸에는 벌써 다음 문장이 이어지는 문서도 있다
+            # (신영자산운용 KR5118420036 실측: "(퇴직) 자퇴직급여보장법에
+            # 의한 퇴직연금가입..."이 한 줄에 같이 찍힌다). line_text
+            # (줄 전체)로 fullmatch를 걸면 이 경우 가입자격 글자가 덧붙어
+            # 있어 매치가 안 돼 "(퇴직)"를 영영 못 잇는다 - known_codes에
+            # 없는 새 가짜 코드 "S-P"만 남고 실제 클래스는 사라진다.
+            # 이름표 칸(label_boundary보다 왼쪽) 글자만 따로 봐서, 그
+            # 쪽만 "(한글)" 모양이면(오른쪽 가입자격 글자는 무관하게)
+            # 코드 조각으로 받는다.
+            label_only = _squash("".join(
+                w["text"] for w in line if w["x0"] < label_boundary))
+            if (re.fullmatch(r"\([가-힣]+\)", label_only)
+                    and pending_bare + label_only in known_codes):
+                pending_bare = pending_bare + label_only
+                # 이 줄의 나머지(가입자격 칸에 이미 이어지는 문장)는
+                # 코드가 아니라 진짜 내용이니 버리면 안 된다 - 아래
+                # 본문 처리로 그대로 흘려보낸다(continue하지 않는다).
+                line = [w for w in line if w["x0"] >= label_boundary]
+                if not line:
+                    continue
+                line_text = _squash("".join(w["text"] for w in line))
         # 코드가 이름표 "앞"에 붙고 그 뒤에 설명이 이어지는 문서도
         # 있다 - 괄호로 싼 경우(신영자산운용 KR5125450023 실측:
         # "A(수수료선취-오프라인)")도 있고, 괄호 없이 코드 바로 뒤에
