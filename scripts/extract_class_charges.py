@@ -2077,85 +2077,91 @@ def extract(db_path=DEFAULT_DB_PATH):
                 merged[cc] = {"front_load_fee": "없음", "back_load_fee": "없음",
                                "redemption_fee": "없음", "switch_fee": "없음"}
                 pages[cc] = no_direct_fee_page
-        for cc, rec in sorted(merged.items()):
-            # 표가 페이지 경계나 줄바꿈으로 갈리면서 코드 글자 일부가
-            # 잘려 나가는 표가 있다(KR5127420034 실측: "C-퇴직연금"의
-            # 마지막 글자 "금"이 다른 셀로 떨어져 나가 "C-퇴직연"이라는
-            # 존재하지 않는 코드가 하나 더 생긴다 - 서로 다른 표(가입자격
-            # 표/보수표)에서 각각 한 번씩 잘려서, 값까지 똑같지는 않고
-            # 칸이 서로 다르게 채워져 있을 수 있다). known_codes
-            # (class_fees.json에 이미 확인된 코드)에 없다고 무조건
-            # 버리면 안 된다 - 대소문자·붙임표만 다른 진짜 표기 차이도
-            # known_codes엔 없다(KR5110501016 실측: "Ae"는 known_codes엔
-            # "A-E"만 있지만 실제로 존재하는 별개 표기다). known 코드
-            # 하나가 이 코드로 시작하거나 이 코드가 known 코드로
-            # 시작하면(글자가 잘렸을 때만 나오는 모양) 잘린 쪽일 가능성이
-            # 커서, 버리지 않고 그 known 코드 쪽에 빈 칸만 채워 합친다 -
-            # 잘린 쪽에만 있던 정보(위 실측: 가입자격 '퇴직연금용')를
-            # 잃지 않으면서 가짜 코드도 안 남긴다.
-            if known_codes and cc not in known_codes:
-                # 잘림은 글자 한두 개가 떨어져 나가는 것뿐이다 - cc가
-                # known 코드의 순수 접두사(cc로 시작하되 cc보다 김)이면서
-                # 길이 차이가 작을 때만 후보로 본다. "cc가 다른 known
-                # 코드로 시작한다"(반대 방향)는 안 쓴다 - "C-퇴직연"은
-                # "C"로 시작하지만 "C"는 이 상품에 실제로 있는 별개의
-                # 완결된 클래스라 그쪽으로 합치면 안 된다. 후보가 여럿
-                # 이면(예: C-퇴직연 -> C-퇴직연금 외에 C-퇴직e도 앞 세
-                # 글자까지는 같다) 길이 차이가 가장 작은 쪽을 고른다.
-                candidates = [k for k in known_codes
-                              if k != cc and k.startswith(cc)
-                              and len(k) - len(cc) <= 3]
-                target = min(candidates, key=len) if candidates else None
-                if not target:
-                    # 반대 방향으로 잘리는 표도 있다 - 코드 칸이 줄바꿈으로
-                    # 두 줄에 걸쳐 있어서 앞쪽 글자("C-")가 다른 셀로
-                    # 떨어져 나가고 뒤쪽 조각("P2e")만 이 행의 코드로
-                    # 잡히는 경우다(KR514X450008 실측: "C-P2e"의 앞
-                    # 두 글자가 떨어져 나가 "P2e"라는 존재하지 않는 코드가
-                    # 하나 더 생겼다). known 코드가 cc로 "끝나면"(cc가
-                    # 순수 접미사) 잘린 뒤쪽 조각일 가능성이 커서 그
-                    # known 코드 쪽에 합친다.
-                    suffix_candidates = [k for k in known_codes
-                                         if k != cc and k.endswith(cc)
-                                         and len(k) - len(cc) <= 3]
-                    target = min(suffix_candidates, key=len) if suffix_candidates else None
-                if not target:
-                    # 대소문자만 다른 표기도 있다(KR514X450008 실측:
-                    # "C-pe"가 이 표에서만 소문자로 찍히는데 정식 표기는
-                    # "C-Pe" - class_meaning/class_fees가 아는 진짜 클래스와
-                    # 같은 것이다. 별개 코드로 남기면 같은 클래스가 두
-                    # 줄로 중복된다).
-                    ci_candidates = [k for k in known_codes
-                                     if k != cc and k.lower() == cc.lower()]
-                    target = ci_candidates[0] if len(ci_candidates) == 1 else None
-                if not target:
-                    # 붙임표(-) 유무만 다른 표기도 있다(KR5123490013 실측:
-                    # 이 표(가입자격·수수료율)는 "A-e"/"C-e"인데 class_fees가
-                    # 아는 정식 표기는 "Ae"/"Ce" - 표마다 붙임표를 넣거나
-                    # 빼는 게 이 문서만의 습관이다). 이걸 반영 안 하면 위
-                    # 셋(접두/접미 잘림, 대소문자) 어디에도 안 걸려서
-                    # "Class"/"No" 같은 진짜 가짜 코드와 똑같이 버려지는데,
-                    # 이건 표기만 다른 진짜 클래스라 잃으면 안 된다.
-                    dash_candidates = [k for k in known_codes
-                                       if k != cc and k.replace("-", "") == cc.replace("-", "")]
-                    target = dash_candidates[0] if len(dash_candidates) == 1 else None
-                if target:
-                    tgt_rec = merged.setdefault(target, {})
-                    for k2, v2 in rec.items():
-                        if v2 and not tgt_rec.get(k2):
-                            tgt_rec[k2] = v2
-                    continue
-                # 위 세 갈래(접두/접미 잘림, 대소문자) 어디에도 안 걸리면
-                # 이 상품의 진짜 클래스가 아닐 가능성이 크다 - 표 헤더
-                # 글자("Class"/"No" 같은 열 이름)가 데이터 행으로 잘못
-                # 읽힌 경우가 실측됐다(KR5144420020/KR5156450026/
-                # KR555202013M의 "Class", KR514X450008의 "No" - 전부
-                # 보수 및 비용 표의 열 머리글 "명칭(Class)"/번호열
-                # "No."가 가입자격 표 파서에 잘못 걸린 것으로 확인).
-                # known_codes(class_fees.json이 이미 검증한 이 상품의
-                # 진짜 클래스 목록)에 전혀 없는 코드는 근거로 못 쓰므로
-                # 버린다 - 있는 척 답에 내보내는 것보다 빼는 게 안전하다.
+        # known_codes에 없는 표기를 정식 코드로 합쳐 넣는다. 표가 페이지
+        # 경계나 줄바꿈으로 갈리면서 코드 글자 일부가 잘려 나가는 표가
+        # 있다(KR5127420034 실측: "C-퇴직연금"의 마지막 글자 "금"이 다른
+        # 셀로 떨어져 나가 "C-퇴직연"이라는 존재하지 않는 코드가 하나 더
+        # 생긴다). known_codes(class_fees.json이 이미 확인한 코드)에
+        # 없다고 무조건 버리면 안 된다 - 대소문자·붙임표만 다른 진짜
+        # 표기 차이도 known_codes엔 없다(KR5110501016 실측: "Ae"는
+        # known_codes엔 "A-E"만 있지만 실제로 존재하는 별개 표기다).
+        #
+        # 이 병합은 반드시 아래 "for cc, rec in sorted(merged.items())"
+        # 출력 루프보다 먼저, merged 자체를 직접 고쳐 끝내야 한다(실측
+        # 회귀: 예전엔 이 병합을 출력 루프 안에서 했는데, 그 루프가
+        # `sorted(merged.items())`로 미리 통째로 스냅샷을 떠 버려서,
+        # 병합 대상 코드(target)가 그 시점까지 merged에 없던 새 키면
+        # `merged.setdefault(target, {})`로 새로 생겨도 이미 떠 둔
+        # 스냅샷엔 없어 출력 루프가 그 키를 아예 못 봤다 - 즉 "Ae" 같은
+        # 표기가 삭제만 되고 정식 표기 "A-e"로는 끝내 안 나갔다. 여기서
+        # merged 자체를 직접 고치면 그 다음에 뜨는 스냅샷엔 병합된 결과가
+        # 이미 반영돼 있다.
+        for cc in list(merged.keys()):
+            if not (known_codes and cc not in known_codes):
                 continue
+            rec = merged[cc]
+            # 잘림은 글자 한두 개가 떨어져 나가는 것뿐이다 - cc가
+            # known 코드의 순수 접두사(cc로 시작하되 cc보다 김)이면서
+            # 길이 차이가 작을 때만 후보로 본다. "cc가 다른 known
+            # 코드로 시작한다"(반대 방향)는 안 쓴다 - "C-퇴직연"은
+            # "C"로 시작하지만 "C"는 이 상품에 실제로 있는 별개의
+            # 완결된 클래스라 그쪽으로 합치면 안 된다. 후보가 여럿
+            # 이면(예: C-퇴직연 -> C-퇴직연금 외에 C-퇴직e도 앞 세
+            # 글자까지는 같다) 길이 차이가 가장 작은 쪽을 고른다.
+            candidates = [k for k in known_codes
+                          if k != cc and k.startswith(cc)
+                          and len(k) - len(cc) <= 3]
+            target = min(candidates, key=len) if candidates else None
+            if not target:
+                # 반대 방향으로 잘리는 표도 있다 - 코드 칸이 줄바꿈으로
+                # 두 줄에 걸쳐 있어서 앞쪽 글자("C-")가 다른 셀로
+                # 떨어져 나가고 뒤쪽 조각("P2e")만 이 행의 코드로
+                # 잡히는 경우다(KR514X450008 실측: "C-P2e"의 앞
+                # 두 글자가 떨어져 나가 "P2e"라는 존재하지 않는 코드가
+                # 하나 더 생겼다). known 코드가 cc로 "끝나면"(cc가
+                # 순수 접미사) 잘린 뒤쪽 조각일 가능성이 커서 그
+                # known 코드 쪽에 합친다.
+                suffix_candidates = [k for k in known_codes
+                                     if k != cc and k.endswith(cc)
+                                     and len(k) - len(cc) <= 3]
+                target = min(suffix_candidates, key=len) if suffix_candidates else None
+            if not target:
+                # 대소문자만 다른 표기도 있다(KR514X450008 실측:
+                # "C-pe"가 이 표에서만 소문자로 찍히는데 정식 표기는
+                # "C-Pe" - class_meaning/class_fees가 아는 진짜 클래스와
+                # 같은 것이다. 별개 코드로 남기면 같은 클래스가 두
+                # 줄로 중복된다).
+                ci_candidates = [k for k in known_codes
+                                 if k != cc and k.lower() == cc.lower()]
+                target = ci_candidates[0] if len(ci_candidates) == 1 else None
+            if not target:
+                # 붙임표(-) 유무만 다른 표기도 있다(KR5123490013 실측:
+                # 이 표(가입자격·수수료율)는 "A-e"/"C-e"인데 class_fees가
+                # 아는 정식 표기는 "Ae"/"Ce" - 표마다 붙임표를 넣거나
+                # 빼는 게 이 문서만의 습관이다). 이걸 반영 안 하면 위
+                # 셋(접두/접미 잘림, 대소문자) 어디에도 안 걸려서
+                # "Class"/"No" 같은 진짜 가짜 코드와 똑같이 버려지는데,
+                # 이건 표기만 다른 진짜 클래스라 잃으면 안 된다.
+                dash_candidates = [k for k in known_codes
+                                   if k != cc and k.replace("-", "") == cc.replace("-", "")]
+                target = dash_candidates[0] if len(dash_candidates) == 1 else None
+            if target:
+                tgt_rec = merged.setdefault(target, {})
+                for k2, v2 in rec.items():
+                    if v2 and not tgt_rec.get(k2):
+                        tgt_rec[k2] = v2
+                if cc in pages and target not in pages:
+                    pages[target] = pages[cc]
+            # target을 못 찾았으면(위 네 갈래 다 실패) 이 상품의 진짜
+            # 클래스가 아닐 가능성이 크다 - 표 헤더 글자("Class"/"No"
+            # 같은 열 이름)가 데이터 행으로 잘못 읽힌 경우가 실측됐다
+            # (KR5144420020/KR5156450026/KR555202013M의 "Class",
+            # KR514X450008의 "No"). known_codes에 전혀 없는 코드는
+            # 근거로 못 쓰므로 버린다 - target을 찾았든 못 찾았든 cc
+            # 자체는(정식 표기가 아니므로) merged에서 지운다.
+            del merged[cc]
+
+        for cc, rec in sorted(merged.items()):
             if not any(rec.get(k) for k in (
                     "eligibility", "front_load_fee", "back_load_fee",
                     "redemption_fee", "switch_fee")):
