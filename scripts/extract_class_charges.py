@@ -35,17 +35,23 @@
 """
 
 import argparse
+import glob
 import json
 import os
 import re
 import sqlite3
 
+import pdfplumber
+
+import pdf_words
 from extract_class_meaning import _parse, _squash
+from extract_class_returns import cluster_lines
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB_PATH = os.path.join(REPO_ROOT, "structured_store.db")
 OUTPUT_JSON = os.path.join(REPO_ROOT, "class_charges.json")
 OUTPUT_PRODUCT_JSON = os.path.join(REPO_ROOT, "product_charges.json")
+DATA_DIR = os.path.join(REPO_ROOT, "data", "products")
 
 # 열 이름 -> 우리가 쓸 이름. 헤더가 두 줄로 쪼개져 있어서(구분/가입자격/수수료율
 # 밑에 선취판매수수료/후취판매수수료/환매수수료/전환수수료) 열마다 위아래를
@@ -73,7 +79,14 @@ HEADER_WORDS = {"선취판매수수료", "후취판매수수료", "환매수수�
 
 
 # 코드만 덩그러니 든 칸("A", "C-Pe")과 이름표가 든 칸을 알아보기 위한 모양.
-RE_BARE_CODE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-]{0,12}$")
+# 코드 표기 자체에 한글이 괄호 없이 그대로 붙는 문서가 있다
+# (class_fees.json 실측: "C-퇴직연금", "C-퇴직e", "S-퇴직" - "(퇴직연금)"
+# 처럼 괄호로 싸지 않고 코드 뒤에 바로 붙는다. KR5127420034 등 KB 계열
+# 실측: 이 코드들이 통째로 못 읽혀 상품 8개에서 클래스가 누락됐었다).
+# 한글 덩어리가 코드 맨 끝이 아니라 중간에 낄 때도 있다("C-퇴직e" -
+# 뒤에 로마자 "e"가 한 번 더 붙는다).
+RE_BARE_CODE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9\-]{0,6}(?:[가-힣]{1,6})?[A-Za-z0-9\-]{0,6}$")
 RE_HAS_LABEL = re.compile(r"수수료(선취|미징구|후취)-")
 # "종류C-F"처럼 머리말이 붙은 코드 칸. 끝의 붙임표는 코드가 아니라
 # 비어 있는 종류형 명칭 칸이 이어 붙은 것이라 코드에서 뺀다
@@ -539,20 +552,40 @@ def _parse_transposed_table(rows, carried_class_order=None):
     return out, pending
 
 
-def _parse_table(rows, carried=None, carried_cols=None):
+def _parse_table(rows, carried=None, carried_cols=None, carried_last_value=None):
     """carried: 앞 페이지에서 확인된 열매핑. 표가 페이지를 넘어가면
     이어지는 쪽엔 머리글이 없어서, 그것만 보고 버리면 뒷장 클래스를
     통째로 잃는다(KR515302022M 실측: 가.표가 31~33쪽에 걸쳐 있는데
-    32·33쪽에 머리글이 없어 C-P2/S-P/S-I/C-Pe/AG/CG/A1/C-Pe2가 빠졌다)."""
+    32·33쪽에 머리글이 없어 C-P2/S-P/S-I/C-Pe/AG/CG/A1/C-Pe2가 빠졌다).
+
+    carried_last_value: 앞 페이지에서 마지막으로 확인된 CARRY_FIELDS
+    이어받기 값(아래 last_value 참고). 표 전체에 한 번만 찍히는 병합
+    칸(예: 후취판매수수료 "없음")이 페이지 경계를 넘어가면, 이어받기는
+    이 함수 호출 안에서만 도는 지역 변수라 다음 페이지 호출에서는
+    다시 빈 채로 시작해 못 이어받는다(신영자산운용 KR5125450023 실측:
+    27쪽 A 클래스 줄에서 "없음"(후취·환매)/"해당사항 없음"(전환)이
+    한 번만 찍히고 그 아래 클래스들은 이어받는데, 28쪽으로 넘어가는
+    C-P/C-Pe/C-G/C-P2/C-P2e는 물려받은 게 없어 통째로 빈 채 남았다).
+    앞 페이지가 반환한 last_value를 그대로 넘겨받아 이어서 쓴다."""
     mapping, header_end = _table_header(rows)
     used_carried = False
     if not mapping:
         if not carried:
-            return {}
+            return {}, {}
         mapping, header_end = carried, 0
         used_carried = True
 
     order = [name for _j, name in sorted(mapping.items())]
+    # 가입자격 칸 번호 - 아래 "이 줄에 값이 있었는데 자리를 못 찾았다"
+    # 판정(raw)에서 빼야 한다. 가입자격 문구는 "가입제한 없음"처럼
+    # "없음"이라는 글자를 포함하는 경우가 흔한데, 그러면
+    # _looks_like_fee_cell이 이걸 수수료 칸 모양으로 오인해 "자리를
+    # 못 찾은 수수료 값이 있다"고 잘못 판단하고, 이어받기(carry)로
+    # 정상적으로 채워져야 할 다른 클래스들의 후취/환매/전환수수료까지
+    # 통째로 못 잇게 막아 버린다(우리자산운용 KR5118420062, NH-Amundi
+    # KR5172450019 등 실측 - 이 줄들의 raw는 사실 이름표/가입자격
+    # 글자일 뿐인데 "없음"이 섞여 수수료 값으로 오인됐다).
+    elig_col = next((j for j, name in mapping.items() if name == "eligibility"), None)
     # 표 전체에 한 번만 찍히고 아래 행들은 비워 두는 병합 칸이 있다
     # (KR5118420062 실측: "환매수수료: 없음"이 A 클래스 줄에만 있고
     # A2부터는 그 자리가 통째로 빈칸이다 - 표 전체에 공통으로 적용되는
@@ -561,15 +594,23 @@ def _parse_table(rows, carried=None, carried_cols=None):
     # 그대로 이어받는다 - 그 클래스가 실제로 다른 값을 밝히면(zip으로
     # 값을 얻으면) 그쪽이 항상 이긴다.
     #
-    # 이어받기는 redemption_fee/switch_fee에만 한정한다 - 환매·전환
-    # 수수료는 상품 전체에 공통으로 적용되는 경우가 흔하지만(위 실측
-    # 근거), 선취·후취판매수수료는 애초에 클래스를 나누는 이유 그
+    # 이어받기는 원칙적으로 redemption_fee/switch_fee에만 한정한다 -
+    # 환매·전환 수수료는 상품 전체에 공통으로 적용되는 경우가 흔하지만
+    # (위 실측 근거), 선취판매수수료는 애초에 클래스를 나누는 이유 그
     # 자체라 클래스마다 값이 다른 게 정상이다. front_load_fee까지
     # 이어받으면 바로 위 클래스 값이 빈 칸에 잘못 들어간다(KR5172450019
     # 실측: Ae의 선취판매수수료 "0.5% 이내"가 바로 아래 Ce 줄의 빈
     # 칸으로 새어 들어가, Ce도 선취판매수수료가 있는 것처럼 잘못
     # 나왔다 - Ce는 원문에 실제로 그 값이 없다).
-    CARRY_FIELDS = {"redemption_fee", "switch_fee"}
+    #
+    # back_load_fee(후취판매수수료)는 사정이 다르다 - pdfplumber 원문
+    # 셀 좌표를 직접 확인해 보면(하나자산운용 KR5111420047 34쪽 실측),
+    # "없음" 칸 자체가 A 클래스 줄부터 표 맨 끝 줄까지 세로로 하나의
+    # 칸으로 실제 병합되어 있다(그 칸의 bbox가 여러 줄 높이를 그대로
+    # 덮는다) - 즉 이 칸은 애초에 "클래스마다 다른 값"이 아니라 "표
+    # 전체에 적용되는 값 하나"로 PDF 자체가 그렸다. 이걸 안 이으면
+    # A2/A-E/C-E/... 11개 클래스가 후취판매수수료를 통째로 못 찾는다.
+    CARRY_FIELDS = {"redemption_fee", "switch_fee", "back_load_fee"}
     # 헤더 칸 번호와 데이터 칸 번호가 표 전체에 걸쳐 똑같이 어긋나기도
     # 한다(KR5172450019 25쪽 실측: 헤더는 선취/후취/환매가 2/5/8열인데
     # 데이터 값은 항상 그보다 한 칸 왼쪽인 1/4/7열에 있다). 이런 표에서
@@ -689,15 +730,17 @@ def _parse_table(rows, carried=None, carried_cols=None):
             if j < len(row) and _clean(row[j]):
                 fields_ever_direct.add(name)
 
-    last_value = {}
+    last_value = dict(carried_last_value) if carried_last_value else {}
     out = {}
-    for row in rows[header_end:]:
+    body_rows = rows[header_end:]
+    for ridx, row in enumerate(body_rows):
         if not row:
             continue
         code = _row_class_code(row, allow_bare_paren=True)
         if not code or code in out:
             continue
 
+        fee_evidence = []
         rec = {}
         for j, name in mapping.items():
             if j < len(row):
@@ -720,8 +763,43 @@ def _parse_table(rows, carried=None, carried_cols=None):
                 if v and used_carried and name != "eligibility" \
                         and not _looks_like_fee_cell(v):
                     v = None
+                # 물려받은 매핑이 가입자격 칸으로 짚은 자리가, 사실은
+                # 전혀 다른 표(표1이 "부과기준" 꼬리줄로 끝난 바로 그
+                # 자리에 곧장 이어 붙는 "2)집합투자기구에 부과되는 보수
+                # 및 비용" 퍼센트 지급비율표)의 숫자 칸인 경우가 있다
+                # (키움 KR5123490013 실측: AG의 가입자격 칸에 판매보수
+                # 비율 "0.3000"이 잘못 채워졌다 - 표1과 표2가 같은
+                # 쪽에서 곧장 이어 붙어서, "바로 다음 표"라는 인접성
+                # 조건만으로는 표가 바뀐 걸 못 걸러낸다). 가입자격은
+                # 원문이 항상 한글 문장이므로, 물려받은 매핑에서 한글이
+                # 전혀 없는 값은 가입자격으로 보지 않는다 - 표1 자신이
+                # 이어지는 진짜 가입자격 문장은 항상 한글이라 안전하다.
+                if v and used_carried and name == "eligibility" \
+                        and not re.search(r"[가-힣]", v):
+                    v = None
                 if v:
                     rec[name] = v
+
+        # 긴 이름표가 셀 하나를 넘어가며 값·코드·나머지 이름표가 서로
+        # 다른 줄로 갈리는 표가 있다(KR5127420034 등 KB 계열 실측: "C-W"
+        # 줄은 칸이 전부 비고 그 값("-","-")은 바로 위 줄("수수료미징구
+        # -오프라인-랩,금전" 이름표 조각)에 있으며, 코드 뒤로도 이름표
+        # 조각("신탁")이 한 줄 더 이어진다 - pdfplumber가 이 표의 셀
+        # 높이를 이름표 줄 수에 맞춰 나누면서 값이 코드 줄이 아니라
+        # 이름표 첫 줄에 걸린다). 코드 자신의 줄에 값이 하나도 없고
+        # 바로 위 줄이 코드 없는(값만 있는) 줄이면 그 위 줄에서 값을
+        # 가져온다 - 코드 없는 줄은 애초에 다른 클래스의 몫일 수 없다.
+        if not rec and ridx > 0:
+            prev = body_rows[ridx - 1]
+            if not _row_class_code(prev, allow_bare_paren=True):
+                for j, name in mapping.items():
+                    if j < len(prev):
+                        v = _clean(prev[j])
+                        if (v and used_carried and name == "eligibility"
+                                and not re.search(r"[가-힣]", v)):
+                            continue
+                        if v and (name == "eligibility" or _looks_like_fee_cell(v)):
+                            rec[name] = v
 
         rec_corrected = False
         if carried_mismatch:
@@ -800,6 +878,27 @@ def _parse_table(rows, carried=None, carried_cols=None):
             raw = [x for x in row[1:]
                    if (x or "").strip() and not RE_HAS_LABEL.search(_squash(x))
                    and _looks_like_fee_cell(x)]
+            # 이 줄에 수수료 모양 값이 하나라도 있었는데(raw) 어느 칸인지
+            # 확신을 못 얻어 결국 못 채웠다면, 아래 이어받기(CARRY_FIELDS)로
+            # 다른 클래스의 값을 그대로 갖다 붙이면 안 된다 - 이 줄은
+            # "값이 원래 없는" 줄이 아니라 "값은 있는데 자리를 모르는"
+            # 줄이라, 이어받은 값이 실제로는 이 줄 자신의 값과 다를 수
+            # 있다(신영자산운용 KR5125450023 실측: S 클래스 자신의
+            # 후취판매수수료 "1,095일 미만 환매 시 환매금액의 0.15%
+            # 이내"가 자리를 못 찾고 버려졌는데, 그 뒤 이어받기가 앞쪽
+            # 미징구 클래스들의 "없음"을 그대로 채워 넣어 완전히 틀린
+            # 값이 나왔었다 - 차라리 안 채우는 게 틀리게 채우는 것보다
+            # 낫다는 이 함수의 기존 원칙과 같은 이유다). 가입자격 칸은
+            # 뺀다 - "가입제한 없음"처럼 가입자격 문구에도 "없음"이
+            # 흔히 섞여 _looks_like_fee_cell을 우연히 통과하는데, 그건
+            # 수수료 값이 아니라 그냥 가입자격 문장이다(우리자산운용
+            # KR5118420062, NH-Amundi KR5172450019 실측 - 이 오판 때문에
+            # 정상적으로 이어받아야 할 환매·전환수수료까지 못 이었다).
+            fee_evidence = [x for j, x in enumerate(row)
+                            if j != 0 and j != elig_col
+                            and (x or "").strip()
+                            and not RE_HAS_LABEL.search(_squash(x))
+                            and _looks_like_fee_cell(x)]
             if len(raw) == len(order):
                 for idx, name in enumerate(order):
                     cv = _clean(raw[idx])
@@ -827,16 +926,54 @@ def _parse_table(rows, carried=None, carried_cols=None):
                 cv = _shift_val(row, jj, name, code)
                 if cv:
                     rec[name] = cv
+        # fee_evidence(이 줄 자신에 있던 수수료 모양 값)가 있었는데도
+        # 위 순서맞추기·이동값 보정을 다 거치고 나서까지 rec가 여전히
+        # 비어 있다면, 그 값은 "자리를 못 찾아 버려진" 것이다 - 이런
+        # 줄만 이어받기(CARRY_FIELDS)를 막는다. fee_evidence가 있어도
+        # 이동값 등으로 이미 rec에 자리를 잡았다면(A2/C-P1e 등 실측:
+        # 앞칸 밀림이라 처음엔 못 찾았다가 이동값으로 바로잡힘) 정상
+        # 처리된 것이므로 막을 이유가 없다.
+        had_unplaced_evidence = bool(fee_evidence) and not rec
         for name in order:
             if name not in CARRY_FIELDS:
                 continue
             if name in rec:
                 last_value[name] = rec[name]
-            elif name in last_value:
+            elif name in last_value and not had_unplaced_evidence:
                 rec[name] = last_value[name]
+        # 위 순서맞추기/이동값 경로들은 각자 나름의 근거(칸 개수 일치,
+        # 표 전체 이동값)로 값을 채우지만, 물려받은 매핑에서는 그
+        # 근거가 애초에 이 표(표1)가 아니라 다른 표(carried_mismatch로
+        # 드러난, 또는 그냥 자리만 우연히 맞은) 것일 수 있다 - 가입자격은
+        # 원문이 항상 한글 문장이므로, 물려받은 매핑에서 한글이 전혀
+        # 없는 값이 여기까지 새어 들어왔으면 그건 어느 경로를 거쳤든
+        # 가입자격이 아니라고 본다(키움 KR5123490013 AG/CG/S-P 실측:
+        # 표1 "부과기준" 꼬리줄 바로 뒤에 곧장 이어 붙는 퍼센트
+        # 지급비율표까지 표1의 칸 매핑을 물려받아, 가입자격 칸에 판매
+        # 보수 비율 숫자가 잘못 채워졌었다).
+        if used_carried and rec.get("eligibility") \
+                and not re.search(r"[가-힣]", rec["eligibility"]):
+            del rec["eligibility"]
+        # "수수료미징구"라는 이름표는 업계 표준 표기로, 판매수수료를
+        # 선취·후취 어느 쪽으로도 걷지 않는다는 뜻이다(그 대신 판매
+        # 보수를 더 높게 매긴다) - 그래서 이 이름표를 쓰는 클래스는
+        # 선취판매수수료도 항상 "없음"이다. 그런데 이 값이 표 안에서
+        # 한 클래스 줄에만 찍히고 그 아래 여러 미징구 클래스에는 병합
+        # 칸으로 비워 두는 문서가 있고(신영자산운용 KR5125450023 실측:
+        # "없음"이 C 클래스 줄에만 있고 C-P/C-Pe/C-G/C-P2/C-P2e 등은
+        # 빈칸), 그 병합이 페이지 경계까지 넘어가면 이어받기(CARRY_FIELDS,
+        # front_load_fee는 클래스마다 실제로 달라지는 게 정상이라 일부러
+        # 안 걸어 뒀다)로도 못 잇는다. 코드/이름표 자체에 "미징구"가
+        # 있는데도 선취판매수수료를 못 찾았을 때만, 그 이름표 자체의
+        # 뜻으로 "없음"을 채운다 - "선취"/"후취" 이름표 클래스는 실제
+        # 값이 클래스마다 다르므로 이 규칙에서 제외한다.
+        if not rec.get("front_load_fee"):
+            row_text = _squash("".join((c or "") for c in row))
+            if "미징구" in row_text:
+                rec["front_load_fee"] = "없음"
         if rec:
             out[code] = rec
-    return out
+    return out, last_value
 
 
 # 펀드 전체에 대해 환매수수료를 어떻게 하는지 적은 문장.
@@ -985,6 +1122,648 @@ def product_redemption_note(conn, code):
     return _redemption_cell_note(conn, code)
 
 
+# 테두리 없는 표 - 좌표 기반 폴백
+#
+# structured_store.db의 tables는 page.extract_tables()(표 테두리선 기반)로
+# 미리 만들어 둔 것이다. 그런데 "가.투자자에게 직접 부과되는 수수료" 표의
+# 첫 칸(코드+이름표)이 통째로 안 잡히는 문서가 있다(흥국 계열 KR5139420015/
+# KR5139420020 실측: tables 안 모든 데이터 행에서 첫 칸이 빈 문자열이다 -
+# 이름표가 "수수료선취\n-오프라인(A)"처럼 두 줄에 걸쳐 있는데, pdfplumber의
+# 셀-단어 결합이 이 칸에서만 실패한다). 이러면 표 자체가 known_codes와
+# 하나도 안 맞아 상품이 통째로 빠진다. 원문 낱말 좌표(pdf_words - 회전
+# 잡음도 보정된 채)는 멀쩡하므로, 이 표만 좌표로 다시 읽는다.
+RE_FEE_CODE_TRAILING = re.compile(r"\(([A-Za-z0-9][A-Za-z0-9\-]{0,12})\)$")
+# 쪽마다 맨 아래에 쪽번호·운용사 영문명이 반복해서 찍힌다("34" 한 줄 +
+# "KIWOOM ASSET MANAGEMENT" 한 줄, 또는 "- 34 -" 한 줄처럼 회사마다
+# 모양이 다르다). 이 표(가입자격 문장)가 페이지 경계에서 끊겨 다음 쪽으로
+# 넘어가는 클래스는, 코드가 아직 안 나온 채로 쪽 맨 아래까지 이름표·
+# 가입자격을 계속 쌓다가 이 꼬리를 그대로 삼켜 버린다(키움 KR5123490013
+# 실측: AG의 가입자격이 "...펀드 매수를 요청하는 34 KIWOOM ASSET
+# MANAGEMENT 등 금융기관등으로부터..."로, 문장 한가운데에 쪽번호+회사명이
+# 끼어 들어갔다). 쪽 맨 아래(마지막 60pt) 안에서 숫자만 있거나 한글이
+# 전혀 없는 짧은 줄은 표 내용이 아니라 이 꼬리로 보고 건너뛴다 - 진짜
+# 표 내용(가입자격 문장 등)은 항상 한글을 포함하므로 잘못 걸릴 위험이
+# 낮다.
+RE_FOOTER_PAGENUM = re.compile(r"^[-–—]?\d{1,4}[-–—]?$")
+RE_FOOTER_LATIN_ONLY = re.compile(r"^[A-Za-z0-9 .,&()\-]{2,60}$")
+
+
+def _is_footer_line(line, page_height):
+    top = line[0]["top"]
+    if top < page_height - 60:
+        return False
+    text = _squash("".join(w["text"] for w in line)).strip()
+    if not text:
+        return False
+    if RE_FOOTER_PAGENUM.match(text):
+        return True
+    if not re.search(r"[가-힣]", text) and RE_FOOTER_LATIN_ONLY.match(text):
+        return True
+    return False
+
+
+def _coord_fee_table_page(page, known_codes, carry=None):
+    """"가.투자자에게 직접 부과되는 수수료" 표가 있는 페이지를 좌표로
+    읽는다. 그 표가 아니거나 코드를 하나도 못 찾으면 ({}, None)을
+    돌려준다.
+
+    carry: 앞 페이지에서 넘어온 (칸 위치, 아직 코드가 안 나온 채 쌓아 둔
+    이름표/가입자격/값) 상태. 표가 페이지 경계에서 끊기면 이어지는 쪽엔
+    머리글이 다시 안 찍히고(KR5139420015 실측: 29쪽은 28쪽 "가.투자자에게
+    직접 부과되는 수수료" 표의 계속인데 머리글이 없다), 클래스 하나의
+    이름표가 앞 쪽 마지막 줄에서 시작해 이어지는 쪽 첫 줄에 코드로
+    끝나기도 한다(실측: "(C-f)"만 29쪽 맨 위에 홀로 있고 나머지 이름표는
+    28쪽에 있었다). 반환값은 (이 페이지에서 확정된 클래스들, 다음
+    페이지로 넘길 상태 - 이 페이지가 표를 계속 갖고 있었을 때만 dict,
+    아니면 None)."""
+    words = pdf_words.extract_words(page)
+    if not words:
+        return {}, None
+    lines = cluster_lines(words, tol=2.5)
+    lines = [ln for ln in lines if not _is_footer_line(ln, page.height)]
+
+    if carry:
+        label_boundary, value_cols = carry["label_boundary"], carry["value_cols"]
+        has_elig_col = carry["has_elig_col"]
+        label_parts = list(carry["label_parts"])
+        elig_parts = list(carry["elig_parts"])
+        value_parts = {k: list(v) for k, v in carry["value_parts"].items()}
+        # 표가 이어지는 페이지도 맨 위엔 이 문서 특유의 반복 상품명
+        # 줄이 또 찍힌다(실측: "키움 Smart Investor...제1호[주식혼합-
+        # 재간접형]" - 표와 무관한데 그 낱말 하나가 하필 값 칸 x좌표에
+        # 걸려 값으로 잘못 잡혔다). 그런데 모든 문서가 이러진 않는다
+        # (실측: 흥국 계열은 이어지는 쪽 맨 위에 제목 없이 곧바로
+        # "(C-f)" 처럼 진짜 표 내용부터 시작한다 - 무조건 첫 줄을
+        # 건너뛰면 그 표 내용을 통째로 잃는다). 펀드 정식명칭은 항상
+        # "투자신탁"이라는 낱말을 포함하므로, 첫 줄이 그 낱말을 포함할
+        # 때만 반복 제목으로 보고 건너뛴다.
+        header_bottom = (lines[0][0]["top"]
+                          if lines and "투자신탁" in "".join(w["text"] for w in lines[0])
+                          else 0)
+        # 알몸 코드가 아직 확정 안 된 채로 페이지가 끝난 경우, 그 코드
+        # 자체도 이어받는다(위 next_carry 조립부 참고) - 안 그러면 다음
+        # 페이지에서 코드를 잃어버려 이어지는 내용이 엉뚱한 클래스로
+        # 새어 들어간다.
+        pending_bare = carry.get("pending_bare")
+    else:
+        # 값 칸(선취/후취/환매/전환) 4개의 x좌표를 헤더 낱말로 찾는다 -
+        # 표마다 자리가 조금씩 달라서(문서 실측: 두 흥국 상품도 서로
+        # 다르다) 고정 숫자로 잡으면 안 된다.
+        header_x = {}
+        header_top_by_key = {}
+        header_top = None
+        for line in lines:
+            for w in line:
+                t = w["text"]
+                for key, prefixes in COLUMNS[1:]:  # eligibility 빼고 수수료 4개만
+                    if key in header_x:
+                        continue
+                    if any(t.startswith(p) for p in prefixes):
+                        header_x[key] = w["x0"]
+                        header_top_by_key[key] = w["top"]
+                        header_top = (w["top"] if header_top is None
+                                      else min(header_top, w["top"]))
+        # 전환수수료(switch_fee) 칸 자체가 없는 문서가 있다(우리자산운용
+        # KR5118420006 실측: 머리글이 "종류(Class)"+"선취"+"후취"+
+        # "환매수수료" 3칸뿐, "전환" 낱말이 표 전체에 없다 - 그런데도
+        # 4칸을 다 요구하면 이 표 자체를 통째로 못 찾은 걸로 보고
+        # 페이지를 버려, 상품 4개/클래스 12개가 통째로 빠졌다). 선취/
+        # 후취/환매 3칸은 모든 문서에 공통이라 이 3개는 필수로 두고,
+        # 전환만 없을 수 있다고 본다.
+        if not {"front_load_fee", "back_load_fee", "redemption_fee"} <= header_x.keys():
+            return {}, None  # 이 페이지엔 이 표가 없다
+        # "선취"/"후취"/"환매" 등은 이 표 바깥의 일반 설명문에도 흔히
+        # 나온다(디에스자산운용 KR5169950018 6쪽 실측: "종류(Class) /
+        # 집합투자기구의 특징"이라는 산문 설명 표에 "선취(A)"/"후취(S)"/
+        # "환매"가 문장 곳곳에 흩어져 있는데, 그 낱말들의 startswith
+        # 매칭만으로는 진짜 수수료표 머리글과 구별이 안 된다 - 게다가
+        # "종류(Class)"까지 있어 jong 검사도 통과해, 표 자체가 없는
+        # 페이지에서 코드 없는 빈 레코드가 만들어지고 그 뒤로 다른 쪽
+        # 스캔까지 조기 종료됐었다). 진짜 머리글은 4칸 낱말이 한 줄
+        # 폭(30pt 이내)에 나란히 있다 - 문장 속에 흩어진 낱말들은 그보다
+        # 훨씬 넓게 퍼져 있으므로, 매칭된 낱말들의 top이 서로 30pt를
+        # 넘게 벌어지면 진짜 머리글이 아니라고 보고 버린다.
+        if max(header_top_by_key.values()) - min(header_top_by_key.values()) > 30:
+            return {}, None
+
+        # "종류" 머리글(코드+이름표 칸의 머리글)의 오른쪽 끝 - 이 칸과
+        # 가입자격 칸을 가르는 경계를 여기서 잡는다. 실측: 코드 칸
+        # 데이터는 이 경계 안쪽에, 가입자격 칸 데이터는 이 경계+30 근처
+        # 부터 시작해 둘 사이에 넉넉한 틈이 있다. 회사마다 이 머리글
+        # 표기가 다르다("종류" 대신 "구분"/"(Class)"를 쓰는 문서도 있다 -
+        # 베어링자산운용 실측).
+        # "종류(Class)"처럼 두 낱말이 한 토큰으로 붙어 나오는 문서가
+        # 있다(우리자산운용 KR5118420006 실측) - 정확히 같은 문자열만
+        # 찾으면 못 찾는다. 그런데 "종류"로 시작하는 낱말을 넓게
+        # 다 받으면, 표와 무관한 본문 문장 속 "종류별로"(실측: "...
+        # 재산의 종류별로 해당재산의...") 같은 말까지 걸린다 - 표
+        # 전체와 상관없는 훨씬 위쪽 문장인데 그 낱말의 x좌표가 더
+        # 오른쪽까지 뻗어 있으면 jong_x1이 엉뚱하게 커진다. 토큰
+        # 전체가 "종류" 또는 "종류(Class)"/"종류(class)"일 때만
+        # 받는다(뒤에 다른 글자가 더 붙으면 안 됨). 그리고 그 낱말이
+        # 수수료 칸 머리글과 같은 줄에 있을 때도 있어(이 문서 실측:
+        # "종류(Class)"와 "선취"가 둘 다 top=395.8) `<` 로 엄격히
+        # 비교하면(부동소수점이라 같은 줄인데도 미세하게 다를 수 있어
+        # 원래 `<`를 썼다) 정작 같은 줄에 있는 걸 걸러내 버린다 -
+        # `<=` 로 완화한다.
+        # "명칭"+"(종류)"로 두 줄에 걸쳐 쓰는 문서도 있다(DB자산운용
+        # KR5131420025 실측: "명칭"이 top=425.3, 그 아래 "(종류)"가
+        # top=440.3 - 머리글(수수료 4칸, top=433.96)보다 6.3pt
+        # 아래라 `<= header_top`만으로는 못 잡는다). 실제 데이터 행은
+        # 이보다 한참 아래(이 문서 실측 첫 행 top=470.5)에서 시작하니
+        # 위쪽 여유를 조금 더 둬도 데이터 행까지 잘못 걸릴 위험은
+        # 낮다.
+        # "명칭(클래스)"도 "종류(Class)"처럼 한 낱말로 붙어 나오는 문서가
+        # 있다(한화자산운용 KR5129420031 실측) - 안 받으면 이 표의 이름표/
+        # 가입자격 경계를 아예 못 잡아 표 전체가 값 칸 분리 없이 통째로
+        # label_parts에 뭉개져, 코드가 하나도 안 잡히고 상품이 통째로
+        # 빠진다.
+        jong_words = [w for line in lines for w in line
+                      if re.fullmatch(
+                          r"종류(\(Class\)|\(class\))?|종|구분|\(Class\)|\(class\)"
+                          r"|명칭(\(클래스\)|\(종류\)|\(Class\)|\(class\))?"
+                          r"|\(종류\)|\(클래스\)",
+                          w["text"])
+                      and w["top"] <= header_top + 10]
+        gap_fallback_elig = False
+        if not jong_words:
+            # 이름표 칸을 가리키는 "종류"/"구분"/"명칭" 낱말이 아예
+            # 없이, 가입자격 칸 머리글("가입자격"/"매입자격")이 곧장
+            # 나오는 문서가 있다(우리자산운용 KR5118201004 실측: 머리글
+            # 이 "매입자격"+선취판매+후취판매+환매뿐 - "매입자격"은
+            # "가입자격"의 다른 표기다). 이때는 가입자격 칸 머리글
+            # 자체의 왼쪽 끝을 이름표/가입자격 경계로 쓴다 - 코드는
+            # 항상 그보다 왼쪽에서 시작하고 가입자격 데이터는 그
+            # 오른쪽에서 시작하기 때문이다.
+            elig_header_words = [w for line in lines for w in line
+                                  if w["text"] in ("가입자격", "매입자격")
+                                  and w["top"] <= header_top + 10]
+            if elig_header_words:
+                jong_x1 = min(w["x0"] for w in elig_header_words) - 20
+                jong_top = min(w["top"] for w in elig_header_words)
+            else:
+                # 이름표 칸도 가입자격 칸도 머리글 낱말이 아예 없는
+                # 문서도 있다(같은 우리자산운용 KR5118420036 실측:
+                # 머리글이 수수료 3칸뿐, "종류"/"구분"/"가입자격" 어느
+                # 것도 없다). 이때는 헤더 바로 아래 첫 데이터 줄 자체가
+                # 경계를 스스로 보여준다 - 코드 바로 뒤에 큰 틈(실측:
+                # "C"~"제한없음" 사이 100pt 넘게 벌어짐)이 있고, 그
+                # 틈의 가운데를 이름표/가입자격 경계로 쓴다. 데이터
+                # 시작을 못 찾거나 그런 틈이 없으면(=이 페이지 형식을
+                # 모르겠으면) 틀린 값을 낼 바에야 포기한다.
+                gap_mid = None
+                for line in lines:
+                    top = line[0]["top"]
+                    if top <= header_top + 5:
+                        continue
+                    if top > header_top + 200:
+                        break
+                    xs = sorted(w["x0"] for w in line)
+                    if len(xs) < 2:
+                        continue
+                    biggest = max(
+                        ((xs[i + 1] - xs[i], (xs[i] + xs[i + 1]) / 2)
+                         for i in range(len(xs) - 1)),
+                        default=(0, None))
+                    if biggest[0] >= 40:
+                        gap_mid = biggest[1]
+                        break
+                if gap_mid is None:
+                    return {}, None
+                jong_x1 = gap_mid - 20
+                jong_top = header_top
+                gap_fallback_elig = True
+        else:
+            # "명칭"+"(종류)"/"(클래스)"처럼 괄호 없는 낱말과 괄호로 싼
+            # 낱말이 같이 나오는 문서에서, 괄호 쪽이 항상 더 오른쪽까지
+            # 뻗는 건 아니다(디에스자산운용 KR5169950018 실측: "명칭"
+            # x1=77.3, "(클래스)" x1=85.9 - 괄호 쪽이 더 넓어
+            # label_boundary가 105.9까지 밀리면서 그보다 왼쪽(100.4)에
+            # 있는 "제한없음"(가입자격 문구)까지 이름표 칸으로 잘못
+            # 삼켜, 그 결과 코드 "(A)" 뒤에 가입자격이 그대로 붙어버려
+            # "(코드)"로 끝나야 할 트레일링 매칭이 아예 안 됐다 -
+            # DB자산운용 KR5131420025는 우연히 괄호 쪽이 안 넘쳐서
+            # 문제가 안 드러났을 뿐이다). 괄호 없는 낱말("종류"/"구분"/
+            # "명칭" 등)이 있으면 그쪽만으로 경계를 잡고, 괄호로 싼
+            # 낱말은 존재 확인(has_elig_col 판정 창) 용도로만 남긴다 -
+            # 괄호 없는 게 하나도 없을 때만 괄호 쪽을 쓴다.
+            plain_jong = [w for w in jong_words if not w["text"].startswith("(")]
+            jong_x1 = max(w["x1"] for w in (plain_jong or jong_words))
+            # "종류"와 "가입자격"이 한 줄에 나란히 있는 문서도 있고
+            # (베어링과 달리, 실측 KR5123490013: top=266.4 줄에 "종류"+
+            # "가입자격"이 함께 있고, 그 아래 top=272.6에 "선취판매"등
+            # 4개 수수료 칸 이름이 별도 줄로 갈린다 - 6.2pt 차이라 그냥
+            # header_top 기준 ±5pt 창으로는 "가입자격" 줄을 놓친다)
+            # "종류" 줄의 top도 함께 챙겨야, 아래 has_elig_col 판정에서
+            # 그 줄까지 확실히 본다.
+            jong_top = min(w["top"] for w in jong_words)
+        label_boundary = jong_x1 + 20
+        value_cols = sorted(header_x.items(), key=lambda kv: kv[1])
+        # 이 표에 "가입자격" 칸 자체가 아예 없는 문서가 있다(베어링자산
+        # 운용 KR5156450026 실측: 머리글이 "(Class)"+수수료 4칸뿐, 가입
+        # 자격 칸이 없다 - 그런데도 있다고 가정하고 코드 칸과 수수료 값
+        # 칸 사이 좁은 구간을 "가입자격"으로 떼어내면, 실은 수수료 칸
+        # 문구의 앞부분("납입액의")이 가입자격으로 잘못 떨어져 나가고
+        # 나머지("1.0% 이내")만 수수료 값으로 남아 문구가 반토막 난다).
+        # 헤더에 "가입자격" 글자가 실제로 있는지로 이 칸의 존재 자체를
+        # 확인한다 - 다만 "가입자격"이 한 낱말로 안 잡히고 "종"/"류"처럼
+        # 한 글자씩 쪼개져 나오는 문서가 있어(KR5139420015 실측: 헤더
+        # 줄이 "종","류","가","입","자","격","선취판매",... 식으로 개별
+        # 글자 낱말이다) 낱말 단위가 아니라 헤더 줄 전체를 이어붙인
+        # 문자열에서 부분 문자열로 찾는다. 헤더 줄 자체(=jong_x1을 준
+        # "종류"/"구분"/"(Class)" 낱말과 같은 물리적 줄)만 좁게 본다 -
+        # 그보다 훨씬 위에 있는 본문 문장 속 "가입자격"(실측: "가.
+        # 투자자에게 직접 부과되는 수수료" 절 윗쪽 다른 문단)까지
+        # 잘못 집어내지 않기 위함이다.
+        header_line_text = _squash("".join(
+            w["text"] for line in lines for w in line
+            if jong_top - 3 <= line[0]["top"] <= header_top + 5))
+        # "매입자격"이라는 다른 표기를 쓰는 문서도 있다(우리자산운용
+        # KR5118201004 실측).
+        has_elig_col = "가입자격" in header_line_text or "매입자격" in header_line_text
+        # 가입자격 칸 머리글 자체가 없는 문서(위 gap_fallback_elig
+        # 참고)는 첫 데이터 줄의 큰 틈으로 이미 "이름표|가입자격" 두
+        # 구간이 있다고 확인했으므로, 여기서도 그 판정을 그대로 쓴다 -
+        # 헤더 줄에 "가입자격"이라는 글자 자체가 없으니 위 검사로는
+        # 항상 False가 나온다.
+        if gap_fallback_elig:
+            has_elig_col = True
+        # 수수료 이름("선취판매"/"후취판매"/"환매"/"전환")과 그 아래
+        # "수수료"가 두 줄로 갈리는 문서가 있어(실측: 두 흥국 상품 다
+        # 16pt 간격) 머리글 한 줄만 건너뛰면 안 된다. 그렇다고 고정
+        # 오프셋(과거 +20)을 쓰면, 헤더-첫데이터 간격이 그보다 좁은
+        # 문서에서 첫 데이터 줄까지 헤더로 오인해 통째로 건너뛴다
+        # (베어링자산운용 KR5156450026 실측: 헤더 top=517.7, A클래스
+        # 데이터 top=533.2 - 간격 15.5pt로 20pt보다 좁아 A클래스 전체가
+        # 사라졌었다). 대신 헤더 줄 바로 다음 줄들을 실제로 훑어,
+        # 이름표/코드 칸(label_boundary보다 왼쪽)에 낱말이 있는 줄을
+        # 만나면 그게 진짜 데이터 시작이므로 거기서 멈춘다 - 그 전까지
+        # (값 칸 x좌표에만 낱말이 있는 줄이면) 머리글이 이어지는 줄로
+        # 보고 계속 포함한다. 표와 무관한 줄이 끼어드는 문서는 아직 실측
+        # 못 봤지만, 혹시 몰라 최대 3줄까지만 이어붙인다.
+        #
+        # header_top은 COLUMNS[1:] 4개 낱말 중 "매칭된 낱말 자신"의 top
+        # 최솟값이지, 그 낱말이 속한 시각적 줄 전체의 top이 아니다(같은
+        # 줄 안에서도 낱말마다 top이 소수점 단위로 미세하게 다르다 -
+        # 베어링 실측: "(Class)"는 top=518.2, 그런데 매칭된 "선취판매"는
+        # top=517.72로 0.48pt 더 작다). 그래서 header_bottom을 header_top
+        # 그 자체로 두면, 헤더 줄의 다른 낱말("(Class)" 등)이 그보다도
+        # top이 커 `<=` 비교를 통과 못 하고 헤더 줄인데도 본문으로
+        # 새어 들어간다(실측: 그 결과 "선취판매"라는 헤더 글자 자체가
+        # A클래스의 front_load_fee 값으로 잘못 찍혔었다). 몇 pt의 여유를
+        # 둬 헤더 줄 전체(클러스터 허용오차 tol=2.5 이내)를 확실히
+        # 덮는다 - 베어링의 헤더-데이터 간격 15.5pt보다는 넉넉히 작다.
+        # "구분"(jong 낱말)이 수수료 4칸 머리글보다 아래 줄에 있는
+        # 문서가 있다(NH-Amundi KR5144420081 실측: 수수료 4칸은
+        # top=496.0인데 "구분"은 그보다 8.6pt 아래인 top=504.6 - 게다가
+        # "구분"의 x좌표(188.5)는 label_boundary보다 왼쪽이다). 시작점을
+        # header_top으로만 잡으면 이 "구분" 줄이 아직 안 덮여, 아래
+        # 확장 루프가 "이 줄엔 label_boundary보다 왼쪽에 낱말이 있다 =
+        # 데이터 줄이다"로 오판해 그 자리에서 멈춰버린다("구분"이라는
+        # 헤더 낱말 자체를 데이터로 착각) - 그러면 진짜 데이터 줄
+        # 전까지 이어지는 "수수료" 등 나머지 머리글 줄도 다 데이터로
+        # 새어 들어간다. jong 낱말의 top도 시작점에 포함시킨다.
+        header_bottom = max(header_top, jong_top) + 3
+        extended = 0
+        for line in lines:
+            top = line[0]["top"]
+            if top <= header_bottom:
+                continue
+            if extended >= 3 or any(w["x0"] < label_boundary for w in line):
+                break
+            header_bottom = top
+            extended += 1
+        label_parts, elig_parts, value_parts = [], [], {}
+        pending_bare = None
+
+    def col_of_value(x0):
+        return min(value_cols, key=lambda kv: abs(kv[1] - x0))[0]
+
+    out = {}
+
+    def _flush(code, label_parts, elig_parts, value_parts):
+        if not (code and code in known_codes):
+            return None
+        rec = out.setdefault(code, {})
+        elig = _clean(" ".join(elig_parts).strip())
+        # 가입자격 문장이 몇백 자씩 길어지면 다른 클래스 몫과 섞였을
+        # 가능성이 크다(실측: S/S-p 클래스는 가입자격 설명이 유독
+        # 길고 그 안에 후취판매수수료 조건문("3년미만 환매시...")까지
+        # 섞여 있어, 값 칸 경계 판정이 흔들리며 앞뒤 클래스 텍스트가
+        # 밀려 붙는다). 짧고 확실한 것만 받고, 의심스러우면(길이가
+        # 비정상적) 아무것도 안 낸다 - 틀린 문장을 내느니 없는 게 낫다.
+        # 가입자격은 문장이라 한글이 있어야 한다 - 옆 표(보수율
+        # 등)의 숫자 조각이 새어 들어오면 "0.3000"처럼 숫자만 남는데,
+        # 이런 값은 가입자격으로 낼 게 아니라 아예 버리는 게 낫다.
+        if (elig and not rec.get("eligibility") and len(elig) <= 150
+                and re.search(r"[가-힣]", elig)):
+            rec["eligibility"] = elig
+        for col, toks in value_parts.items():
+            v = _clean(" ".join(toks))
+            # 값 칸도 수수료 모양(퍼센트/이내/없음류)을 갖춰야 받는다 -
+            # 위와 같은 이유로 다른 칸 글자 조각이 섞여 들어올 수
+            # 있다(실측: 페이지 번호 "28"이나 "환매"라는 낱말 조각이
+            # 값으로 잘못 잡혔었다).
+            if v and not rec.get(col) and _looks_like_fee_cell(v):
+                rec[col] = v
+        return code
+
+    # 한 클래스의 이름표·가입자격·값이 물리적으로 여러 줄에 걸쳐 있고
+    # (실측: 이름표 2줄, 그 사이에 "-" 값만 있는 줄이 하나 더 낀다) 코드는
+    # 이름표의 "맨 마지막" 줄에야 나온다. 그래서 줄마다 즉시 처리하지
+    # 않고, 코드가 나오는 줄을 만날 때까지 이름표·가입자격·값을 계속
+    # 모아 두었다가 그 시점에 한 클래스 몫으로 한꺼번에 확정한다.
+    #
+    # 그런데 코드가 이름표 "맨 마지막"이 아니라 중간에 알몸으로 끼는
+    # 문서가 있다(우리자산운용 KR5118420006 실측: "수수료선취-" /
+    # "A1"(코드) / "오프라인 0.30% 이내" 순 - 진짜 수수료 값("0.30%
+    # 이내")은 코드보다 "뒤"에 나온다). 이런 문서는 코드를 보자마자
+    # 확정하면 아직 안 읽은 진짜 값을 놓치고, 그 값은 다음 클래스
+    # 몫으로 잘못 섞여 들어가 한 클래스씩 밀린다. 그래서 알몸 코드는
+    # 바로 확정하지 않고 pending_bare로 들고 있다가, 다음 클래스
+    # 블록이 시작하는 줄("수수료선취-"/"수수료후취-"/"수수료미징구-"
+    # 로 시작)을 만나면 그제서야 확정한다.
+    table_ended = False
+    # 가장 최근에 확정한 클래스 코드 - 코드+가입자격까지는 한 줄에
+    # 나오는데 진짜 수수료 값이나 가입자격 나머지 문장은 그보다도 더
+    # 뒤(이미 확정을 마친 다음) 줄에서야 나오는 문서가 있다(DB자산운용
+    # KR5131420025/KR5131420007 실측: "수수료선취-오프라인(A)제한없음"
+    # 이 한 줄이라 코드+가입자격이 그 자리에서 확정되는데, 진짜 값
+    # "0.3%이내"는 다음 줄에야 나온다 - 그 값은 아직 시작도 안 한 다음
+    # 클래스의 몫으로 잘못 흘러들어간다). 이런 "이름표가 전혀 없이 값만
+    # 있는" 외톨이 줄을 만나면, 다음 클래스로 보지 않고 방금 확정한
+    # 클래스(last_code) 몫으로 바로 채운다.
+    last_code = None
+    # 외톨이 줄 처리는 방금 확정을 마친 "바로 다음 한 줄"에만 적용한다
+    # (아래 참고). 그 이상 넓히면(=계속 쌓인 게 없을 때마다 매번
+    # last_code로 보낸다) 가입자격 문장이 원래 여러 줄에 걸쳐 길게
+    # 이어지는 클래스(실측: 흥국/키움 S/S-p - "수수료..." 로 시작하는
+    # 줄 없이 곧장 가입자격 문장부터 여러 줄 이어진다)에서, 그 새
+    # 클래스 자신의 이름표 없는 첫 줄들을 죄다 "방금 끝난 클래스"
+    # 몫으로 잘못 보내 버려 그 클래스의 가입자격이 반토막 나고 코드도
+    # 못 찾는 회귀가 났다(직접 겪음).
+    just_flushed = False
+
+    for line in lines:
+        if line[0]["top"] <= header_bottom:
+            continue
+        line_text = _squash("".join(w["text"] for w in line))
+        # 이 표는 항상 "부과기준 매입시 환매시 환매시 전환시" 꼬리줄로
+        # 끝난다(실측: 모든 문서가 같다). 이어지는 쪽 페이지는 표가 몇
+        # 줄만 더 있다가 바로 다음 표("2) 집합투자기구에 부과되는 보수
+        # 및 비용" 등, 칸 구성이 전혀 다르다)로 넘어가곤 하는데, 물려준
+        # 칸 위치를 그 다음 표에도 그대로 쓰면 완전히 무관한 숫자·문구가
+        # 값으로 잡힌다(KR5123490013 실측: "2)" 표의 보수율 숫자와 페이지
+        # 맨 위 반복되는 상품명 "...제1호[주식혼합-재간접형]"이 AG 클래스
+        # 값·가입자격으로 섞여 들어왔다). 꼬리줄이나 다음 절 번호를
+        # 만나면 그 자리에서 완전히 멈춘다.
+        # 이 표를 설명하는 각주("주1)선취,후취판매수수료는...")도 항상
+        # 표 바로 뒤에 붙어 나온다 - "부과기준" 꼬리줄이 아예 없는
+        # 회사도(베어링자산운용 실측: "가)" 표기를 쓰고 "부과기준" 줄
+        # 자체가 없다) 각주는 빠짐없이 있어서 더 믿을 만한 종료 신호다.
+        if ("부과기준" in line_text or re.match(r"^주\d+\)", line_text)
+                or re.match(r"^(?:\d\)|[가-힣]\.)", line_text)):
+            table_ended = True
+            break
+        # 알몸 코드(pending_bare)를 들고 있는 채로 새 클래스 블록의
+        # 첫 줄("수수료선취-" 등)을 만나면, 그게 앞 클래스가 끝났다는
+        # 신호다 - 이번 줄 내용이 앞 클래스 몫으로 섞이기 전에 먼저
+        # 확정한다.
+        if pending_bare and re.fullmatch(r"\([가-힣]+\)", line_text):
+            # 코드 자체가 두 조각으로 쪼개져 몇 줄 사이를 두고
+            # 떨어져 나오는 문서가 있다(우리자산운용 KR5118201004
+            # 실측: "S-P"가 먼저 알몸으로 나오고, 몇 줄 뒤(그 사이에
+            # "가입한 자로서 퇴직연금" 등 가입자격 설명이 낀다)에
+            # "(퇴직)"만 홀로 한 줄을 차지해 "S-P(퇴직)"를 완성한다 -
+            # "S-P"도 그 자체로 이미 유효한 별개 코드라 여기서 코드가
+            # 끝났다고 오판하면 안 된다). 이번 줄이 "(한글)" 모양
+            # 하나뿐이고 지금 들고 있는 pending_bare 뒤에 그대로
+            # 붙였을 때 known과 맞는 코드가 되면, 새 블록이 아니라
+            # 코드 마무리로 본다 - 이 줄 자체는 버리고(가입자격 등
+            # 다른 용도가 아니라 코드 조각이므로) 다음 줄로 넘어간다.
+            if pending_bare + line_text in known_codes:
+                pending_bare = pending_bare + line_text
+                continue
+        # 코드가 이름표 "앞"에 붙고 그 뒤에 설명이 이어지는 문서도
+        # 있다 - 괄호로 싼 경우(신영자산운용 KR5125450023 실측:
+        # "A(수수료선취-오프라인)")도 있고, 괄호 없이 코드 바로 뒤에
+        # "수수료..."가 곧장 이어지는 경우(우리단기채권 KR5118420062,
+        # 하나자산운용 KR5111420047 실측: "A 수수료선취-오프라인",
+        # "I수수료미징구-오프라인-고액투자")도 있다 - 둘 다 "수수료..."
+        # 로 시작하는 RE_HAS_LABEL과 반대 순서라 그걸로는 못 잡는다.
+        # "수수료"라는 낱말 자체가 줄 경계에서 "수수"/"료"로 쪼개지는
+        # 문서가 있다(신영자산운용 KR5125450023 실측: "Ae(수수"까지만
+        # 이 줄에 있고 "료선취-온..."은 다음 줄에야 나온다) - "수수료"
+        # 세 글자를 다 요구하면 이런 줄을 놓친다. "수" 한 글자만 있으면
+        # 받는다.
+        new_block = RE_HAS_LABEL.match(line_text) or re.match(
+            r"^[A-Za-z][A-Za-z0-9\-]{0,10}\(?수", line_text)
+        if pending_bare and new_block:
+            # 알몸 코드(pending_bare)를 들고 있는 채로 새 클래스 블록의
+            # 첫 줄을 만나면, 그게 앞 클래스가 끝났다는 신호다 - 이번
+            # 줄 내용이 앞 클래스 몫으로 섞이기 전에 먼저 확정한다.
+            last_code = _flush(pending_bare, label_parts, elig_parts, value_parts) or last_code
+            just_flushed = True
+            pending_bare = None
+            label_parts, elig_parts, value_parts = [], [], {}
+        # "(코드)"만 홀로 이루는 낱말이 label_boundary보다 훨씬
+        # 오른쪽(진짜 값 칸 바로 앞)까지 밀려 나는 문서가 있다
+        # (NH-Amundi KR5144420081 실측: 코드 칸 자체가 넓어서 "(A)"가
+        # x0=254.1인데 label_boundary는 228.4뿐이다 - 그러면 이 낱말이
+        # 값 구간으로 잘못 분류돼 이름표 문자열에 코드가 아예 안
+        # 남는다). x좌표와 상관없이, "(코드)" 모양 그 자체인 낱말은
+        # 항상 이름표 쪽으로 돌린다.
+        # 이 낱말 자체가 "(코드)"만은 아니고, 앞 이름표 글자에 공백 없이
+        # 바로 붙어 나오기도 한다(한화자산운용 KR5129420031 실측:
+        # "등(Cw)" - "등" 뒤에 공백 없이 코드가 바로 붙는다). 그러면
+        # fullmatch로는 못 잡으니, 끝이 "(코드)" 모양이면 낱말 전체를
+        # 이름표로 돌린다(중간에 낀 앞부분 글자도 이름표 문장의 일부라
+        # 버리면 안 된다).
+        code_paren_words = [
+            w for w in line
+            if w["x0"] >= label_boundary
+            and re.search(r"\([A-Za-z0-9][A-Za-z0-9\-]{0,20}(?:\([가-힣]+\))?\)$",
+                           w["text"])]
+        code_paren_ids = {id(w) for w in code_paren_words}
+        label_words = [w for w in line if w["x0"] < label_boundary] + code_paren_words
+        rest = [w for w in line if id(w) not in code_paren_ids
+                and w["x0"] >= label_boundary]
+        if has_elig_col:
+            elig_words = [w for w in rest if w["x0"] < value_cols[0][1] - 15]
+            value_words = [w for w in rest if w["x0"] >= value_cols[0][1] - 15]
+        else:
+            # 가입자격 칸이 없는 문서는 코드 칸 바로 다음부터가 전부
+            # 수수료 값 구간이다 - 그 문구("납입액의 1.0% 이내")가 첫
+            # 수수료 칸(선취판매) 머리글 x좌표보다도 왼쪽에서 시작하는
+            # 경우가 있어(베어링 실측: "납입액의" x0=201.5 <
+            # 선취판매 머리글 x0=227.8) 가입자격 구간을 아예 두지 않고
+            # label_boundary부터 곧장 값으로 본다.
+            elig_words = []
+            value_words = rest
+
+        # 이름표가 전혀 없이 가입자격/값만 있는 외톨이 줄이고(=새
+        # 클래스가 시작한 게 아니다), 방금 확정을 마친 "바로 다음 한
+        # 줄"이면(just_flushed) 방금 확정한 클래스(last_code) 몫으로
+        # 바로 채운다 - 그대로 두면 이 내용이 아직 시작도 안 한 다음
+        # 클래스의 몫으로 잘못 흘러들어간다. 딱 한 줄만 봐주고(아래
+        # just_flushed 리셋 참고), 그 다음부터 이름표 없는 줄이 계속
+        # 이어지면 그건 새 클래스 자신의 가입자격이 여러 줄로 긴
+        # 것으로 본다.
+        is_grace_line = just_flushed
+        just_flushed = False
+        if (is_grace_line and not label_words and (elig_words or value_words)
+                and last_code):
+            rec = out.get(last_code)
+            if rec is not None:
+                if elig_words:
+                    elig = _clean(" ".join(w["text"] for w in elig_words).strip())
+                    if (elig and not rec.get("eligibility") and len(elig) <= 150
+                            and re.search(r"[가-힣]", elig)):
+                        rec["eligibility"] = elig
+                vws = sorted(value_words, key=lambda w: w["x0"])
+                vgroups = []
+                for w in vws:
+                    if vgroups and w["x0"] - vgroups[-1][-1]["x1"] <= 15:
+                        vgroups[-1].append(w)
+                    else:
+                        vgroups.append([w])
+                for g in vgroups:
+                    col = col_of_value(g[0]["x0"])
+                    v = _clean(" ".join(w["text"] for w in g))
+                    if v and not rec.get(col) and _looks_like_fee_cell(v):
+                        rec[col] = v
+            continue
+        if label_words:
+            label_parts.append("".join(w["text"] for w in label_words))
+        # 가입자격 문구가 이미 확정 문턱(150자, _flush 참고)을 넘겼으면
+        # 더 안 쌓는다. 코드 확정이 늦게(다음 페이지까지) 나오는
+        # 문서에서, 다음 클래스의 가입자격 상투문구가 아직 코드가
+        # 나오기 전에 앞 클래스 몫으로 계속 쌓일 수 있다(신영자산운용
+        # KR5125450023 실측: S-P 클래스의 진짜 가입자격 마무리 문장
+        # 뒤로, 코드가 나오기도 전에 S-P2의 가입자격 상투문구
+        # 전체("집합투자업자의 공동판매채널로서의 역할...")가 먼저
+        # 줄줄이 나온다 - 계속 다 쌓으면 합친 문구가 150자를 넘겨
+        # _flush에서 통째로 버려진다). 이미 넘긴 뒤로는 더 안 쌓아야
+        # 그 앞부분(진짜 이 클래스 몫)만이라도 살아남는다.
+        if elig_words and sum(len(p) for p in elig_parts) <= 150:
+            elig_parts.append(" ".join(w["text"] for w in elig_words))
+        # 한 칸 안의 값 문구가 길어 다음 칸 머리글 x좌표에 더 가까워
+        # 보이는 낱말이 섞여 있을 수 있다(베어링 실측: "납입액의 1.0%
+        # 이내"에서 "이내"의 x0=274.2가 선취판매(227.8)보다 후취판매
+        # (318.6)에 더 가까워, 낱말별로 최근접 칸을 매기면 "이내"만
+        # 후취판매 칸으로 잘못 떨어진다). 낱말 사이 간격이 좁으면(같은
+        # 문구가 이어지는 것) 같은 칸으로 묶고, 간격이 크게 벌어질
+        # 때만(실측: 칸 사이 진짜 틈은 40pt 이상) 새 칸으로 본다 -
+        # 묶음의 "첫" 낱말 x좌표로만 최근접 칸을 정한다.
+        value_words_sorted = sorted(value_words, key=lambda w: w["x0"])
+        groups = []
+        for w in value_words_sorted:
+            if groups and w["x0"] - groups[-1][-1]["x1"] <= 15:
+                groups[-1].append(w)
+            else:
+                groups.append([w])
+        for g in groups:
+            col = col_of_value(g[0]["x0"])
+            for w in g:
+                value_parts.setdefault(col, []).append(w["text"])
+
+        joined_label = "".join(label_parts)
+        squashed_label = _squash(joined_label)
+        m = RE_FEE_CODE_TRAILING.search(squashed_label)
+        code = m.group(1) if m else None
+        if not code:
+            # RE_FEE_CODE_TRAILING의 코드 글자 집합은 영숫자/붙임표뿐이라
+            # "(C-P1(연금저축))"처럼 코드 자체에 괄호+한글이 중첩되는
+            # 문서는 못 잡는다(NH-Amundi 실측). known_codes를 직접 아니
+            # 그 안에 정확히 "(코드)"로 끝나는지를 본다 - 짧은 코드가
+            # 긴 코드의 접미어일 수 있어("P1"이 "C-P1"의 일부) 가장 긴
+            # 것을 고른다.
+            trailing_candidates = [
+                c for c in known_codes if squashed_label.endswith(f"({c})")]
+            if not trailing_candidates:
+                # PDF 원문 글자 추출 자체가 괄호 하나를 통째로 빠뜨리는
+                # 경우가 있다(한화자산운용 KR5129420031 실측: "(Ci-RP(퇴
+                # 직연금)"처럼 코드 자체에 이미 괄호가 중첩된 코드의
+                # 마지막(바깥쪽) 닫는 괄호가 없이 끝난다 - 코드 자체의
+                # 렌더링 결함이라 우리 쪽에서 더 채울 수 없다). 코드
+                # 자체에 괄호가 있는 known_codes에 한해, 닫는 괄호
+                # 하나가 모자란 채로 끝나는 것도 받아준다.
+                trailing_candidates = [
+                    c for c in known_codes
+                    if "(" in c and squashed_label.endswith(f"({c}")]
+            if trailing_candidates:
+                code = max(trailing_candidates, key=len)
+        if code and code in known_codes:
+            # "(코드)"가 이름표 끝에 붙는 문서는 그 순간 이미 값까지
+            # 다 읽은 뒤이므로 바로 확정한다(기존 방식 그대로).
+            last_code = _flush(code, label_parts, elig_parts, value_parts) or last_code
+            just_flushed = True
+            label_parts, elig_parts, value_parts = [], [], {}
+            continue
+        if not pending_bare and label_words:
+            # 코드가 "(코드)"로 안 감싸이고 맨 알몸으로 제 줄 하나를
+            # 통째로 차지하는 문서가 있다(우리자산운용 KR5118420006
+            # 실측: "A1"/"C-e"/"S-P(퇴직)" 등이 이름표 앞뒤 줄과 안
+            # 섞인 채 그 자체로 한 줄이다). 그런데 같은 줄에 코드
+            # 바로 뒤로 다음 이름표 조각이 틈 없이 바로 붙어 한
+            # 낱말로 뭉치기도 한다(같은 문서 실측: "C-F오프라인---",
+            # "S-" - 사이 공백이 원래 없거나 다음 줄로 넘어가야 할
+            # "-"이 이 줄에 붙어버렸다). 그래서 완전 일치가 아니라
+            # "이 줄 글자가 이 코드로 시작하는지"로 찾는다 - "C"가
+            # "C-F"의 접두어이기도 해서, 시작하는 후보 중 가장 긴
+            # 코드를 고른다(짧은 쪽을 고르면 "C-F" 행이 "C"로 잘못
+            # 잡힌다). 이런 문서는 코드보다 진짜 값이 "뒤"에 나오므로
+            # (위 주석 참고) 바로 확정하지 않고 pending_bare로 들고
+            # 있다가 다음 블록 시작 줄에서 확정한다.
+            bare = _squash("".join(w["text"] for w in label_words))
+            candidates = [c for c in known_codes if bare.startswith(c)]
+            if candidates:
+                pending_bare = max(candidates, key=len)
+
+    if pending_bare and table_ended:
+        # 표가 이 페이지 안에서 확실히 끝났다(꼬리줄을 만났다) - 마지막
+        # 클래스의 알몸 코드가 아직 확정 안 된 채 남아 있어도 다음
+        # 블록 시작 줄이 더는 없으므로(표의 맨 마지막 클래스라서)
+        # 여기까지 읽은 값을 지금 확정한다.
+        _flush(pending_bare, label_parts, elig_parts, value_parts)
+        pending_bare = None
+        label_parts, elig_parts, value_parts = [], [], {}
+
+    next_carry = None
+    if table_ended:
+        # 표가 이 페이지 안에서 확실히 끝났다(꼬리줄/다음 절 번호를
+        # 만났다) - 남은 조각이 있어도 그건 다음 절의 것이지 이 표의
+        # 것이 아니므로 버리고, 다음 페이지로 아무 것도 물려주지 않는다.
+        pass
+    elif pending_bare or label_parts or elig_parts or value_parts:
+        # 이 페이지가 끝났는데 아직 코드로 안 끝난 이름표가 남았다 -
+        # 다음 페이지로 이어질 수 있으니 상태를 그대로 넘긴다(다음
+        # 페이지도 이 표가 아니면 호출부가 그냥 버린다). 알몸 코드가
+        # 확정 안 된 채 남아 있으면(pending_bare) 그것도 같이 넘겨야
+        # 한다 - 안 그러면(실측: 신영자산운용 KR5125450023 S-P 클래스
+        # - 가입자격 설명이 길어 코드+값이 다음 페이지까지 이어지는데
+        # 이 페이지 끝에서 미완성인 채로 그냥 확정해버리면 빈 레코드가
+        # 박히고, 다음 페이지에서는 pending_bare를 잃어버려 이어지는
+        # 내용이 그 다음 클래스(S-P2) 몫으로 잘못 섞여 들어간다) 코드
+        # 자체를 잃어버려 이어지는 내용이 엉뚱한 다음 클래스로 잘못
+        # 흘러들어간다.
+        next_carry = {
+            "label_boundary": label_boundary, "value_cols": value_cols,
+            "has_elig_col": has_elig_col, "pending_bare": pending_bare,
+            "label_parts": label_parts, "elig_parts": elig_parts,
+            "value_parts": value_parts,
+        }
+    elif value_cols:
+        # 이 페이지 자체는 깔끔히 끝났어도, 바로 다음 페이지가 머리글
+        # 없이 이어지는 조각일 수 있으니 칸 위치는 넘겨 둔다.
+        next_carry = {
+            "label_boundary": label_boundary, "value_cols": value_cols,
+            "has_elig_col": has_elig_col, "pending_bare": None,
+            "label_parts": [], "elig_parts": [], "value_parts": {},
+        }
+    return out, next_carry
+
+
 def extract(db_path=DEFAULT_DB_PATH):
     conn = sqlite3.connect(db_path)
     codes = [r[0] for r in conn.execute(
@@ -1000,6 +1779,7 @@ def extract(db_path=DEFAULT_DB_PATH):
         # 같은 열 개수로 이어지는 표에 물려준다. 그래서 "환매수수료"가
         # 적힌 표만 보는 게 아니라 전부 훑는다.
         carried, carried_cols, carried_page = None, None, None
+        carried_last_value = None
         carried_transposed, carried_transposed_page = None, None
         for page, dj in conn.execute(
                 "SELECT page, data_json FROM tables WHERE doc_id = ? ORDER BY page",
@@ -1020,7 +1800,7 @@ def extract(db_path=DEFAULT_DB_PATH):
             else:
                 mapping, _end = _table_header(rows)
                 if mapping:
-                    got = _parse_table(rows)
+                    got, carried_last_value = _parse_table(rows)
                     carried, carried_cols, carried_page = mapping, ncols, page
                 elif (carried and carried_cols is not None
                       and abs(ncols - carried_cols) <= 10
@@ -1036,7 +1816,9 @@ def extract(db_path=DEFAULT_DB_PATH):
                     # 보정이 스스로 바로잡으므로, 열 개수가 완전히 같을
                     # 필요는 없다 - 다만 무관한 뒤쪽 표까지 잘못 이어붙지
                     # 않도록 어느 정도 상한은 둔다.
-                    got = _parse_table(rows, carried=carried, carried_cols=carried_cols)
+                    got, carried_last_value = _parse_table(
+                        rows, carried=carried, carried_cols=carried_cols,
+                        carried_last_value=carried_last_value)
                     if got:
                         carried_page = page  # 또 이어질 수 있다
                 else:
@@ -1073,6 +1855,98 @@ def extract(db_path=DEFAULT_DB_PATH):
                         best_n[real_cc] = len(rec)
                         pages[real_cc] = page
 
+        # 테두리표 자체가 코드 칸을 통째로 놓치는 문서가 있다
+        # (_coord_fee_table_page 참고) - 위 방식으로 known_codes를 다
+        # 못 채웠을 때만, PDF 원문을 좌표로 다시 훑는다(느려서 늘 켜 두면
+        # 안 된다). 표가 있는 페이지부터 이어지는 페이지까지 죽 넘기며
+        # 진짜 새로 찾은 클래스만(이미 merged에 있는 건 그대로 둔다) 보탠다.
+        #
+        # "채워졌다"는 기준은 수수료 칸(front/back/redemption/switch) 중
+        # 하나라도 실제 값이 있는지로 본다 - 코드 키가 merged에 있는지
+        # (`in merged`)만으로 판단하면 안 된다(KR5169950018 실측: 6쪽의
+        # 전혀 무관한 문장에서 "A"/"C"가 우연히 코드로 잡히되 값은
+        # 하나도 못 찾아 빈 딕셔너리 {}가 merged에 꽂혔다 - 그러면
+        # known_codes가 다 "있는" 걸로 오판해 6쪽에서 스캔이 멈춰버려,
+        # 진짜 표가 있는 32쪽까지 못 가서 7개 클래스가 수수료 칸을
+        # 하나도 못 채운 채 남았다). 가입자격만 있고 수수료 칸이 없는
+        # 것도 미해결로 본다 - 테두리표가 가입자격만 잡고 수수료 칸은
+        # 못 잡는 문서(같은 실측)에서 이 좌표 스캔이 그 칸을 마저
+        # 채워야 하기 때문이다.
+        FEE_FIELDS = ("front_load_fee", "back_load_fee", "redemption_fee", "switch_fee")
+        # 이 상품의 표에 가입자격 칸이 아예 없는 문서가 있다(우리자산운용
+        # KR5118420036 등 실측 - "종류"/"구분"/"가입자격" 어느 머리글도
+        # 없다). 그런 문서에서 가입자격을 항상 요구하면 매번 헛되이 좌표
+        # 재스캔을 돌게 된다(정답은 계속 없다). 지금까지(테두리표 1차
+        # 처리) 단 한 클래스라도 가입자격을 찾았으면, 이 표에 가입자격
+        # 칸이 "있다"는 뜻이므로 그때만 다른 클래스에도 요구한다.
+        any_eligibility = any(rec.get("eligibility") for rec in merged.values())
+
+        def _fee_resolved(cc):
+            rec = merged.get(cc)
+            if not (rec and any(rec.get(f) for f in FEE_FIELDS)):
+                return False
+            # "필드 중 하나라도 있으면 끝"으로 보면, 후취/환매/전환처럼
+            # 여러 클래스가 공유하는 이어받기(carry) 칸 하나만 새로
+            # 채워져도 그 클래스가 "다 됐다"고 오판한다(한화자산운용
+            # KR5125450070 실측: C-P/S-P는 가입자격까지 제 줄에서 정상
+            # 확인됐는데, 선취판매수수료만 원래 이어받지 않는 칸이라
+            # 빈 채로 남았다 - 그런데 후취판매수수료가 이어받기로
+            # 채워지자 스캔이 거기서 멈춰, 좌표 재스캔에서만 나오던
+            # 선취판매수수료를 영영 못 찾게 됐다. 신영자산운용
+            # KR5125450023 실측: C-P/C-Pe 등은 표 칸 수가 물려받은 칸
+            # 수와 달라(carried_mismatch) _parse_table이 직접매핑 결과를
+            # 통째로 버리는 자리라, 가입자격까지 같이 못 건졌는데도
+            # 이어받기로 후취/환매/전환만 채워져 "다 됐다"고 오판했다).
+            # 선취판매수수료는 "가.투자자에게 직접 부과되는 수수료"
+            # 표에서 모든 클래스가 예외 없이 값을 갖는 칸이다(실제
+            # 값이든 "없음"/"-"든) - 이게 비어 있다는 건 이 클래스의
+            # 제 줄을 아직 제대로 못 읽었다는 뜻이므로, 다른 칸이 이어
+            # 받기로 채워졌어도 미해결로 본다.
+            if not rec.get("front_load_fee"):
+                return False
+            # 선취판매수수료는 "미징구" 이름표로 유추해 채울 수 있지만
+            # (위 참고), 가입자격은 그런 유추가 안 된다 - 이 표에
+            # 가입자격 칸이 있는 게 확인됐는데 이 클래스만 없다면,
+            # 선취판매수수료가 이름표 유추로 채워졌다고 해서 "제 줄을
+            # 다 읽었다"고 오판하면 안 된다(같은 KR5125450023 실측:
+            # carried_mismatch로 가입자격이 버려진 자리에 "미징구"
+            # 유추로 선취판매수수료만 채워지면, 좌표 재스캔에서만
+            # 나오는 가입자격 문장을 영영 못 찾게 된다).
+            if any_eligibility and not rec.get("eligibility"):
+                return False
+            return True
+
+        def _unresolved_codes():
+            return {cc for cc in known_codes if not _fee_resolved(cc)}
+
+        if _unresolved_codes():
+            pdf_candidates = glob.glob(os.path.join(DATA_DIR, code, "*.pdf"))
+            if pdf_candidates:
+                with pdfplumber.open(pdf_candidates[0]) as pdf:
+                    carry, carried_page = None, None
+                    for page_num, page in enumerate(pdf.pages, start=1):
+                        # 표가 아닌 페이지가 몇 장 끼면(실측: KR5123490013
+                        # 34쪽 표 뒤로 35~36쪽엔 "나.집합투자기구에 부과되는
+                        # 보수 및 비용" 같은 다른 표가 오고, 37쪽에 가서야
+                        # 우연히 "직접 부과되는 수수료"라는 문구가 각주에
+                        # 다시 나온다) 물려주기를 바로 다음 쪽으로만
+                        # 제한하지 않으면, 이미 끝난 표의 칸 위치를 전혀
+                        # 무관한 페이지 내용에 그대로 덮어써서 엉뚱한 글자
+                        # 조각이 값으로 잡힌다. 바로 다음 쪽일 때만 잇는다.
+                        use_carry = carry if carried_page == page_num - 1 else None
+                        got, carry = _coord_fee_table_page(page, known_codes, carry=use_carry)
+                        carried_page = page_num if carry else None
+                        for cc, rec in got.items():
+                            cur = merged.setdefault(cc, {})
+                            for k, v in rec.items():
+                                if v and not cur.get(k):
+                                    cur[k] = v
+                            if len(rec) > best_n.get(cc, 0):
+                                best_n[cc] = len(rec)
+                                pages[cc] = page_num
+                        if not _unresolved_codes():
+                            break
+
         if not merged and known_codes and product_has_no_direct_fee(conn, code):
             # 클래스별 표 자체가 없이 "가. 투자자에게 직접 부과되는
             # 수수료: 해당사항 없음"이라고 절 하나로 끝내는 문서다
@@ -1084,6 +1958,40 @@ def extract(db_path=DEFAULT_DB_PATH):
                 merged[cc] = {"front_load_fee": "없음", "back_load_fee": "없음",
                                "redemption_fee": "없음", "switch_fee": "없음"}
         for cc, rec in sorted(merged.items()):
+            # 표가 페이지 경계나 줄바꿈으로 갈리면서 코드 글자 일부가
+            # 잘려 나가는 표가 있다(KR5127420034 실측: "C-퇴직연금"의
+            # 마지막 글자 "금"이 다른 셀로 떨어져 나가 "C-퇴직연"이라는
+            # 존재하지 않는 코드가 하나 더 생긴다 - 서로 다른 표(가입자격
+            # 표/보수표)에서 각각 한 번씩 잘려서, 값까지 똑같지는 않고
+            # 칸이 서로 다르게 채워져 있을 수 있다). known_codes
+            # (class_fees.json에 이미 확인된 코드)에 없다고 무조건
+            # 버리면 안 된다 - 대소문자·붙임표만 다른 진짜 표기 차이도
+            # known_codes엔 없다(KR5110501016 실측: "Ae"는 known_codes엔
+            # "A-E"만 있지만 실제로 존재하는 별개 표기다). known 코드
+            # 하나가 이 코드로 시작하거나 이 코드가 known 코드로
+            # 시작하면(글자가 잘렸을 때만 나오는 모양) 잘린 쪽일 가능성이
+            # 커서, 버리지 않고 그 known 코드 쪽에 빈 칸만 채워 합친다 -
+            # 잘린 쪽에만 있던 정보(위 실측: 가입자격 '퇴직연금용')를
+            # 잃지 않으면서 가짜 코드도 안 남긴다.
+            if known_codes and cc not in known_codes:
+                # 잘림은 글자 한두 개가 떨어져 나가는 것뿐이다 - cc가
+                # known 코드의 순수 접두사(cc로 시작하되 cc보다 김)이면서
+                # 길이 차이가 작을 때만 후보로 본다. "cc가 다른 known
+                # 코드로 시작한다"(반대 방향)는 안 쓴다 - "C-퇴직연"은
+                # "C"로 시작하지만 "C"는 이 상품에 실제로 있는 별개의
+                # 완결된 클래스라 그쪽으로 합치면 안 된다. 후보가 여럿
+                # 이면(예: C-퇴직연 -> C-퇴직연금 외에 C-퇴직e도 앞 세
+                # 글자까지는 같다) 길이 차이가 가장 작은 쪽을 고른다.
+                candidates = [k for k in known_codes
+                              if k != cc and k.startswith(cc)
+                              and len(k) - len(cc) <= 3]
+                target = min(candidates, key=len) if candidates else None
+                if target:
+                    tgt_rec = merged.setdefault(target, {})
+                    for k2, v2 in rec.items():
+                        if v2 and not tgt_rec.get(k2):
+                            tgt_rec[k2] = v2
+                    continue
             if not any(rec.get(k) for k in (
                     "eligibility", "front_load_fee", "back_load_fee",
                     "redemption_fee", "switch_fee")):

@@ -205,6 +205,34 @@ def _periods(rows, header_row, cols, need=2):
     # 포함 5줄에 걸쳐 있다). 좁은 창이면 끝일 줄이 통째로 창 밖으로
     # 밀려나 기간을 하나도 못 읽는다.
     window = rows[header_row: header_row + 6]
+    # 날짜 줄 자체에 라벨 줄("최근N년차")에는 없는 칸("설정일" 등)이
+    # 하나 더 끼어들어, 그 뒤로 모든 날짜가 라벨보다 한 칸씩 밀려 있는
+    # 문서가 있다(KR5118420062 46쪽 실측: "최근2년차" 라벨은 3번 칸인데
+    # 그 날짜("2023.11.01~2024.10.31")는 5번 칸에 있다 - 아래 cols
+    # 제한 방식으로는 5개 기간 중 2개만 건지고, need=2를 만족해 그
+    # 불완전한 결과로 조용히 멈춰버린다). 값 칸(_row_values)은 칸이
+    # 밀려도 "왼쪽부터 순서대로" 다시 맞추는 길이 있는데 여기엔 없었다 -
+    # 같은 원칙을 기간에도 먼저 적용해본다: cols 제한 없이 표 전체에서
+    # 날짜꼴을 찾아, 그 개수가 cols 칸 수와 정확히 같을 때만(그래야
+    # 우연히 섞인 다른 날짜에 안 속는다) 왼쪽부터 순서대로 cols 칸에
+    # 맞춰 배정한다 - 이게 성공하면 아래 칸 제한 방식보다 항상 더
+    # 완전한 결과이므로 먼저 시도한다.
+    for span in (1, 2, 3, 4, 5):
+        for start in range(len(window) - span + 1):
+            joined = {}
+            for row in window[start: start + span]:
+                for j, cell in enumerate(row):
+                    if (cell or "").strip():
+                        joined[j] = joined.get(j, "") + " " + cell
+            found = {}
+            for j, text in joined.items():
+                candidate = " ".join(text.split())
+                m = RE_PERIOD.search(candidate)
+                if m:
+                    found[j] = f"{m.group(1)}~{m.group(2)}"
+            if len(found) == len(cols) and len(cols) > 2:
+                ordered_vals = [v for _, v in sorted(found.items())]
+                return dict(zip(sorted(cols), ordered_vals))
     for span in (1, 2, 3, 4, 5):
         for start in range(len(window) - span + 1):
             joined = {}
@@ -707,7 +735,21 @@ def _merge_split_label_rows(rows):
                 # 있다(KR5139420015 실측: "수수료미징구"/"-오프라인"
                 # /"-기관,펀드 등(C-f)" 석 줄) - 앞뒤로 라벨 조각이
                 # 이어지는 한 계속 모은다.
-                while j < n and is_label_only(rows[j]):
+                #
+                # 그런데 값이 전부 "-"(결측)인 클래스가 바로 다음 줄에
+                # 있으면(값이 숫자가 아니라 has_values가 False라 "라벨
+                # 조각"으로 오인된다) 그 클래스의 라벨 전체를 앞 클래스의
+                # 라벨 계속으로 잘못 삼켜버린다(KR5153420079 44쪽 실측:
+                # C-I 값 행 뒤에 "종류C-PI\n...퇴직연금, 펀드\n등"이
+                # 통째로 삼켜져, 합쳐진 라벨에서 _row_label이 "C-PI"를
+                # 골라 C-I의 진짜 값이 있지도 않은 C-PI 것으로 둔갑했다 -
+                # C-PI 자신은 정말 결측이라 값 행이 하나도 안 남는다).
+                # "종류"로 시작하는 줄은 이 표기에서 언제나 새 클래스의
+                # 시작이라 계속 이어붙이면 안 된다 - 여기서 멈추면 그
+                # 줄은 자기 차례에 라벨만 있는 행으로 그대로 남아 결측
+                # 클래스로 정확히 처리된다.
+                while j < n and is_label_only(rows[j]) \
+                        and not (rows[j][0] or "").strip().startswith("종류"):
                     parts.append(rows[j][0])
                     j += 1
             if len(parts) > (1 if own else 0):
@@ -716,6 +758,97 @@ def _merge_split_label_rows(rows):
                 continue
         out.append(r)
         i += 1
+    return out
+
+
+# 클래스마다 표 하나를 통째로 페이지 하나에 따로 싣는 문서가 있다
+# (KR5114420016 실측: "가/나" 표가 전 클래스를 한 표에 쌓아 보여주는
+# 다른 문서들과 달리, 클래스마다 "(N) 펀드이름_코드(설명)" 제목이 붙은
+# 자기 페이지가 따로 있다 - 삼성자산운용 계열 문서 다수(같은 계열 6개
+# 상품 실측)가 이 형식을 쓴다). 위 _row_label/_year_columns_all은 "한
+# 표 안에 클래스가 여러 줄"이라고 가정해서 이 형식은 아예 못 읽어
+# 상품 전체가 통째로 빠진다. 다만 표 자체는 테두리가 있어 structured
+# _store.db의 tables에 깨끗하게 잡히므로(제목 표 하나 + 값 표 하나,
+# 연속 table_index) 별도 좌표 보정 없이 바로 읽을 수 있다.
+# 코드가 "_코드(설명)"으로 붙거나(밑줄 뒤에 바로, 자기 괄호 없이),
+# "[분류](코드)(설명)"으로 자기 괄호에 따로 싸여 붙는 두 표기가 다
+# 있다(KR5114420016 실측: "..._R-Ae(수수료선취-온라인)" 대 "...[채권]
+# (A)(수수료미징구...)").
+
+# 퇴직연금 클래스는 코드 자체에 한글 괄호가 덧붙는 문서가 있다
+# (class_fees.json 실측: "Cp(퇴직연금)", "Cp-f(퇴직연금)" - 코드
+# 표기 자체가 이 한글 괄호까지 포함한다). 제목 줄의 코드 뒤에도
+# 똑같이 이 한글 괄호가 붙어 나오므로 같이 잡아야 known_codes와
+# 맞는다.
+_CODE_BODY = r"[A-Za-z0-9][A-Za-z0-9\-]{0,8}(?:\([가-힣]+\))?"
+RE_PAGE_TITLE_CODE = re.compile(
+    r"(?:_(" + _CODE_BODY + r")\("
+    r"|\]\((" + _CODE_BODY + r")\)\()")
+
+
+def _per_class_page_records(doc_id, conn, known_codes):
+    """클래스당 페이지 하나짜리 문서에서 "나. 연도별 수익률" 값을 읽는다.
+    "가.연평균" 페이지(기간에 "년차"가 안 붙음)는 이 파일의 대상이
+    아니므로 거른다."""
+    out = []
+    pending_code, pending_page = None, None
+    for page, dj in conn.execute(
+            "SELECT page, data_json FROM tables WHERE doc_id = ? "
+            "ORDER BY page, table_index", (doc_id,)):
+        try:
+            rows = json.loads(dj)
+        except (ValueError, TypeError):
+            continue
+        if not rows:
+            continue
+        first_cell = (rows[0][0] or "").strip() if rows[0] else ""
+        # 제목 표: [('(N)', ''), ('', '펀드이름_코드(설명)')] 두 줄짜리.
+        if re.fullmatch(r"\(\d+\)", first_cell):
+            title_text = " ".join(
+                c for r in rows for c in r if (c or "").strip())
+            m = RE_PAGE_TITLE_CODE.search(title_text)
+            code = (m.group(1) or m.group(2)) if m else None
+            # 명칭표에 없는 표기는 이 표 자신의 표기 차이로 보지 않고
+            # (다른 상품과 섞일 위험) 그냥 버린다 - known_codes로 검증된
+            # 코드만 받는다. 코드가 아예 없는 제목("(1) 펀드이름")은
+            # 클래스 구분 없는 펀드 전체 페이지이므로 code=None 그대로
+            # 둔다(이 함수는 class_return만 다루므로 이 페이지의 값은
+            # 안 쓴다 - 펀드 전체 값은 다른 경로가 이미 다룬다).
+            pending_code = code if (code and code in known_codes) else None
+            pending_page = page
+            continue
+        if pending_page != page or pending_code is None:
+            pending_code, pending_page = None, None
+            continue
+        header = next((r for r in rows if (r[0] or "").strip() == "연도"), None)
+        own_row = next((r for r in rows if (r[0] or "").strip() == "투자신탁"), None)
+        if not header or not own_row:
+            pending_code, pending_page = None, None
+            continue
+        if not any("년차" in (c or "") for c in header):
+            pending_code, pending_page = None, None
+            continue  # "가.연평균" 페이지 - 이 함수는 "나" 표만 다룬다
+        date_row = None
+        hi = rows.index(header)
+        if hi + 1 < len(rows) and (rows[hi + 1][0] or "").strip() == "":
+            date_row = rows[hi + 1]
+        for ci in range(2, len(own_row)):
+            cell = (own_row[ci] or "").strip()
+            m = re.search(r"-?\d+\.\d+", cell)
+            if not m:
+                continue
+            rank = ci - 1
+            period = None
+            if date_row and ci < len(date_row):
+                dm = re.findall(r"\d{2}[./]\d{2}[./]\d{2}", date_row[ci] or "")
+                if len(dm) == 2:
+                    period = f"{dm[0]}~{dm[1]}"
+            out.append({
+                "row_kind": "class_return", "class_code": pending_code,
+                "year_rank": rank, "period": period,
+                "return_pct": float(m.group()), "page": page,
+            })
+        pending_code, pending_page = None, None
     return out
 
 
@@ -834,6 +967,16 @@ def extract(db_path=DEFAULT_DB_PATH):
                             continue
                         seen.add(key)
                         out.append(dict(r, product_code=code, page=page_num))
+
+        # 클래스당 페이지 하나짜리 문서(_per_class_page_records 참고) -
+        # 위 두 경로 다 "한 표 안에 클래스 여러 줄"을 가정해서 이 형식은
+        # 통째로 놓친다. seen으로 걸러지므로 겹치면 안 쓴다.
+        for r in _per_class_page_records(code, conn, known_codes):
+            key = (r["row_kind"], r["class_code"], r["year_rank"])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(dict(r, product_code=code))
     conn.close()
     return _drop_suffix_duplicate_codes(out)
 

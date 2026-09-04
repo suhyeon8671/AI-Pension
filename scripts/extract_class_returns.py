@@ -1315,6 +1315,30 @@ def return_rows_for_doc(doc_id, pdf, pages, known_classes=None):
                                 break
                     dm = INCEPTION_DATE_RE.search(raw or "")
                     inception = _normalize_date(dm.group()) if dm else None
+                    # 최초설정일 칸에 날짜 대신 숫자가 찍히는 클래스가 있다
+                    # (KR5125450070 41쪽 실측: I/C-P/C-P2/C-Pe/C-P2e 클래스 -
+                    # 설정일 칸이 원래 비어 있어야 하는데 그 자리에 "최근1년"
+                    # 값이 들어가 있고, 나머지 값 칸들은 전부 한 칸씩 밀려
+                    # 읽힌다("설정일이후" 칸엔 최근1년 값이 중복으로 다시
+                    # 찍힌다 - "나.연도별 수익률" 표의 43쪽 실측으로 대조:
+                    # I클래스 최근1년차 -6.93%가 진짜 값이고, 밀리기 전
+                    # values['1y']=1.85는 사실 2년째 값이었다). 값 칸이
+                    # 정확히 5개(1y~설정일이후) 다 찼을 때만, 밀린 앞칸의
+                    # 진짜 값을 되돌리고 마지막(중복된 설정일이후)을 버린다.
+                    if kind in ("class_return", "benchmark", "volatility") and dm is None:
+                        shift_val = _clean_val(raw or "")
+                        if DECIMAL_RE.match(shift_val) or NUM_RE.match(shift_val):
+                            ordered_fields = [
+                                f for _, f in sorted(
+                                    (ci, f) for ci, f in field_by_col.items()
+                                    if f.endswith("y") or f == "since_inception")
+                            ]
+                            if (len(ordered_fields) == 5
+                                    and all(f in values for f in ordered_fields)):
+                                shifted = {ordered_fields[0]: shift_val}
+                                for i in range(1, len(ordered_fields)):
+                                    shifted[ordered_fields[i]] = values[ordered_fields[i - 1]]
+                                values = shifted
                 if inception is None:
                     # 최초설정일 칸이 따로 안 잡히는 표가 있다
                     # (KR5123490013 실측: 날짜가 클래스명 칸에 같이 들어
@@ -1755,35 +1779,81 @@ def enrich_with_detail_return_table(pdf, doc_id, existing_rows, used_pages, know
                 if r.get("page") == page_num
             ]
         # 셀 격자(cell_rows_here)가 좌표 방식(coord_rows)보다 코드 인식이
-        # 확실하다는 원칙은 위 주석 그대로인데, 정작 "둘 다 known과
-        # 안 겹치는" 흔한 경우(요약표엔 C 하나뿐인데 상세표 이 페이지엔
+        # 확실하다는 원칙은 위 주석 그대로다. 그런데 "둘 다 known과 안
+        # 겹치는" 흔한 경우(요약표엔 C 하나뿐인데 상세표 이 페이지엔
         # I/C-P/C-P2 등 요약표에 없는 새 클래스만 있는 경우 - 아래 신뢰
-        # 이어받기가 원래 이런 페이지를 구하려고 있는 것이다)에 예전
-        # 코드가 걸려 넘어졌다: 후보를 순서대로 돌며 매번 class_rows를
-        # 덮어써서, 반복이 refs 없이 끝나면 마지막으로 시도한 coord_rows
-        # 결과가 그대로 남았다 - 셀 격자가 6개 클래스를 제대로 찾았어도
-        # 좌표 방식이 그 페이지에서 하나도 못 찾으면(실측: 여기서 늘
-        # 그랬다) class_rows가 빈 채로 남아, 신뢰 이어받기 조건
-        # (`class_rows and last_validated_page == page_num - 1`)이 항상
-        # 거짓이 되고 그 뒤의 모든 페이지가 통째로 유실됐다(KR5125450070
-        # 실측: 41쪽 이후 상세표 클래스 12개가 이렇게 전부 사라졌다 -
-        # 오늘 "라벨 파싱을 고쳤는데 결과가 하나도 안 바뀐다"고 확인된
-        # 것도 이 버그가 그 수정 효과를 가려서였다). refs가 없을 때는
-        # (더 신뢰하는) 셀 격자 결과를 그대로 남긴다.
+        # 이어받기가 원래 이런 페이지를 구하려고 있는 것이다)에, "refs가
+        # 없을 때는 셀 격자를 남긴다"는 규칙을 그대로 cell_class_rows에
+        # 적용하면 새 버그가 생긴다: 표에 테두리가 없어 셀 격자 자체가
+        # 이 페이지에서 통째로 실패하는 문서(KR5113420069 실측: 61쪽 -
+        # 셀 격자는 lookback을 5까지 넓혀도 0행, 좌표 방식은 12개 클래스를
+        # 전부 찾음)에서는 cell_class_rows가 언제나 빈 리스트라 class_rows도
+        # 빈 채로 남는다. 그러면 신뢰 이어받기 조건(`class_rows and
+        # last_validated_page == page_num - 1`)과 보류(pending) 둘 다
+        # "빈 리스트는 버린다"는 판정을 받아 12개 클래스가 통째로
+        # 유실됐다(다음 쪽 62에서 "C"가 검증에 성공해도 61쪽 몫을 물려줄
+        # pending 자체가 없었다). 셀 격자가 "이 페이지에서 아무것도 못
+        # 찾았다"와 "찾았는데 known과 안 맞다"는 구분해야 한다 - 전자면
+        # 좌표 방식 결과로 대체한다.
         cell_class_rows = [r for r in cell_rows_here
                             if r["row_kind"] == "class_return" and r.get("class_code")]
-        cell_refs = [r for r in cell_class_rows if r["class_code"] in known]
         coord_class_rows = [r for r in coord_rows
                              if r["row_kind"] == "class_return" and r.get("class_code")]
-        coord_refs = [r for r in coord_class_rows if r["class_code"] in known]
-        if cell_refs:
-            class_rows, refs = cell_class_rows, cell_refs
-        elif coord_refs:
-            class_rows, refs = coord_class_rows, coord_refs
-        else:
-            class_rows, refs = cell_class_rows, []
-            if refs:
-                break
+        # 예전엔 "이 페이지는 셀 격자를 믿을지 좌표 방식을 믿을지"를
+        # 페이지 하나 단위로 통째로 골랐다(known과 맞는 refs가 있는
+        # 쪽 전부를 채택). 그런데 표 형식이 상품마다 다 다른 이
+        # 데이터 특성상, 한 상품의 문제(예: KR5113420069 - 셀 격자가
+        # 그 페이지에서 통째로 실패)를 고치려고 이 판정 기준을
+        # 바꾸면, 같은 판정을 타는 다른 상품에서 다른 방식으로
+        # 깨지는 일이 반복됐다(KR5120450015: 신뢰 판정 받은 쪽이
+        # 클래스 하나를 놓침 / KR5156450026·KR5160420009: 신뢰 판정
+        # 받은 쪽이 클래스는 다 찾았는데 그중 한 칸(설정후)만 놓침).
+        # "페이지 단위로 승자를 고른 뒤 패자 쪽에서 모자란 걸
+        # 채운다"는 이 구조 자체가 원인이라, 클래스 단위로 바꾼다 -
+        # 클래스마다 독립적으로 "이 클래스는 어느 쪽이 더 믿을 만한지"
+        # 만 보고, 그 클래스가 다른 쪽에 있는 칸을 놓쳤으면 채운다.
+        # 이러면 새 상품의 새 표 형식이 이 판정을 깨도 그 상품(그
+        # 클래스)에만 영향이 있고 이미 맞던 다른 상품까지 흔들리지
+        # 않는다.
+        by_code = {}
+        for r in cell_class_rows:
+            by_code.setdefault(r["class_code"], {})["cell"] = r
+        for r in coord_class_rows:
+            by_code.setdefault(r["class_code"], {})["coord"] = r
+
+        class_rows = []
+        for code, methods in by_code.items():
+            cell_r, coord_r = methods.get("cell"), methods.get("coord")
+            if cell_r and coord_r:
+                if code in known:
+                    cell_matched, cell_bad = _values_agree(cell_r["values"], known[code])
+                    coord_matched, coord_bad = _values_agree(coord_r["values"], known[code])
+                    if cell_bad and not coord_bad:
+                        primary, other = coord_r, cell_r
+                    elif coord_bad and not cell_bad:
+                        primary, other = cell_r, coord_r
+                    elif coord_matched > cell_matched:
+                        primary, other = coord_r, cell_r
+                    else:
+                        primary, other = cell_r, coord_r
+                else:
+                    # 대조할 known이 없는 새 클래스는 칸이 더 많이
+                    # 채워진 쪽을 주로 삼는다(동률이면 코드 인식이
+                    # 더 확실한 셀 격자 쪽 원칙대로 셀을 우선한다).
+                    n_cell = sum(1 for v in cell_r["values"].values()
+                                 if v not in (None, ""))
+                    n_coord = sum(1 for v in coord_r["values"].values()
+                                  if v not in (None, ""))
+                    primary, other = ((cell_r, coord_r) if n_cell >= n_coord
+                                       else (coord_r, cell_r))
+                for k, v in other.get("values", {}).items():
+                    if v not in (None, "") and not primary["values"].get(k):
+                        primary["values"][k] = v
+                class_rows.append(primary)
+            else:
+                class_rows.append(cell_r or coord_r)
+
+        refs = [r for r in class_rows if r["class_code"] in known]
 
         def commit(rows_to_add, this_page_num):
             for r in rows_to_add:

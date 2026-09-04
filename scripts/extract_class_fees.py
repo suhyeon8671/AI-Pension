@@ -3203,6 +3203,13 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
 # 5년후/10년후"), 구조가 요약표와 달라 별도로 읽는다.
 # ---------------------------------------------------------------------------
 
+# "후"는 문서마다 있기도(1년후) 없기도(1년) 하다(KR5117420097 실측:
+# "1년 2년 3년 5년 10년"처럼 "후" 없이 쓰는 문서가 실재한다) - "후"를
+# 필수로 요구하면 이런 문서를 통째로 놓친다. 대신 "최근 1년"/"최근
+# 2년"처럼 전혀 다른 표(연평균 수익률 요약표)의 기간 머리글과 헷갈리는
+# 문제는, 아래 by_code 선택에서 "연도 칸을 더 많이 채운 쪽"을 우선하는
+# 것으로 대응한다(수익률 요약표는 보통 10년 칸이 없어 4칸뿐이고, 진짜
+# 비용예시표는 5칸이 다 있다 - KR5113420069 실측).
 COST_AFTER_RE = re.compile(r"^(\d+)년\s*후?$")
 
 
@@ -3356,6 +3363,18 @@ def _detail_cost_grids(pdf):
                     # 완성된 연도 칸은 더 안 건드린다.
                     if COST_AFTER_RE.match(cur.replace(" ", "")):
                         continue
+                    # cur가 "OO년후" 조각으로 보이지 않는 남남의 글자를
+                    # 담고 있으면(실측 KR5156450026: 표 맨 위 캡션
+                    # "투자기간"이 하필 "1년후" 칸과 같은 x열로 셀이
+                    # 잡혀 먼저 쌓이고, 그 뒤에 진짜 "1년후"가 이어
+                    # 붙으면 "투자기간1년후"가 돼 다시는 연도로 안
+                    # 읽힌다 - 그 결과 1년후 칸 전체가 통째로 빠졌었다)
+                    # 이어붙이지 말고 새로 시작한다. 진짜 "OO년후"
+                    # 조각(숫자/년/후로만 된 짧은 글자, "2년후"가 세
+                    # 줄로 쪼개지는 문서의 "2"/"년"/"후" 각 조각 포함)
+                    # 이면 그 모양을 유지하므로 안 걸린다.
+                    if cur and not re.fullmatch(r"[\d년후]*", cur):
+                        cur = ""
                     acc[ci] = cur + v
             cand = {}
             for ci, v in acc.items():
@@ -3413,6 +3432,33 @@ def _detail_cost_grids(pdf):
                 ws.sort(key=lambda w: (round(w["top"] / 3), w["x0"]))
                 label = " ".join(w["text"] for w in ws)
                 code = _label_class_code(label)
+                if not code and r is grid[-1] and i + 1 < len(pdf.pages):
+                    # 이 표의 마지막 행은 이름표가 "코드" 조각만 남기고
+                    # 페이지 경계에서 끊길 수 있다(KR5113470030/S 실측:
+                    # 값 행 바로 다음에 와야 할 "(S)" 코드 줄이 이
+                    # 페이지엔 아예 없고, 다음 페이지 맨 위 첫 줄로
+                    # 넘어가 있다). 다음 페이지 맨 첫 줄만 좁게 봐서
+                    # 코드 조각이 있으면 그걸로 채운다.
+                    nxt_words = pdf.pages[i + 1].extract_words(
+                        x_tolerance=2, keep_blank_chars=False)
+                    nxt_lines = cluster_lines(nxt_words, tol=2.5)
+                    if nxt_lines:
+                        lead = "".join(w["text"] for w in nxt_lines[0])
+                        # 다음 페이지 첫 줄이 이미 캡션("판매수수료및
+                        # 보수·비용")이나 숫자값을 담고 있으면, 그건 이
+                        # 행이 이어지는 이름표가 아니라 완전히 새 행
+                        # (다른 클래스)의 시작이다(KR5113420013 실측:
+                        # 46쪽 마지막 행 다음 47쪽 첫 줄이 "인-개인연금
+                        # (C)판매수수료및보수·비용"으로 캡션까지 붙어
+                        # 있다 - 이걸 그대로 이 행 코드로 쓰면 사실은
+                        # 클래스 "C"의 새 행 이름표 앞부분인데 이 행
+                        # (다른 클래스)의 코드로 잘못 갖다 붙인다). 순수
+                        # 코드 조각만 있고 그 뒤에 아무 것도(캡션도
+                        # 숫자도) 안 붙어 있을 때만 받는다 - 애매하면
+                        # 코드를 못 찾은 채로 두는 게(누락) 엉뚱한 코드에
+                        # 값을 붙이는 것(오귀속)보다 낫다.
+                        if not re.search(r"[0-9]|판매수수료|보수|비용", lead):
+                            code = _label_class_code(label + lead)
                 if not code:
                     continue
                 # 같은 클래스가 "판매수수료 및 보수·비용"과 "(피투자
@@ -4860,10 +4906,14 @@ def fill_detail_cost_projections(doc_id, rows):
         grids = _detail_cost_grids(pdf)
     if not grids:
         return 0
+    # 같은 코드가 여러 표(부속서류가 여러 군데 있는 문서)에서 나오면,
+    # 연도 칸을 더 많이 채운 쪽을 믿는다 - "1년후~10년후" 5칸이 전부
+    # 있는 진짜 비용예시표가, 일부만 걸린 표보다 항상 더 완전하다.
     by_code = {}
     for _, m in grids:
         for code, vals in m.items():
-            by_code.setdefault(code, vals)
+            if code not in by_code or len(vals) > len(by_code[code]):
+                by_code[code] = vals
 
     checked = conflict = 0
     for r in rows:
