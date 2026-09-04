@@ -213,35 +213,13 @@ def answer_payload(question_id: str, question: str) -> dict:
             "route": "tax_calculation",
         }
 
-    # 여러 상품을 조건으로 걸러 정렬하는 질의("총보수가 가장 낮은 상품
-    # 5개", "위험등급 4 이하이고 총보수가 낮은 상품")는 지목된 상품이
-    # 없다. product_lookup.GENERIC_WORDS가 "채권형"/"혼합형" 같은
-    # 분류어를 상품 이름으로 안 보므로 find_products는 이런 질문에서
-    # 어차피 못 찾는다 - 그러면 RAG로 빠져 엉뚱한 텍스트 조각만 나오게
-    # 되므로, 상품 조회보다 먼저 랭킹 질의인지부터 본다.
-    rank_conditions = product_ranking.detect(question)
-    if rank_conditions is not None:
-        summary, evidence = product_ranking.rank_products(rank_conditions)
-        answer, how = compose_answer(question, summary, summary)
-        return {
-            "question_id": question_id,
-            "question": question,
-            "retrieved_context": summary,
-            "think_trace": (
-                f"1. 질의 분류: 상품 랭킹/조건 검색 (조건: {rank_conditions})\n"
-                "2. semantic_search 대신 구조화 DB(product_master/class_fees/"
-                "class_returns/fund_aum) 전체를 조건으로 걸러 정렬 (일반 고객이 "
-                "가입 가능한 클래스만 사용)\n"
-                f"   - 조회 근거: {evidence[:5]}\n"
-                f"3. 답변 생성: {how}"
-            ),
-            "answer": answer,
-            "route": "ranking",
-        }
-
     # 상품을 이름으로도 찾는다. 예전엔 질의에 상품코드(KR...)가 문자
     # 그대로 있을 때만 인식해서, "미래에셋장기성장포커스 총보수 얼마야?"
     # 같은 실제 질문이 구조화 DB에 못 닿고 텍스트 검색으로 빠졌다.
+    # 랭킹 질의 판단보다 먼저 하는 이유: "솔로몬 단기·중장기·장기
+    # 국공채 중 위험도가 가장 낮은 상품은?"처럼 "여러 상품 중에서"가
+    # 카테고리가 아니라 이름으로 지목한 상품들을 가리킬 수 있어서,
+    # 랭킹 쪽에 그 상품코드들을 넘겨줘야 한다.
     hits = find_products(question)
     product_codes = [h[0] for h in hits]
     analysis, analysis_how = (None, "규칙 기반 상품명 매칭으로 이미 찾아 LLM 질의분석 생략")
@@ -258,6 +236,37 @@ def answer_payload(question_id: str, question: str) -> dict:
                     if code not in product_codes:
                         product_codes.append(code)
                         hits.append((code, name, n))
+
+    # 여러 상품을 조건으로 걸러 정렬하는 질의("총보수가 가장 낮은 상품
+    # 5개", "위험등급 4 이하이고 총보수가 낮은 상품", "솔로몬 셋 중
+    # 위험도가 가장 낮은 상품은?")는 랭킹을 비교보다 먼저 본다 - "중에서
+    # 가장 낮은/제일 좋은 하나"를 묻는 건 나란히 늘어놓는 비교가 아니라
+    # 하나를 골라내라는 뜻이라, is_comparison_query가 상품코드 2개
+    # 이상이면 그냥 True를 주는 것과 충돌한다. product_codes가 2개
+    # 이상이면 그 상품들 안에서만, 아니면(카테고리 질문이라 이름으로는
+    # 못 찾음) 코퍼스 전체에서 정렬한다.
+    rank_conditions = product_ranking.detect(question)
+    if rank_conditions is not None:
+        named = product_codes if len(product_codes) >= 2 else None
+        summary, evidence = product_ranking.rank_products(rank_conditions, named_codes=named)
+        answer, how = compose_answer(question, summary, summary)
+        return {
+            "question_id": question_id,
+            "question": question,
+            "retrieved_context": summary,
+            "think_trace": (
+                f"1. 질의 분류: 상품 랭킹/조건 검색 (조건: {rank_conditions})\n"
+                + (f"   - 질문에서 지목한 상품코드: {product_codes}\n" if named else "")
+                + "2. semantic_search 대신 구조화 DB(product_master/class_fees/"
+                "class_returns/fund_aum)를 조건으로 걸러 정렬 (일반 고객이 "
+                "가입 가능한 클래스만 사용)\n"
+                f"   - 조회 근거: {evidence[:5]}\n"
+                f"3. 답변 생성: {how}"
+            ),
+            "answer": answer,
+            "route": "ranking",
+        }
+
     if is_comparison_query(question, product_codes) and len(product_codes) >= 2:
         summary, evidence = compare_products(product_codes)
         answer, how = compose_answer(question, summary, summary)

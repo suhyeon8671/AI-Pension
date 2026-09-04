@@ -242,18 +242,25 @@ def _aum_map(conn):
     return out
 
 
-def rank_products(conditions, db_path=DEFAULT_DB_PATH):
-    """조건에 맞는 상품을 정렬한 (요약 텍스트, 근거 목록)."""
+def rank_products(conditions, db_path=DEFAULT_DB_PATH, named_codes=None):
+    """조건에 맞는 상품을 정렬한 (요약 텍스트, 근거 목록).
+
+    named_codes: find_products()가 질문에서 이름으로 직접 지목한 상품
+    코드 목록(2개 이상). 주어지면 전체 100개가 아니라 이 상품들 안에서만
+    정렬한다 - "솔로몬 단기·중장기·장기 국공채 중 위험도가 가장 낮은
+    상품은?"처럼 "여러 상품 중에서"가 카테고리가 아니라 사용자가 직접
+    이름을 댄 상품들을 가리키는 경우다. 이 경우 asset_type 필터는 이미
+    사용자가 상품을 특정했으므로 의미가 없어 건너뛴다."""
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
         products = {r["product_code"]: dict(r) for r in conn.execute(
             "SELECT product_code, product_name, asset_type, risk_level FROM product_master")}
 
-        pool = set(products)
+        pool = set(named_codes) & set(products) if named_codes else set(products)
         excluded_notes = []
 
-        if conditions["asset_types"] is not None:
+        if named_codes is None and conditions["asset_types"] is not None:
             allowed = set(conditions["asset_types"])
             pool = {c for c in pool if products[c]["asset_type"] in allowed}
             if not allowed:
@@ -322,7 +329,9 @@ def rank_products(conditions, db_path=DEFAULT_DB_PATH):
 
         lines = []
         cond_bits = []
-        if conditions["asset_types"] is not None:
+        if named_codes:
+            cond_bits.append(f"질문에서 지목한 상품 {len(set(named_codes) & set(products))}개 중에서")
+        elif conditions["asset_types"] is not None:
             cond_bits.append("분류: " + ("/".join(conditions["asset_types"]) or "해당 분류 상품 없음"))
         if conditions["risk_filter"] is not None:
             n, op = conditions["risk_filter"]
