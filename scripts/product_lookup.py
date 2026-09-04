@@ -138,7 +138,15 @@ def _piece_is_background(piece):
     if n is None:
         n = sum(1 for _, _, nn in _CACHE if piece in nn)
         _BACKGROUND_CACHE[piece] = n
-    return n > MAX_SHARED_PRODUCTS
+    # 경계값 자체(정확히 MAX_SHARED_PRODUCTS개)도 배경어로 본다. "포커스"
+    # (마케팅용 상투어, 상품 고유명이 아님)를 정확히 5개 상품이 나눠
+    # 갖는데, ">"였을 때는 "5 > 5"가 거짓이라 식별 조각으로 잘못
+    # 살아남았다(실측: "미래에셋장기성장포커스의 연금저축용 클래스는
+    # 뭐야?"가 "포커스" 한 조각으로 무관한 "미래에셋고배당포커스연금
+    # 저축..." 펀드까지 같이 찾아서 단일 상품 질문이 엉뚱하게 비교로
+    # 샜다). "솔로몬"/"한국투자골드플랜연금"처럼 진짜 식별 조각은 4개
+    # 상품만 나눠 가져 이 경계보다 낮으므로 그대로 살아남는다.
+    return n >= MAX_SHARED_PRODUCTS
 
 
 def _match_blocks(q, nname):
