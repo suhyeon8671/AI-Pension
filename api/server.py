@@ -43,6 +43,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 from compare_products import is_comparison_query, compare_products  # noqa: E402
 from product_lookup import find_products, find_class_code  # noqa: E402
 from product_facts import detect_intents, product_facts  # noqa: E402
+import input_guard  # noqa: E402
+import query_analyzer  # noqa: E402
+import tax_calculator  # noqa: E402
 
 app = FastAPI(title="연금 Agent 평가용 API")
 
@@ -120,6 +123,23 @@ def format_think_trace(query: str, route_result: dict) -> str:
     return "\n".join(lines)
 
 
+def _analysis_trace_line(analysis, analysis_how):
+    """LLM 구조화 질의분석 결과를 think_trace 한 줄로 요약.
+
+    missing_slots(질문에 안 밝혀진 조건)는 되묻지 않고(단일 턴 평가라
+    되물으면 답을 못 받는다 - answer_llm.SYSTEM_PROMPT 규칙 6 참고),
+    "이 조건이 안 밝혀져 있었다"는 근거로만 남긴다. 실제로 어떤 기본값을
+    썼는지는 LLM이 답을 쓸 때 규칙 6에 따라 알아서 밝힌다."""
+    if not analysis:
+        return f"   - LLM 질의분석: {analysis_how}"
+    line = (f"   - LLM 질의분석: intent={analysis.get('intent')}, "
+            f"entities={analysis.get('entities')}")
+    missing = analysis.get("missing_slots")
+    if missing:
+        line += f"\n   - 질문에 안 밝혀진 조건(되묻지 않고 무난한 기본값으로 답함): {missing}"
+    return line
+
+
 NO_EVIDENCE = (
     "가지고 있는 자료로는 이 질문에 답할 수 있는 근거를 찾지 못했습니다. "
     "질문을 더 구체적으로 말씀해 주시거나, 관련 제도나 상품명을 알려주시면 다시 찾아보겠습니다."
@@ -167,11 +187,50 @@ def answer_payload(question_id: str, question: str) -> dict:
 
     route 필드는 어느 경로로 답했는지(comparison/single_product/rag)를
     남긴다. 응답 스펙에 없는 필드라 /answer에서는 빼고 내보낸다."""
+    blocked = input_guard.check(question_id, question)
+    if blocked is not None:
+        return blocked
+
+    # 세제 계산 질의(세액공제/연금소득세/퇴직소득세감면/기타소득세)는
+    # 상품과 무관하고 답이 순전히 규칙 계산이라, 상품 조회·검색보다
+    # 먼저 본다 - 계산에 필요한 숫자(금액/나이/연차)를 질문에서 못 찾으면
+    # None을 돌려주므로, 여기 안 걸리면 그냥 아래 경로로 그대로 이어진다.
+    tax_summary, tax_evidence = tax_calculator.answer_from_question(question)
+    if tax_summary is not None:
+        answer, how = compose_answer(question, tax_summary, tax_summary)
+        return {
+            "question_id": question_id,
+            "question": question,
+            "retrieved_context": tax_summary,
+            "think_trace": (
+                "1. 질의 분류: 세제 계산 (질문에서 계산에 필요한 금액/나이/연차 인식)\n"
+                f"   - 계산 근거(세율·한도 출처): {tax_evidence}\n"
+                "2. semantic_search 대신 세제 규칙 계산기(tax_calculator) 직접 계산\n"
+                f"3. 답변 생성: {how}"
+            ),
+            "answer": answer,
+            "route": "tax_calculation",
+        }
+
     # 상품을 이름으로도 찾는다. 예전엔 질의에 상품코드(KR...)가 문자
     # 그대로 있을 때만 인식해서, "미래에셋장기성장포커스 총보수 얼마야?"
     # 같은 실제 질문이 구조화 DB에 못 닿고 텍스트 검색으로 빠졌다.
     hits = find_products(question)
     product_codes = [h[0] for h in hits]
+    analysis, analysis_how = (None, "규칙 기반 상품명 매칭으로 이미 찾아 LLM 질의분석 생략")
+    if not product_codes:
+        # 규칙 기반 이름 매칭이 하나도 못 찾았을 때만 LLM 질의분석을
+        # 부른다 - 이미 찾았으면 토큰을 쓸 이유가 없다. HCX가 뽑은
+        # entities.product_names로 find_products를 다시 시도해서, 질문
+        # 원문 표현이 상품명과 너무 달라(줄임말/오탈자) 규칙 매칭이
+        # 놓친 경우를 보강한다.
+        analysis, analysis_how = query_analyzer.analyze(question)
+        if analysis:
+            for cand in analysis.get("entities", {}).get("product_names", []):
+                for code, name, n in find_products(cand):
+                    if code not in product_codes:
+                        product_codes.append(code)
+                        hits.append((code, name, n))
     if is_comparison_query(question, product_codes) and len(product_codes) >= 2:
         summary, evidence = compare_products(product_codes)
         answer, how = compose_answer(question, summary, summary)
@@ -182,6 +241,7 @@ def answer_payload(question_id: str, question: str) -> dict:
             "think_trace": (
                 "1. 질의 분류: 상품 비교 (상품코드 2개 이상 인식)\n"
                 f"   - 인식된 상품코드: {product_codes}\n"
+                f"{_analysis_trace_line(analysis, analysis_how)}\n"
                 "2. semantic_search 대신 구조화 DB(product_master/class_fees/"
                 "class_returns) 직접 조회로 처리 (토큰 절약)\n"
                 f"   - 조회 근거: {evidence}\n"
@@ -210,6 +270,7 @@ def answer_payload(question_id: str, question: str) -> dict:
                     f"1. 질의 분류: 단일 상품 정량 질의 (의도: {intents})\n"
                     f"   - 인식된 상품: {code} ({hits[0][1]})\n"
                     f"   - 지목된 클래스: {find_class_code(question) or '없음(전체)'}\n"
+                    f"{_analysis_trace_line(analysis, analysis_how)}\n"
                     "2. semantic_search 대신 구조화 DB(product_master/class_fees/"
                     "class_returns/fund_aum) 직접 조회\n"
                     f"   - 조회 근거: {ev[:5]}\n"
@@ -232,7 +293,9 @@ def answer_payload(question_id: str, question: str) -> dict:
         "question_id": question_id,
         "question": question,
         "retrieved_context": format_retrieved_context(route_result),
-        "think_trace": format_think_trace(question, route_result) + f"\n4. 답변 생성: {how}",
+        "think_trace": (format_think_trace(question, route_result)
+                        + f"\n{_analysis_trace_line(analysis, analysis_how)}"
+                        + f"\n4. 답변 생성: {how}"),
         "answer": answer,
         "route": "rag",
     }

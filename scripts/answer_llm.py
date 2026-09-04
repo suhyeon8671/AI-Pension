@@ -120,6 +120,85 @@ def check_asks_back(answer):
     return bool(RE_ASKS_BACK.search(text))
 
 
+# 규칙 5(추천/권유 금지)도 프롬프트만 믿지 않고 한 번 더 본다. "사세요"류
+# 명령형과 "가장 좋다/추천한다"류 단정 평가 표현을 같이 잡는다 - 이 둘을
+# 따로 두면 "이 상품이 가장 좋습니다"(명령형 아님)나 "매수하세요"(단정
+# 표현 아님) 중 하나만 걸린다.
+RE_RECOMMENDATION = re.compile(
+    r"(사세요|매수하세요|가입하세요|투자하세요|담으세요)"
+    r"|(추천(합니다|드립니다|해요)|권합니다|권해드립니다)"
+    r"|((가장|제일)\s*(좋|낫|유리)[가-힣]{0,3}(습니다|아요|어요|다)?)"
+)
+
+
+def check_recommendation(answer):
+    """답이 특정 상품 매수/가입을 권하거나 단정적으로 낫다고 하면 True."""
+    return bool(RE_RECOMMENDATION.search(answer or ""))
+
+
+# 근거에 없는 상품코드를 답이 지어내 언급하면(숫자가 아니라 코드라
+# check_numbers로는 안 걸린다) 그 자체로 근거 이탈이다.
+# 한글 뒤에는 \b가 안 먹는다(\b는 \w 경계인데, 한글도 \w라 "코드를"처럼
+# 코드 바로 뒤에 조사가 붙으면 경계로 안 잡힌다) - 뒤쪽은 영숫자가 더
+# 이어지지만 않으면 되므로 부정형 전방탐색으로 막는다.
+RE_KR_CODE = re.compile(r"KR[0-9A-Za-z]{10}(?![0-9A-Za-z])")
+
+
+def check_claims(answer, context):
+    """답에 나온 상품코드(KR...) 중 근거에 없는 것을 돌려준다. 비어 있으면 통과."""
+    codes = set(RE_KR_CODE.findall(answer or ""))
+    return sorted(c for c in codes if c not in (context or ""))
+
+
+# 질문이 물은 항목(보수/수익률/위험등급/설정액/비용예시 등)이 답에서
+# 아예 안 다뤄졌는지 본다. product_facts.detect_intents와 같은 의도
+# 분류를 재사용해 질문 쪽과 답변 쪽에 일관되게 적용한다 - 질문 분류에
+# 쓰는 낱말과 답이 그 의도를 다뤘다고 볼 낱말은 다르므로(질문은 "총보수
+# 얼마"처럼 캐묻는 말투, 답은 "총보수는 0.43%" 같은 서술형이라 낱말
+# 자체는 겹친다) 여기서는 INTENT_KEYWORDS를 답 쪽에도 그대로 재사용한다
+# - 의도를 물은 낱말이 답에도 나오는 게 정상이기 때문이다(질문 "총보수
+# 얼마야" -> 답 "총보수는...").
+def check_question_coverage(question, answer):
+    """질문에서 감지된 의도 중 답에서 전혀 안 다뤄진 것을 돌려준다."""
+    try:
+        from product_facts import INTENT_KEYWORDS, detect_intents
+    except ImportError:
+        return []
+    intents = detect_intents(question)
+    ans = (answer or "").replace(" ", "")
+    missing = []
+    for intent in intents:
+        kws = INTENT_KEYWORDS.get(intent, ())
+        if kws and not any(w.replace(" ", "") in ans for w in kws):
+            missing.append(intent)
+    return missing
+
+
+def verify_answer(question, answer, context):
+    """생성된 답을 검증기(다섯 항목)로 훑는다. 실패 항목 설명 목록을 돌려준다.
+
+    check_numbers만으로는 숫자 하나만 본다 - 상품코드를 지어내거나,
+    추천성 문장을 넣거나, 질문이 물은 항목을 통째로 빠뜨려도 못 잡는다.
+    이 다섯 항목이 설계에서 말한 검증기(숫자·계산 재검증/주장-근거 연결
+    검사/질문 요구사항 누락 검사/단정 추천 검사/문서에 없는 주장 검사)에
+    대응한다."""
+    problems = []
+    bad_numbers = check_numbers(answer, context)
+    if bad_numbers:
+        problems.append(f"근거에 없는 숫자 사용: {bad_numbers[:5]}")
+    bad_codes = check_claims(answer, context)
+    if bad_codes:
+        problems.append(f"근거에 없는 상품코드 언급: {bad_codes[:5]}")
+    if check_recommendation(answer):
+        problems.append("추천/단정 표현 사용(규칙 5 위반)")
+    if check_asks_back(answer):
+        problems.append("정보 없이 되묻기만 함(단일 턴이라 답을 못 받음)")
+    missing = check_question_coverage(question, answer)
+    if missing:
+        problems.append(f"질문이 물은 항목 미반영: {missing}")
+    return problems
+
+
 def build_messages(question, context):
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -129,11 +208,30 @@ def build_messages(question, context):
     ]
 
 
+def build_retry_messages(question, context, prev_answer, problems):
+    """검증 실패 뒤 한 번 더 시도할 때 쓰는 메시지. 무엇이 왜 틀렸는지
+    구체적으로 짚어 줘야 같은 실수를 반복하지 않는다 - 그냥 "다시 써라"만
+    시키면 새 답도 같은 자리에서 또 어긋날 수 있다."""
+    messages = build_messages(question, context)
+    messages.append({"role": "assistant", "content": prev_answer})
+    messages.append({"role": "user", "content":
+        "방금 답이 아래 문제로 반려됐다. <근거>만 다시 확인해서 문제를 "
+        "고친 답을 새로 써라. 고칠 수 없으면(근거 자체에 없는 내용이라면) "
+        "규칙 4대로 확인할 수 없다고 답하라.\n\n"
+        "문제:\n" + "\n".join(f"- {p}" for p in problems)})
+    return messages
+
+
 def generate(question, context, max_tokens=900):
     """(답변 글자, 어떻게 만들었는지 한 줄).
 
-    LLM을 못 쓰거나 답이 근거를 벗어나면 None을 돌려준다. 부르는 쪽이
-    근거를 그대로 내보내면 된다 - 틀린 문장보다 투박한 근거가 낫다."""
+    LLM을 못 쓰거나 검증기를 (재시도까지) 통과 못 하면 None을 돌려준다.
+    부르는 쪽이 근거를 그대로 내보내면 된다 - 틀린 문장보다 투박한 근거가
+    낫다.
+
+    검증기(verify_answer)에 걸리면 바로 버리지 않고 문제를 구체적으로
+    짚어 한 번 다시 시켜 본다(설계의 "실패 -> 답변 1회 재생성"). 그래도
+    걸리면 그때 버린다 - 한 번은 봐주되 두 번은 안 봐준다."""
     if not is_configured():
         return None, "HCX 키가 없어 LLM 생성을 건너뛰고 조회 결과를 그대로 내보냄"
     if not context or context.strip() in ("", "(검색된 근거 문서 없음)"):
@@ -142,14 +240,24 @@ def generate(question, context, max_tokens=900):
         text = chat(build_messages(question, context), max_tokens=max_tokens)
     except HcxError as e:
         return None, f"HCX 호출 실패({e}) - 조회 결과를 그대로 내보냄"
-    bad = check_numbers(text, context)
-    if bad:
-        return None, (f"생성된 답에 근거에 없는 숫자 {bad[:5]}가 있어 버리고 "
-                      "조회 결과를 그대로 내보냄")
-    if check_asks_back(text):
-        return None, ("생성된 답이 정보 없이 되묻기만 해 버리고 조회 결과를 "
-                      "그대로 내보냄(단일 턴 평가라 되물으면 답을 못 받음)")
-    return text, "HCX가 조회 결과를 문장으로 옮김(숫자 검산 통과)"
+
+    problems = verify_answer(question, text, context)
+    if not problems:
+        return text, "HCX가 조회 결과를 문장으로 옮김(검증기 5항목 통과)"
+
+    try:
+        retry_text = chat(build_retry_messages(question, context, text, problems),
+                          max_tokens=max_tokens)
+    except HcxError as e:
+        return None, (f"1차 답 검증 실패({problems[:2]}) 후 재생성 호출도 "
+                      f"실패({e}) - 조회 결과를 그대로 내보냄")
+
+    retry_problems = verify_answer(question, retry_text, context)
+    if not retry_problems:
+        return retry_text, (f"1차 답 검증 실패({problems[:2]})로 1회 재생성함 - "
+                            "재생성 답은 검증기 통과")
+    return None, (f"1차 답 검증 실패({problems[:2]}), 재생성 답도 검증 "
+                  f"실패({retry_problems[:2]}) - 조회 결과를 그대로 내보냄")
 
 
 def _demo():
@@ -176,6 +284,31 @@ def _check_demo():
         mark = "OK " if got == want else "!! "
         ok = ok and got == want
         print(f"{mark}{ans!r}\n     근거에 없는 숫자: {got} (기대 {want})")
+
+    print()
+    rec_cases = [
+        ("이 상품을 매수하세요.", True),
+        ("A클래스가 가장 좋습니다.", True),
+        ("총보수는 A클래스가 가장 낮습니다.", False),
+        ("총보수는 0.43%입니다.", False),
+    ]
+    for ans, want in rec_cases:
+        got = check_recommendation(ans)
+        mark = "OK " if got == want else "!! "
+        ok = ok and got == want
+        print(f"{mark}[추천표현] {ans!r} -> {got} (기대 {want})")
+
+    print()
+    claim_ctx = "미래에셋솔로몬단기국공채증권자투자신탁1호(채권) (KR5153420063) 총보수 0.43%"
+    claim_cases = [
+        ("KR5153420063의 총보수는 0.43%입니다.", []),
+        ("KR5153420063와 KR0000000000을 비교하면...", ["KR0000000000"]),
+    ]
+    for ans, want in claim_cases:
+        got = check_claims(ans, claim_ctx)
+        mark = "OK " if got == want else "!! "
+        ok = ok and got == want
+        print(f"{mark}[근거외코드] {ans!r} -> {got} (기대 {want})")
     return 0 if ok else 1
 
 
@@ -209,7 +342,7 @@ def _mock_demo():
             me.is_configured = lambda: True
             p = answer_payload("MOCK", q)
             how = p["think_trace"].strip().splitlines()[-1]
-            used_llm = "숫자 검산 통과" in how
+            used_llm = "검증기" in how and "통과" in how
             want_llm = name == "정상 응답"
             ok = ok and used_llm == want_llm
             print(f"{'OK ' if used_llm == want_llm else '!! '}{name}")
