@@ -505,7 +505,15 @@ def _parse_tall_table(rows, known_codes=()):
             continue
         seen_kinds.add(_squash(row[kind_col]))
         field = TALL_KIND_TO_FIELD[_squash(row[kind_col])]
-        val = row[kind_col + 1] if kind_col + 1 < len(row) else None
+        # 구분 칸 바로 다음 칸이 늘 값 칸은 아니다 - 표 테두리 선과
+        # 실제 글자 칸 경계가 안 맞아 그 사이에 빈 칸(병합된 셀의
+        # 나머지 조각)이 여러 개 끼는 문서가 있다(키움자산운용
+        # KR5123365001 실측: "['선취판매수수료','','','','','-',...]"
+        # - kind_col+1은 빈 문자열이고 진짜 값 "-"는 5칸 뒤에야 나온다).
+        # 고정 오프셋(kind_col+1) 대신, 구분 칸 다음부터 처음 나오는
+        # 빈칸 아닌 칸을 값으로 본다 - "부과시기"(매입시/환매시 등)는
+        # 그 값 칸보다 항상 뒤에 있어 먼저 걸릴 위험이 없다.
+        val = next((c for c in row[kind_col + 1:] if (c or "").strip()), None)
         cv = _clean(val)
         if cv and not cur_rec.get(field):
             cur_rec[field] = cv
