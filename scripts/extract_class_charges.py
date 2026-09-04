@@ -192,6 +192,21 @@ RE_PCT_NUM = re.compile(r"[\d]+(?:\.[\d]+)?\s*%")
 RE_BUNBUI_NUM = re.compile(r"100분\s*의\s*[\d]+(?:\.[\d]+)?")
 
 
+def _elig_looks_cut(elig):
+    """가입자격 문장이 중간에서 잘렸는지 본다. 150자 문턱을 넘겨
+    누적을 멈추는 안전장치(_flush 주석 참고)가, 실제로는 "이 클래스
+    몫이 시작하기 전에" 남의 몫이 먼저 섞여 들어오는 문서에서는
+    거꾸로 작동한다(KR5139420015 S-p 실측: 원본은 "소득세법
+    제20조의3...가입할 수 있으며 다른 종류 수익증권(가입자격(기관 및
+    고액거래자 등)에 제한이 있는 종류 수익증권 제외)보다..."인데,
+    앞쪽이 잘려 나가고 "수 있으며 다른 종류 수익증권(가입자격(기관"
+    이라는, 문장 중간에서 시작해 괄호가 안 닫힌 조각만 남았다). 괄호가
+    안 맞으면(원본 법령 문구는 항상 괄호를 닫는다) 문장이 잘렸다는
+    확실한 신호이므로, 틀린 조각을 내느니 아예 버린다.
+    """
+    return elig.count("(") != elig.count(")")
+
+
 def _clean_front_load_fee(v):
     """선취판매수수료 값을 최종적으로 한 번 더 본다. 이 칸은 값이
     클래스마다 다른 게 정상이라(위 CARRY_FIELDS 주석 참고) 다른 클래스
@@ -470,7 +485,15 @@ def _parse_tall_table(rows, known_codes=()):
                     if not cs or RE_HAS_LABEL.search(_squash(cs)):
                         continue
                     elig = _clean(cs)
-                    if elig and not cur_rec.get("eligibility"):
+                    # 이 칸이 가입자격 문장이 아니라 각주 참조("주2)
+                    # 참조")나 옆 칸의 수수료율("납입금액의 0.4%이내
+                    # 주1)")이 잘못 흘러든 경우가 있다(KR5123420015/49,
+                    # KR5123490013/16/17, KR5157420003, KR5185450009
+                    # 실측 - 전부 괄호가 안 맞거나 수수료 모양이라
+                    # _elig_looks_cut/_looks_like_fee_cell로 걸러진다).
+                    if (elig and not cur_rec.get("eligibility")
+                            and not _elig_looks_cut(elig)
+                            and not _looks_like_fee_cell(elig)):
                         cur_rec["eligibility"] = elig
                     break
             elif kind_col is None:
@@ -1548,7 +1571,7 @@ def _coord_fee_table_page(page, known_codes, carry=None):
         # 등)의 숫자 조각이 새어 들어오면 "0.3000"처럼 숫자만 남는데,
         # 이런 값은 가입자격으로 낼 게 아니라 아예 버리는 게 낫다.
         if (elig and not rec.get("eligibility") and len(elig) <= 150
-                and re.search(r"[가-힣]", elig)):
+                and re.search(r"[가-힣]", elig) and not _elig_looks_cut(elig)):
             rec["eligibility"] = elig
         for col, toks in value_parts.items():
             v = _clean(" ".join(toks))
@@ -1710,7 +1733,7 @@ def _coord_fee_table_page(page, known_codes, carry=None):
                 if elig_words:
                     elig = _clean(" ".join(w["text"] for w in elig_words).strip())
                     if (elig and not rec.get("eligibility") and len(elig) <= 150
-                            and re.search(r"[가-힣]", elig)):
+                            and re.search(r"[가-힣]", elig) and not _elig_looks_cut(elig)):
                         rec["eligibility"] = elig
                 vws = sorted(value_words, key=lambda w: w["x0"])
                 vgroups = []
@@ -2142,10 +2165,19 @@ def extract(db_path=DEFAULT_DB_PATH):
                 # kind_col+1로는 못 읽는다). 아무 정보도 없는 빈 레코드를
                 # 그대로 내보내면 잡음만 된다.
                 continue
+            elig_final = rec.get("eligibility")
+            # 표 파서가 여럿(가로형/세로형/전치형/좌표 폴백)이라 위에서
+            # 개별적으로 다 막기 어렵다 - 어느 파서를 거쳤든 최종적으로
+            # 한 번 더 본다. 각주 참조("주2) 참조")나 수수료율 문구가
+            # 가입자격 칸으로 잘못 들어온 경우(KR5123420015/49,
+            # KR5123490013/16/17, KR5157420003 실측)도 여기서 걸린다.
+            if elig_final and (_elig_looks_cut(elig_final)
+                                or _looks_like_fee_cell(elig_final)):
+                elig_final = None
             out.append({
                 "product_code": code,
                 "class_code": cc,
-                "eligibility": rec.get("eligibility"),
+                "eligibility": elig_final,
                 "front_load_fee": _clean_front_load_fee(rec.get("front_load_fee")),
                 "back_load_fee": rec.get("back_load_fee"),
                 "redemption_fee": rec.get("redemption_fee"),

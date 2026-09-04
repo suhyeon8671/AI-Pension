@@ -398,9 +398,16 @@ def check_source_conflicts(conn, rep):
         vals = {s: (r["value"] or "").strip() for s, r in bysrc.items()}
         # 자릿수 표기만 다른 건 다른 값이 아니다("0.05"와 "0.050",
         # "0.2350"과 "0.235"). 숫자로 견준다. 둘 다 "-"면 "문서가 없다고
-        # 적은 것"이라 이것도 같은 값이다.
+        # 적은 것"이라 이것도 같은 값이다. 한쪽만 "-"고 다른 쪽이 "0.00"인
+        # 경우도 같은 값이다 - 이 칸은 요율이라 "확인된 없음"과 "0%"는
+        # 같은 뜻이다(KR5194450018 W distribution_fee 실측: 요약표 "-",
+        # 상세표 "0.00" - 표기만 다를 뿐 둘 다 판매보수가 없다는 같은
+        # 사실을 적은 것이지 상세표를 잘못 읽은 게 아니다).
         nums = []
         for v in vals.values():
+            if v == "-":
+                nums.append(0.0)
+                continue
             try:
                 nums.append(float(v))
             except ValueError:
