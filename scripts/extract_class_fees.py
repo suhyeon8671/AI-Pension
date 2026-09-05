@@ -3452,8 +3452,19 @@ def _detail_cost_grids(pdf):
                     left_margin = (
                         min(30, (lx - col_x0s[last_ci - 1]) / 2)
                         if last_ci > 0 else 30)
+                    # 오른쪽 경계 +30은 콤마 있는 4자리 값(예: "2,144",
+                    # x0=502.5, 칸 왼쪽 경계 474.8에서 +27.7)엔 맞는데,
+                    # 같은 칸의 콤마 없는 3자리 값(예: "944", x0=506.6,
+                    # +31.8)은 오른쪽 정렬 탓에 자릿수가 적을수록 시작
+                    # 위치가 더 오른쪽으로 밀려서 그 폭을 벗어난다
+                    # (KR5157450017 실측: C-F/C-W/C-I 세 클래스만
+                    # 10년후 값이 1,000천원 밑이라 콤마가 없어서 이
+                    # 문턱에 걸려 통째로 빠졌다 - 같은 표의 다른
+                    # 클래스는 전부 콤마 있는 값이라 안 걸렸다). 마지막
+                    # 칸은 오른쪽에 다음 칸이 없어 넓혀도 다른 칸 값을
+                    # 끌어올 위험이 없으므로 +40으로 넉넉히 늘린다.
                     ws = [w for w in words
-                          if lx - left_margin <= w["x0"] <= lx + 30
+                          if lx - left_margin <= w["x0"] <= lx + 40
                           and top - 1 <= (w["top"] + w["bottom"]) / 2 <= bottom + 1]
                     ws.sort(key=lambda w: (round(w["top"] / 3), w["x0"]))
                     txt = " ".join(w["text"] for w in ws).strip()

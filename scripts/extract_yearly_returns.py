@@ -297,6 +297,39 @@ def _periods(rows, header_row, cols, need=2):
                     got[j] = f"{m.group(1)}~{m.group(2)}"
             if len(got) >= need:
                 return got
+    # 라벨("최근N년차")과 날짜가 칸 하나씩 밀려 있는데, 뒤쪽 년차는
+    # 문서 자체에 값이 없어(설정한 지 얼마 안 된 펀드라 5년차까지 없는
+    # 경우 등) 위 두 시도가 다 실패하는 표가 있다(KR5169950018 실측:
+    # "최근1년차"는 2번 칸인데 날짜("24.07.12"+"~25.07.11", 두 줄로
+    # 나뉨)는 3번 칸 - 첫 시도는 날짜 칸 수(2개)가 라벨 칸 수(5개)와
+    # 안 맞아서, 두 번째 시도는 cols={2,5,8,9,10}에 3·6이 없어서 둘 다
+    # 못 건진다). cols 제한 없이 표에서 찾은 날짜를, 있는 만큼만
+    # 왼쪽부터 순서대로 라벨에 배정한다 - "값 칸은 밀려도 순서로
+    # 맞춘다"는 이 파일의 기존 원칙(_row_values)과 같다. 앞의 두
+    # 시도가 이미 실패한 뒤에만 쓰는 마지막 수단이라, 우연히 다른
+    # 날짜가 섞여도 need(최소 개수)를 못 채우면 그냥 실패로 끝난다.
+    best = None
+    for span in (1, 2, 3, 4, 5):
+        for start in range(len(window) - span + 1):
+            joined = {}
+            for row in window[start: start + span]:
+                for j, cell in enumerate(row):
+                    if (cell or "").strip():
+                        joined[j] = joined.get(j, "") + " " + cell
+            found = {}
+            match_len = 0
+            for j, text in joined.items():
+                candidate = _squash_split_digits(text)
+                m = RE_PERIOD.search(candidate)
+                if m:
+                    found[j] = f"{m.group(1)}~{m.group(2)}"
+                    match_len += len(m.group(0))
+            if need <= len(found) < len(cols):
+                if best is None or match_len > best[0]:
+                    best = (match_len, found)
+    if best:
+        ordered_vals = [v for _, v in sorted(best[1].items())]
+        return dict(zip(sorted(cols)[:len(ordered_vals)], ordered_vals))
     return {}
 
 

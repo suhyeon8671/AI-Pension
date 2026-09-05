@@ -91,6 +91,9 @@ COUNT_AUM_NO_UNIT_RE = re.compile(r"(?<!\d)(\d{1,3})\s+(\d{1,3}(?:,\d{3})+)(?!\d
 # "2021년"(년수)+"12개월"(개월수) 모양으로 오인된다(실측: 위 NAME_YEAR_RE
 # 오탐과 같은 자리에서 career까지 "2021년 12월"로 잘못 잡혔었다).
 CAREER_RE = re.compile(r"(?<!\d)(\d{1,3}(?:\.\d{1,2})?년\s*\d{0,2}개?월?)(?!\d)")
+# 이름 줄 자신이 "이름 생년 - - - - -"처럼 값 칸이 전부 "-"로 찍혀
+# 있으면(=이 사람은 개수·규모·경력 다 없다고 문서가 명시한 것) 표시.
+DASH_RUN_RE = re.compile(r"(?:^|\s)-(?:\s+-){1,}")
 # 이 절의 표는 늘 "생년"이 표 머리글에 있고, 각주("주1)"/"주 1)"/"*"로
 # 시작하는 설명)로 끝난다. 이 사이만 표 본문으로 본다 - 그 밖의 페이지
 # 내용(연혁, 위험고지 등)에서 이름+생년 모양이 우연히 걸리는 오탐을 막는다.
@@ -212,6 +215,20 @@ def find_manager_rows(pdf, page_nums, doc_id):
             # 나온다(KCGI KR5147430065 실측: 이름보다 47pt 위의 "18개
             # 10,120억원"이 진짜 값인데, 이름보다 36pt 아래의 "1개
             # 24억원"(하위 집계)이 순수 거리로는 더 가까워 오판했었다).
+            # 이 줄이 "다른" 운용역의 이름+생년 줄이면(자기 자신 줄은
+            # 당연히 자기 이름이 걸리므로 제외 안 됨) 건너뛴다. 이게
+            # 없으면 이 사람 칸이 전부 "-"(데이터 없음)인데 창 안에서
+            # 가장 가까운 "다른 사람"의 개수·규모·경력을 잘못 빌려 온다
+            # (실측: KR5118201004의 전준필(신규 부책임, 표에 전부 "-")이
+            # 위 줄 황우성의 "47개 50,832억원 6년3개월"을 그대로
+            # 물려받았다 - 두 사람 다 이 표에 있었는데 전준필 자기
+            # 줄에는 숫자가 하나도 없었다). "18개 10,120억원"처럼 이름이
+            # 아예 없는 줄(KCGI 실측, 표 칸이 갈려 이름 줄과 떨어진
+            # 진짜 값)은 이 규칙에 안 걸려 그대로 잡힌다 - 사람이 아닌
+            # 순수 값 줄만 빌려오는 걸 막지는 않는다.
+            other = NAME_YEAR_RE.search(line_texts[j])
+            if other and other.group(1) != name:
+                continue
             dist = abs(tops[j] - my_top)
             has_name = name in line_texts[j] and j != i
             key = (0 if has_name else 1, 0 if tops[j] <= my_top else 1, dist)
@@ -251,7 +268,33 @@ def find_manager_rows(pdf, page_nums, doc_id):
                 count = int(am.group(1))
                 aum = _aum_to_100m(am_jo, am_eok)
                 count_key, count_line = key, j
-        if career is None and count is None:
+        # 이 사람 개수·규모가 끝내 하나도 안 잡혔는데(위에서 다른
+        # 사람 줄은 걸렀으니, 정말 이 사람 칸 자체가 비어 있다는 뜻)
+        # 자기 줄이 "이름 생년 - - - - -"처럼 값 자리가 전부 "-"로
+        # 찍혀 있다면, 경력도 십중팔구 "-"다(실측 5건 전부 이 셋이
+        # 같이 빈다). 그런데 "6년3개월"처럼 이름이 안 붙은 순수 숫자
+        # 줄(경력년수만 툭 떨어져 있는 줄)은 위의 "다른 사람 줄
+        # 건너뛰기"로는 못 거른다 - 이름이 아예 없어서 누구 줄인지
+        # 모르기 때문이다. 그래서 개수·규모가 명시적으로 비어 있다는
+        # 신호(자기 줄의 "-" 나열)가 있을 때만 경력도 같이 비운다.
+        explicit_no_data = False
+        if count is None and DASH_RUN_RE.search(line_texts[i]):
+            # class_returns.json/class_fees.json도 원문이 "-"면 파싱
+            # 실패(null)가 아니라 문자열 "-" 그대로 남기는 게 이
+            # 코퍼스의 관행이다 - "확인 안 됨"과 "문서가 명시적으로
+            # 없다고 적음"은 다른 사실이기 때문이다. career는 문자열
+            # 필드라 그 관행을 그대로 따른다.
+            career = "-"
+            explicit_no_data = True
+        # 위에서 "-" 나열로 확인 사살한 경우(explicit_no_data)는 이
+        # 사람이 실존 운용역이라는 것 자체는 확실하니 남긴다 - 통째로
+        # 빼버리면 "이 상품엔 이 운용역이 아예 없다"와 "있는데 개별
+        # 실적을 공시 안 했다"가 구분이 안 된다. 그 신호가 없는데도
+        # career·count가 둘 다 안 잡힌 경우(순수 추출 실패)만 원래대로
+        # 버린다. count·aum은 정수 컬럼이라 "-"를 못 담고, fund_aum.py
+        # 처럼 0으로 바꾸는 것도 안 맞는다("이 운용역이 펀드 0개를
+        # 운용한다"는 다른 사실이 되어버린다) - null로 둔다.
+        if career is None and count is None and not explicit_no_data:
             continue
         rows.append({
             "name": name,

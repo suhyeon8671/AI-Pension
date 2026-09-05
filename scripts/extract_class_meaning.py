@@ -665,10 +665,13 @@ class _Vote:
         self.rank = {}
         self.order = {}
         self._n = 0
+        self.ever_titled = False
 
     def add(self, rec, page, from_table, n_codes=0, titled=False):
         key = _meaning_key(rec)
         (self.table if from_table else self.chunk)[key] += 1
+        if titled:
+            self.ever_titled = True
         rank = (n_codes, titled, -page)
         if key not in self.rec:
             self.rec[key] = rec
@@ -1013,6 +1016,26 @@ def extract(db_path=DEFAULT_DB_PATH):
             tiers = sum(1 for kc in known_codes if kc.startswith(cc)
                         and kc[len(cc):].isdigit())
             if tiers >= 2:
+                del merged[cc]
+                del pages[cc]
+                aka.pop(cc, None)
+
+        # 이 상품이 실제로 파는 클래스가 아닌데 이름표만 걸리는 경우가
+        # 있다 - 환매수수료 안내문처럼 "이 운용사 계열 펀드가 두루 쓰는
+        # 표준 클래스 목록"을 그대로 실어 둔 보조 표(KR5194450018 27쪽
+        # 환매수수료표: 클래스I "수수료미징구-오프라인-고액"이 실렸는데,
+        # 정작 이 상품의 명칭표(9쪽)와 보수·비용표(31~34쪽) 어디에도
+        # I클래스가 없다 - 이 상품은 I클래스를 발행한 적이 없다). 그런
+        # 클래스는 보수표 근거(known_codes)도 없고, 진짜 「종류형 명칭」
+        # 표에도 한 번을 안 걸린다(ever_titled=False) - 둘 다 없으면 이
+        # 상품 소속이 아니라고 보고 뺀다. 위 _fold_spelling·티어 정리가
+        # 끝난 뒤에 하는 마지막 단계다 - 표기만 다른 진짜 클래스(예:
+        # "P2e"가 "C-P2e"로 접힘)까지 여기서 먼저 지워버리면 그 병합
+        # 기회를 뺏는다. known_codes와의 대조는 대소문자·붙임표 흔들림도
+        # 같은 클래스로 보도록 _canon_key로 한다.
+        known_canon = {_canon_key(k) for k in known_codes}
+        for cc in list(merged):
+            if _canon_key(cc) not in known_canon and not votes[cc].ever_titled:
                 del merged[cc]
                 del pages[cc]
                 aka.pop(cc, None)
