@@ -2776,20 +2776,206 @@ def _remap_columns(carry, col_x0s, tol=8):
     return out
 
 
-def _remap_labels(prev_labels, prev_x0s, col_x0s, tol=8):
+def _remap_labels(prev_labels, prev_x0s, col_x0s, tol=8, wide_tol=12):
     """앞 페이지에서 읽은 칸 이름을 이 페이지의 열 번호로 옮긴다
     (_remap_columns와 같은 x좌표 기준 - 표 제목 한 줄만 있고 진짜
     칸 이름(집합투자업자보수 등)은 전부 앞 페이지에 있는 문서가 있다.
     KR5153420022 실측: 26쪽에 칸 이름이, 27쪽엔 값만 있어 27쪽만 보면
-    "총보수비용" 칸을 이름으로 못 찾는다)."""
-    out = [None] * len(col_x0s)
+    "총보수비용" 칸을 이름으로 못 찾는다).
+
+    1차는 좁은 tol(8)로 맞춘다. 그런데 헤더 페이지에만 유령 칸이 하나
+    더 있어(칸 이름 낱말이 줄바꿈 위치에 따라 둘로 갈라짐 등) 진짜
+    대응 칸이 tol을 살짝(1~4pt) 넘겨 못 걸리는 문서가 있다
+    (KR5118420006 실측: 31쪽 "집합투자업자보수" 칸 x=147.6인데 32쪽의
+    대응 칸은 x=137.7 - 9.9pt 차이라 8pt 기준을 근소하게 넘김. 31쪽엔
+    이 칸 바로 옆에 x=137.7짜리 진짜 빈 유령 칸이 따로 있어서 생긴
+    어긋남). 1차에서 못 채운 칸만, 더 넓은 tol로 다시 시도한다 - 이미
+    채워진 칸은 절대 안 건드리고 "그래도 못 찾았던" 칸에만 기회를
+    한 번 더 주는 것이라 기존에 맞던 매칭을 망가뜨리지 않는다.
+
+    같은 목표 칸에 후보가 둘 이상 걸리면(스팬 헤더 "지급비율(연간,%)"나
+    "용"처럼 옆 칸 글자가 잘려 우연히 같이 걸치는 조각 등 - KR5169950018
+    34쪽 실측: "증권거래비용"(x=514.0, 목표 칸과 정확히 일치)과 그 옆
+    "용"(x=506.7, 같은 칸까지 7.3pt 안에 걸침)이 같은 칸을 두고
+    경쟁), 처리 순서가 아니라 목표 칸 x좌표에 더 가까운 쪽을 쓴다 -
+    처리 순서(먼저 옴/나중 옴) 기준으로는 어느 쪽이 잘린 조각이고
+    어느 쪽이 진짜인지 알 수 없지만, 거리는 진짜 칸 이름일수록
+    가깝다는 근거가 있다."""
+    best = {}  # 목표 칸 인덱스 -> (거리, 라벨)
     for i, x in enumerate(prev_x0s):
         if i >= len(prev_labels) or not prev_labels[i]:
             continue
         near = [j for j, x2 in enumerate(col_x0s) if abs(x2 - x) <= tol]
+        if len(near) != 1:
+            continue
+        j = near[0]
+        d = abs(col_x0s[j] - x)
+        if j not in best or d < best[j][0]:
+            best[j] = (d, prev_labels[i])
+    out = [None] * len(col_x0s)
+    for j, (_, label) in best.items():
+        out[j] = label
+    for i, x in enumerate(prev_x0s):
+        if i >= len(prev_labels) or not prev_labels[i]:
+            continue
+        if prev_labels[i] in out:
+            continue
+        near = [j for j, x2 in enumerate(col_x0s)
+                if out[j] is None and abs(x2 - x) <= wide_tol]
         if len(near) == 1:
             out[near[0]] = prev_labels[i]
     return out
+
+
+def _rescan_prev_page_header(pdf, page_num, col_x0s, tol=8, wide_tol=12):
+    """위 _remap_labels는 "바로 앞 페이지도 _detail_fee_grids가 표로
+    인정했을 때"만 쓸 수 있다. 그런데 칸 이름표만 있고 데이터 행이
+    하나도 없이 페이지가 끝나는 문서가 있다(KR5169950018 33쪽,
+    KR5114420046 15쪽 실측: 표 헤더가 페이지 맨 아래에 있고 실제 값
+    행은 전부 다음 페이지로 넘어감 - 이 페이지 자체엔 값 행이 없어
+    _detail_fee_grids의 "셀 12개 이상" 기준에 못 미쳐 "표가 있는
+    페이지"로 아예 안 잡는다). 그러면 prev_header_page가 한 번도 안
+    채워져 원래 이월 로직이 작동할 기회조차 없다.
+
+    이 폴백은 원래 이월이 실패했을 때만 마지막 수단으로, PDF 원본의
+    바로 앞 물리 페이지를 직접 다시 읽는다 - _detail_fee_grids의 페이지
+    판정 로직 자체는 전혀 건드리지 않는, 국지적인 보강이다."""
+    if page_num < 2:
+        return None
+    prev_page = pdf.pages[page_num - 2]
+
+    def valid_label(text):
+        return bool(text) and not (DECIMAL_RE.match(text) or text in DASHES) and (
+            text in _FEE_BREAKDOWN_LABEL_BY_TEXT or FEE_BREAKDOWN_EXCLUDE_RE.search(text))
+
+    # 1순위: pdfplumber가 이 페이지에서 이미 감지해 둔 표 셀을 쓴다 -
+    # 낱말 좌표를 y-비율로 훑는 것보다 훨씬 안정적이다(KR5114420046
+    # 15쪽 실측: 헤더만 있는 작은 표(11개 셀, _detail_fee_grids의
+    # "12개 이상" 기준을 근소하게 못 채워 걸러짐)를 pdfplumber
+    # find_tables()는 이미 별개 표로 잡아내고, 그 칸 x좌표가 다음 페이지
+    # 데이터 칸과 거의 그대로 일치한다). 페이지 아래쪽(하단 절반)에
+    # 걸쳐 있는 표만 대상으로 한다 - 본문 중간의 다른 데이터표까지
+    # 헤더 후보로 오인하면 안 된다.
+    for t in prev_page.find_tables():
+        cells = [c for c in t.cells if c]
+        if len(cells) < 4 or t.bbox[1] < prev_page.height * 0.5:
+            continue
+        by_x0 = {}
+        for (x0, top, x1, bottom) in cells:
+            text = (prev_page.crop((x0, top, x1, bottom)).extract_text() or "").strip()
+            if not text:
+                continue
+            # "지급비율(연간,%)"처럼 여러 칸을 가로질러 걸치는 단위 안내
+            # 셀은 특정 칸의 진짜 이름이 아니다 - 안 걸러 두면 이 셀의
+            # x좌표가 우연히 진짜 칸(집합투자업자보수 등)과 같은 목표
+            # 칸으로 매칭될 때, sorted(by_x0) 순서상 나중에 처리되면서
+            # 먼저 맞게 매칭된 진짜 이름을 덮어써 버린다(KR5120420091
+            # 41쪽 실측: x=98.0 "집합투자업자보수"가 먼저 col1에 매칭된
+            # 뒤, x=103.0 "지급비율(연간,%)"도 같은 col1에 매칭돼 뒤에서
+            # 처리되며 덮어씀). 본문 파서가 label_by_col 만들 때 쓰는
+            # 필터와 동일하게 여기서도 미리 뺀다.
+            text_compact = text.replace(" ", "").replace("\n", "")
+            if text_compact.startswith("지급") or "연간" in text_compact:
+                continue
+            by_x0.setdefault(round(x0, 1), []).append((top, text.replace("\n", "")))
+        if len(by_x0) < 4:
+            continue
+        cell_x0s, cell_labels = [], []
+        for x0 in sorted(by_x0):
+            items = sorted(by_x0[x0])
+            text = FEE_FOOTNOTE_MARK_RE.sub(
+                "", "".join(txt for _, txt in items).replace(" ", ""))
+            cell_x0s.append(x0)
+            cell_labels.append(text)
+        label_by_col = _remap_labels(cell_labels, cell_x0s, col_x0s, tol=tol, wide_tol=wide_tol)
+        label_by_col = [x if (x is None or valid_label(x)) else None for x in label_by_col]
+        if any(label_by_col[1:]):
+            return label_by_col
+        # 이 표의 칸 좌표 자체가 데이터 페이지와 다르게 찍혀 있으면
+        # (KR5169950018류) 왼쪽부터 순서로 짝짓는다 - 유효한 칸 이름
+        # 개수가 값 칸 수(0번 제외)와 정확히 같을 때만 받아들인다.
+        valid_ordered = [x for x in cell_labels if valid_label(x)]
+        if len(valid_ordered) == len(col_x0s) - 1:
+            return [None] + valid_ordered
+
+    # 2순위(표 자체가 안 잡히는 경우): 낱말을 직접 훑는다.
+    words = prev_page.extract_words(x_tolerance=2, keep_blank_chars=False)
+    if not words:
+        return None
+    # 페이지 아래쪽 1/4만 본다 - 앞선 "가입자격" 등 다른 칸의 긴 설명
+    # 문단이 페이지 중간부터 시작해 절반 기준으로는 같이 잡힌다
+    # (KR5169950018 33쪽 실측: 설명 문단 y=478~587, 진짜 칸 이름은
+    # y=664.5~751.5로 뒤쪽 1/4 안에만 있음).
+    footer_zone = prev_page.height * 0.75
+    buckets = {}
+    for w in words:
+        if w["top"] < footer_zone:
+            continue
+        wt = w["text"]
+        if wt.replace(" ", "").startswith("지급") or "연간" in wt:
+            continue
+        mid_x = (w["x0"] + w["x1"]) / 2
+        best = min(range(len(col_x0s)), key=lambda k: abs(col_x0s[k] - mid_x))
+        if abs(col_x0s[best] - mid_x) > tol:
+            continue
+        buckets.setdefault(best, []).append((w["top"], wt))
+
+    label_by_col = [None] * len(col_x0s)
+    for c, items in buckets.items():
+        items.sort()
+        text = "".join(t for _, t in items).replace(" ", "")
+        text = FEE_FOOTNOTE_MARK_RE.sub("", text)
+        # 페이지 아래쪽을 통째로 훑다 보니(가입자격 설명 등 다른 칸의
+        # 긴 문단까지) 진짜 칸 이름이 아닌 글자가 섞여 들어올 수 있다
+        # (KR5169950018 33쪽 실측: "종류별 가입자격" 열의 여러 줄짜리
+        # 설명이 같이 잡혀 "금(IRP),수행을..." 같은 쓰레기가 됨). 헤더만
+        # 있고 데이터 행이 없는 페이지를 다시 읽는 위험한 폴백이라, 이미
+        # 알려진 진짜 칸 이름(또는 원래도 배제 대상인 합성/총보수)으로
+        # 확인되는 것만 받아들이고 나머지는 차라리 None으로 둔다 - 틀린
+        # 라벨을 붙이는 것보다 안 붙이는 쪽이 안전하다.
+        if valid_label(text):
+            label_by_col[c] = text
+    if any(label_by_col[1:]):
+        return label_by_col
+
+    # 위 x좌표 매칭이 통째로 실패하면(0건), 헤더 페이지의 표가 데이터
+    # 페이지와 칸 x좌표 자체가 다르게 찍힌 문서일 수 있다(KR5169950018
+    # 실측: 33쪽 헤더 칸이 34쪽 데이터 칸보다 전부 18~36pt씩 밀려 있어
+    # 좌표로는 대응이 안 됨 - 그러나 왼쪽부터 순서는 그대로다). 이번엔
+    # x좌표를 이 페이지 자체의 낱말들만으로 다시 묶어("이 페이지 안에서
+    # 몇 번째 칸인가") 순서대로 늘어놓고, 데이터 페이지의 칸에 순서대로
+    # 짝지어 본다. 0번 칸(클래스명)은 늘 별도라 값 칸은 1번부터라고
+    # 가정한다.
+    local_x0s = []
+    for w in words:
+        if w["top"] < footer_zone:
+            continue
+        x = round((w["x0"] + w["x1"]) / 2, 1)
+        if not any(abs(x - lx) <= 10 for lx in local_x0s):
+            local_x0s.append(x)
+    local_x0s.sort()
+    local_buckets = {}
+    for w in words:
+        if w["top"] < footer_zone:
+            continue
+        wt = w["text"]
+        if wt.replace(" ", "").startswith("지급") or "연간" in wt:
+            continue
+        x = (w["x0"] + w["x1"]) / 2
+        best = min(range(len(local_x0s)), key=lambda k: abs(local_x0s[k] - x))
+        local_buckets.setdefault(best, []).append((w["top"], wt))
+    ordered_labels = []
+    for c in sorted(local_buckets):
+        items = sorted(local_buckets[c])
+        text = FEE_FOOTNOTE_MARK_RE.sub("", "".join(t for _, t in items).replace(" ", ""))
+        if valid_label(text):
+            ordered_labels.append(text)
+    # 유효한 칸 이름이 값 칸 수(0번 제외)와 정확히 같을 때만 순서 매칭을
+    # 받아들인다 - 개수가 안 맞으면 어느 게 어느 칸인지 순서만으로는
+    # 장담할 수 없어 차라리 포기한다.
+    if len(ordered_labels) == len(col_x0s) - 1:
+        return [None] + ordered_labels
+    return None
 
 
 def enrich_with_detail_fee_table(doc_id, existing_rows):
@@ -2822,11 +3008,33 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
         except (TypeError, ValueError):
             return False
 
+    def resolve_label(label_by_col, col_x0s, c, cols, tol=15):
+        """label_by_col[c]가 None인데 실제 값이 있는 칸의 라벨을 옆
+        칸에서 빌려온다. 칸이 좁고 헤더가 두 줄인 문서는 헤더 낱말과
+        그 아래 값의 x좌표가 6pt(칸 병합 기준)보다 더 벌어져 서로 다른
+        버킷으로 잡힐 수 있다(KR5131420025 13쪽 실측: "사무"/"관리"
+        헤더는 x=508.8인데 그 값 0.01은 x=498.0 - 10.8pt 차이라 칸
+        병합 기준을 안 넘는다). 그러면 헤더만 있고 값은 없는 "유령 칸"이
+        바로 옆에 생긴다 - 그 유령 칸이 데이터가 없는 칸이면서 가장
+        가까울 때만 라벨을 빌린다(임의로 먼 칸까지 끌어오면 엉뚱한
+        라벨을 붙일 위험이 있어 tol로 좁힌다)."""
+        if label_by_col[c] is not None:
+            return label_by_col[c]
+        x = col_x0s[c]
+        candidates = sorted(
+            (abs(col_x0s[j] - x), j)
+            for j in range(len(label_by_col))
+            if label_by_col[j] and j not in cols and j != c
+        )
+        if candidates and candidates[0][0] <= tol:
+            return label_by_col[candidates[0][1]]
+        return None
+
     pdf_candidates = glob.glob(os.path.join(DATA_DIR, doc_id, "*.pdf"))
     if not pdf_candidates:
         return existing_rows
 
-    def apply_rows(raw_rows, page_num, label_by_col,
+    def apply_rows(raw_rows, page_num, label_by_col, col_x0s,
                     dist_col, peer_col, cost_col, total_col, total_sum_cols):
         """이 페이지(또는 열 구성을 이어받은 보류 페이지)의 행을 채워
         넣는다. known/added/new_rows는 바깥 스코프 것을 그대로 쓴다."""
@@ -2889,7 +3097,8 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
                 })
                 if not cur.get("fee_breakdown"):
                     bd = [
-                        {"label": label_by_col[c], "value": v}
+                        {"label": resolve_label(label_by_col, col_x0s, c, cols),
+                         "value": v}
                         for c, v in sorted(cols.items())
                         if c not in (dist_col, peer_col, cost_col)
                         and (total_col is None or c != total_col)
@@ -2930,7 +3139,8 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
             else:
                 continue
             breakdown = [
-                {"label": label_by_col[c], "value": v}
+                {"label": resolve_label(label_by_col, col_x0s, c, cols),
+                 "value": v}
                 for c, v in sorted(cols.items())
                 if c not in (dist_col, peer_col, cost_col)
                 and (total_col is None or c != total_col)
@@ -2996,6 +3206,15 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
                 parts = [h["cells"][ci] for h in real_header_rows if ci in h["cells"]]
                 parts = [p for p in parts
                          if not (p.replace(" ", "").startswith("지급") or "연간" in p)]
+                # 종류형 설명("수수료선취-오프라인" 등)이 줄바꿈 경계에서 잘려
+                # 다음 페이지 첫 줄("수수료미징구-온")로 넘어가면, 그 조각이
+                # "이 페이지 헤더 행"으로 잘못 잡힌다(KR5111450067 42쪽 실측).
+                # 실제 칸 이름은 "집합투자업자보수"류뿐이라 "수수료..."로
+                # 시작하는 조각은 항상 종류형 설명이지 칸 이름이 아니다 -
+                # 아래 any(label_by_col[1:]) 판단을 그르치지 않도록 뺀다.
+                parts = [p for p in parts
+                         if not p.replace(" ", "").startswith(
+                             ("수수료선취", "수수료후취", "수수료미징구"))]
                 joined = " ".join(parts).replace(" ", "")
                 label_by_col.append(joined or None)
 
@@ -3006,9 +3225,34 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
             # 이름(1번 이후)은 전부 비어 있는데도 "이 페이지 자체 헤더가
             # 있다"고 오판해 앞 페이지 이름표를 안 물려받는다. 값 칸
             # (1번 이후)만으로 판단한다.
-            if not any(label_by_col[1:]) and prev_header_page == page_num - 1:
-                label_by_col = _remap_labels(
-                    prev_label_by_col, prev_label_x0s, col_x0s)
+            # 값 칸에 글자가 있다고 해서 다 진짜 칸 이름은 아니다 - 앞
+            # 표("종류별 가입자격" 등)의 설명 문장 조각이 이 페이지
+            # 첫머리로 넘어와 값 칸(1번 이후) 자리에 걸리는 문서가 있다
+            # (KR5131420007 14쪽 실측: "에 따른 연금저축계좌를 통하여
+            # 가입한 자"가 1번 칸으로 잡혀, "이 페이지에 헤더가 있다"고
+            # 오판해 13쪽에서 이어받는 걸 건너뜀). "수수료선취/후취/
+            # 미징구"로 시작하는 조각만 걸러내는 방식은 이런 문장까지는
+            # 못 잡는다 - 대신 "이미 알려진 진짜 칸 이름인가"로 판단
+            # 기준을 일반화한다. 진짜 헤더가 있는 페이지는 이 검사와
+            # 무관하게 label_by_col을 그대로 쓴다(원문 표기가 사전에
+            # 없는 경우까지 이 검사로 걸러 원래 값을 잃으면 안 된다).
+            has_real_header = any(
+                v and (v in _FEE_BREAKDOWN_LABEL_BY_TEXT or FEE_BREAKDOWN_EXCLUDE_RE.search(v))
+                for v in label_by_col[1:])
+            if not has_real_header:
+                # 진짜 칸 이름이 하나도 없다고 판단했으면, 남아 있던
+                # 잡음(예: "집합투자기구보수포함)")도 버리고 완전히
+                # 새로 채운다 - 잡음이 남아 있으면 any(label_by_col[1:])가
+                # 참이 돼 아래 이월·재스캔 시도 자체가 건너뛰어진다
+                # (KR5120420091 41쪽 실측).
+                label_by_col = [None] * len(col_x0s)
+                if prev_header_page == page_num - 1:
+                    label_by_col = _remap_labels(
+                        prev_label_by_col, prev_label_x0s, col_x0s)
+                if not any(label_by_col[1:]):
+                    rescanned = _rescan_prev_page_header(pdf, page_num, col_x0s)
+                    if rescanned:
+                        label_by_col = rescanned
             if any(label_by_col[1:]):
                 prev_header_page, prev_label_by_col, prev_label_x0s = (
                     page_num, label_by_col, col_x0s)
@@ -3305,12 +3549,12 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
                     pending["col_x0s"])
                 if back:
                     apply_rows(pending["raw_rows"], pending["page"],
-                               pending["label_by_col"], back["dist_col"],
-                               back["peer_col"], back["cost_col"],
+                               pending["label_by_col"], pending["col_x0s"],
+                               back["dist_col"], back["peer_col"], back["cost_col"],
                                back["total_col"], back["total_sum_cols"])
                 pending = None
 
-            apply_rows(raw_rows, page_num, label_by_col,
+            apply_rows(raw_rows, page_num, label_by_col, col_x0s,
                        dist_col, peer_col, cost_col, total_col, total_sum_cols)
 
     return existing_rows + new_rows
@@ -5697,17 +5941,60 @@ _KNOWN_COST_PROJECTION_GAPS = {
     "KR5157420003": {
         "C-W": {"1y": "12", "2y": "26", "3y": "39", "5y": "69", "10y": "157"},
     },
+    # KR5122420005는 예상비용표 마지막 두 행이 둘 다 "(A-G)"로 인쇄돼 있다
+    # (33/59/88/148/329 그리고 32/65/100/176/400 - 39쪽 실측). 이 상품은
+    # A-G와 C-G가 둘 다 실존하는 별개 클래스다(class_meaning/37쪽 보수표
+    # 확인: A-G=선취 0.07%이내+총보수 0.25%, C-G=미징구(선취 없음)+총보수
+    # 0.31%). 두 행 중 어느 쪽이 진짜 C-G인지는, 이 문서의 다른 선취/
+    # 미징구 클래스 쌍으로 앞뒤를 맞춰 봐야 판단할 수 있다:
+    #   - 선취 있는 클래스끼리(A 총보수0.34%→10년394 vs A-G 0.25%→?):
+    #     첫 번째 행(329)이 훨씬 낮은 총보수와 앞뒤가 맞는다.
+    #   - 미징구 클래스끼리(C 총보수0.40%→10년496 vs C-G 0.31%→?):
+    #     두 번째 행(400)이 비율(0.31/0.40=0.775)과 10년치 비율
+    #     (400/496=0.806)이 가장 가깝게 맞아떨어진다.
+    # 두 비교 모두 "첫 번째 행=A-G, 두 번째 행=C-G"로 일치해 C-G에 두
+    # 번째 행 값을 채운다(source_corrections에 원문 오기와 판단 근거를
+    # 남긴다).
+    "KR5122420005": {
+        "C-G": {"1y": "32", "2y": "65", "3y": "100", "5y": "176", "10y": "400"},
+    },
 }
 
-# KR5122420005는 예상비용표 마지막 두 행이 둘 다 "(A-G)"로 인쇄돼 있다
-# (33/59/88/148/329 그리고 32/65/100/176/400 - 실측). 이 상품은 A-G와
-# C-G가 둘 다 실존하는 별개 클래스이고(class_meaning 확인: A-G=선취,
-# C-G=미징구), C-G의 총보수(0.31%)가 A-G(0.25%)보다 높아 두 번째 행의
-# 장기 수치가 더 크게 벌어지는 패턴과도 앞뒤가 맞는다 - 그래서 두
-# 번째 행이 실제로는 C-G인데 라벨만 잘못 인쇄됐을 가능성이 높다. 그러나
-# 원문 라벨 자체는 끝까지 "A-G"라 확정할 근거가 못 된다(추정일 뿐).
-# 이 코퍼스의 원칙("모르면 지어내지 않는다")대로, C-G의
-# cost_projection_per_10m은 빈 채로 두고 여기 근거만 남긴다.
+# 위 KR5122420005/C-G처럼 원문 라벨 자체가 잘못 인쇄돼 있어 다른 값과
+# 대조해 판단해야 했던 경우, 그 근거를 값과 함께 남긴다(class_fees.json
+# 기존 관례인 source_corrections 포맷 그대로).
+_KNOWN_COST_PROJECTION_SOURCE_CORRECTIONS = {
+    ("KR5122420005", "C-G"): {
+        "field": "cost_projection_per_10m",
+        "raw": "A-G (39쪽 예상비용표에 두 번째 행도 \"A-G\"로 중복 인쇄됨)",
+        "used": "C-G",
+        "reason": (
+            "선취 클래스쌍(A vs A-G)·미징구 클래스쌍(C vs C-G)의 총보수 "
+            "비율과 10년 누적비용 비율을 대조하면 두 번째 행(32/65/100/"
+            "176/400)이 총보수 0.31%인 C-G와, 첫 번째 행(33/59/88/148/"
+            "329)이 총보수 0.25%인 A-G와 일치한다"
+        ),
+    },
+}
+
+# 상세표(page)와 요약표 예상비용표 페이지가 다른 문서가 많아, 위 override로
+# 채운 값의 field_source_pages를 PDF 재검색으로 확인해 둔 것만 기록한다
+# (검색 결과가 여러 페이지에 걸쳐 걸리는 모호한 경우는 "모르면 지어내지
+# 않는다" 원칙대로 비워 둔다).
+_KNOWN_COST_PROJECTION_PAGES = {
+    ("KR5118201004", "B2"): 40, ("KR5118201004", "C-I"): 40,
+    ("KR5118201004", "C-W"): 40, ("KR5118201004", "S"): 40,
+    ("KR5118420036", "C-I"): 42, ("KR5118420036", "S"): 43,
+    ("KR5118420036", "S-P(퇴직)"): 43,
+    ("KR5120420091", "C-P(연금)"): 43, ("KR5120420091", "C-Pe(연금)"): 43,
+    ("KR5120420091", "C-Re(퇴직연금)"): 43,
+    ("KR5120420091", "S-R(퇴직연금)"): 44,
+    ("KR5120451001", "C-Re"): 43,
+    ("KR5185450009", "C-P2(퇴직연금)"): 31,
+    ("KR5185450009", "S-P2(퇴직연금)"): 31,
+    ("KR5111450067", "C-P2E"): 43,
+    ("KR5122420005", "C-G"): 39,
+}
 
 
 def fill_known_cost_projection_gaps(doc_id, rows):
@@ -5723,6 +6010,16 @@ def fill_known_cost_projection_gaps(doc_id, rows):
         if not cand:
             continue
         r["cost_projection_per_10m"] = dict(cand)
+        key = (doc_id, r.get("class_code"))
+        correction = _KNOWN_COST_PROJECTION_SOURCE_CORRECTIONS.get(key)
+        if correction:
+            r.setdefault("source_corrections", []).append(dict(correction))
+        page = _KNOWN_COST_PROJECTION_PAGES.get(key)
+        if page:
+            r.setdefault("field_source_pages", {})["cost_projection_per_10m"] = page
+            sp = r.setdefault("source_pages", [r.get("page")])
+            if page not in sp:
+                sp.append(page)
         filled += 1
     return filled
 
@@ -5755,6 +6052,47 @@ def fix_known_peer_avg_fee_gaps(doc_id, rows):
             fixed += 1
         if "total_fee_after_conversion" in r and "peer_avg_fee_after_conversion" not in r:
             r["peer_avg_fee_after_conversion"] = "-"
+    return fixed
+
+
+# KR5116501001은 "나. 집합투자기구에 부과되는 보수 및 비용"(36쪽)
+# 표의 머리글이 "총 보 수) 총보수 비율"처럼 각주성 문구
+# ("(모투자신탁의 총보수·비용 포함)")가 칸 이름 사이에 끼어들며
+# 두 줄로 어긋나 있다. 그 결과 C-P/C-Pe의 fee_breakdown이
+# management_fee가 중복되고("0.2"·"0.02" 둘 다 management_fee),
+# 라벨이 "비용"/"및비용비율"처럼 잘린 조각으로 남았다(36쪽 원문
+# 재대조 결과 0.2=집합투자업자, 0.3=판매회사[제외], 0.02=신탁업자,
+# 0.015=사무관리회사, 0.0070/0.0000=기타비용, 0.0016/0.0000=
+# 증권거래비용 - 나머지 0.535/0.385(총보수)·0.5420/0.3850(총보수
+# 비용)·"-"(동종유형)는 원래도 breakdown 제외 대상). 이 머리글
+# 모양이 이 문서 하나뿐이라 일반 파서를 고치는 대신 값 자체를
+# 못박는다.
+_KNOWN_FEE_BREAKDOWN_FIXES = {
+    ("KR5116501001", "C-P"): [
+        {"label": "management_fee", "value": "0.2"},
+        {"label": "trustee_fee", "value": "0.02"},
+        {"label": "admin_fee", "value": "0.015"},
+        {"label": "other_expense", "value": "0.0070"},
+        {"label": "transaction_cost", "value": "0.0016"},
+    ],
+    ("KR5116501001", "C-Pe"): [
+        {"label": "management_fee", "value": "0.2"},
+        {"label": "trustee_fee", "value": "0.02"},
+        {"label": "admin_fee", "value": "0.015"},
+        {"label": "other_expense", "value": "0.0000"},
+        {"label": "transaction_cost", "value": "0.0000"},
+    ],
+}
+
+
+def fix_known_fee_breakdown_corruption(doc_id, rows):
+    """_KNOWN_FEE_BREAKDOWN_FIXES 정의부 주석 참고."""
+    fixed = 0
+    for r in rows:
+        fix = _KNOWN_FEE_BREAKDOWN_FIXES.get((doc_id, r.get("class_code")))
+        if fix:
+            r["fee_breakdown"] = [dict(item) for item in fix]
+            fixed += 1
     return fixed
 
 
@@ -5993,6 +6331,7 @@ def main():
         # 둔 값을 그대로 못박는다.
         cost_filled += fill_known_cost_projection_gaps(doc_id, rows)
         fix_known_peer_avg_fee_gaps(doc_id, rows)
+        fix_known_fee_breakdown_corruption(doc_id, rows)
         rows = _backfill_from_value_sources(rows)
         rows = _normalize_fee_breakdown(rows)
         # 출처 필드는 모든 행이 갖도록 맞춘다(class_returns.json과 같은
