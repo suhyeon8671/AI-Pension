@@ -3347,8 +3347,16 @@ CAPTION_NOISE_RE = re.compile(
     r"|^\(?모투자신탁의$|^총보수[·‧･]?비용$|^포함\)?$"
 )
 
+# 자동전환 티어 클래스 행이 "(C1~C4)"처럼 접두+시작숫자~[접두]+끝숫자로
+# 뭉뚱그려 적히는 문서가 있다(_detail_cost_grids의 by_code.setdefault
+# 직전 주석 참고). 접두는 문자/붙임표로만, 숫자는 1~2자리로 좁혀서
+# "5~10" 같은 진짜 연도 낱말이나 다른 우연한 물결표 문구를 코드로
+# 오인하지 않게 한다.
+RE_LABEL_CODE_RANGE = re.compile(
+    r"\(([A-Za-z][A-Za-z\-]*?)(\d{1,2})~(?:[A-Za-z\-]*?)(\d{1,2})\)")
 
-def _detail_cost_grids(pdf):
+
+def _detail_cost_grids(pdf, known_codes=frozenset()):
     """상세 비용예시표를 셀 격자로 읽어
     [(page_num, {클래스코드: {"1y": ...}}), ...]를 돌려준다.
     머리글이 앞 페이지에 있고 값만 이어지는 경우가 흔해 열 구성을
@@ -3639,6 +3647,24 @@ def _detail_cost_grids(pdf):
                         if not re.search(r"[0-9]|판매수수료|보수|비용", lead):
                             code = _label_class_code(label + lead)
                 if not code:
+                    # 자동전환 티어 클래스(C1→C2→C3→C4)는 요약표엔 C1만
+                    # 있고(C2~C4는 최초가입 불가라 요약표에 안 실림),
+                    # 상세표는 넷을 "체감(C1~C4)"처럼 한 행에 몰아
+                    # 적는다(교보악사 KR5120450015/KR5120450018 실측).
+                    # 물결표 때문에 위 코드 정규식들은 하나도 안 걸려
+                    # 이 행 자체가 통째로 버려졌었다 - C2/C3/C4는
+                    # cost_projection이 영영 안 채워진다. "(접두 + 시작
+                    # 숫자 ~ [접두] + 끝 숫자)" 모양이면 그 구간의 모든
+                    # 코드를 이 행 값으로 채운다. known_codes에 실제로
+                    # 있는 코드만 받아, 엉뚱한 문자열을 코드로 지어내지
+                    # 않는다.
+                    mrange = RE_LABEL_CODE_RANGE.search(label.replace(" ", ""))
+                    if mrange:
+                        prefix, start, end = mrange.groups()
+                        for cc in (f"{prefix}{n}" for n in
+                                   range(int(start), int(end) + 1)):
+                            if cc in known_codes:
+                                by_code.setdefault(cc, vals)
                     continue
                 # 같은 클래스가 "판매수수료 및 보수·비용"과 "(피투자
                 # 집합투자기구 포함)" 두 줄로 나오는데 앞줄이 기본값이다.
@@ -5581,6 +5607,111 @@ def fill_detail_cost_row_table2(doc_id, rows):
     return filled
 
 
+# 위 다섯 폴백을 전부 거치고도 못 채우는 극소수는 PDF 원문 대조로 확인해
+# 둔 값을 그대로 못박는다. 전부 "포함"/"합성 총보수" 쪽(이 코퍼스가 쓰는
+# 기본 표기 - 위 함수들이 다 그 값을 쓴다) 숫자다. 공통 원인은 없다 -
+# 코드가 두 물리적 줄에 걸쳐 있거나("S-P" 다음 줄에 "(퇴직)"), 코드
+# 셀이 값 행과 다른 밴드에 떨어져 있거나(KR5118201004의 C-I·C-W처럼
+# 바로 위/아래 클래스 이름과 밴드가 겹쳐 보이거나), 표 자체가 아예 다른
+# 셀 구조(KR5120420091/KR5120451001)라 코드마다 원인이 다르다.
+_KNOWN_COST_PROJECTION_GAPS = {
+    "KR5118201004": {
+        "B2": {"1y": "71", "2y": "103", "3y": "137", "5y": "209", "10y": "421"},
+        "C-I": {"1y": "23", "2y": "46", "3y": "71", "5y": "125", "10y": "283"},
+        "C-W": {"1y": "21", "2y": "42", "3y": "65", "5y": "114", "10y": "257"},
+        "S": {"1y": "31", "2y": "63", "3y": "97", "5y": "169", "10y": "382"},
+        "S-P(퇴직)": {"1y": "28", "2y": "58", "3y": "88", "5y": "154", "10y": "349"},
+    },
+    "KR5118420006": {
+        "S": {"1y": "15", "2y": "31", "3y": "48", "5y": "84", "10y": "191"},
+        "S-P(퇴직)": {"1y": "16", "2y": "33", "3y": "51", "5y": "90", "10y": "204"},
+    },
+    "KR5118420036": {
+        "C-I": {"1y": "19", "2y": "40", "3y": "61", "5y": "106", "10y": "241"},
+        "S": {"1y": "21", "2y": "43", "3y": "66", "5y": "116", "10y": "263"},
+        "S-P(퇴직)": {"1y": "20", "2y": "41", "3y": "63", "5y": "111", "10y": "250"},
+    },
+    "KR5118420062": {
+        "A2": {"1y": "26", "2y": "38", "3y": "50", "5y": "77", "10y": "155"},
+        "C-W": {"1y": "11", "2y": "23", "3y": "35", "5y": "62", "10y": "140"},
+        "S": {"1y": "20", "2y": "42", "3y": "64", "5y": "112", "10y": "254"},
+        "S-P(퇴직)": {"1y": "17", "2y": "35", "3y": "55", "5y": "95", "10y": "216"},
+    },
+    "KR5120420091": {
+        "C-P(연금)": {"1y": "30", "2y": "61", "3y": "94", "5y": "164", "10y": "374"},
+        "C-Pe(연금)": {"1y": "21", "2y": "44", "3y": "67", "5y": "118", "10y": "268"},
+        "C-R(퇴직연금)": {"1y": "28", "2y": "58", "3y": "89", "5y": "156", "10y": "355"},
+        "C-Re(퇴직연금)": {"1y": "20", "2y": "42", "3y": "65", "5y": "113", "10y": "258"},
+        "S-R(퇴직연금)": {"1y": "20", "2y": "41", "3y": "63", "5y": "110", "10y": "251"},
+    },
+    "KR5120451001": {
+        "C-Re": {"1y": "55", "2y": "112", "3y": "173", "5y": "303", "10y": "690"},
+    },
+    "KR5123420049": {
+        "C-P2(퇴직연금)": {"1y": "31", "2y": "63", "3y": "97", "5y": "169", "10y": "386"},
+        "C-P2e(퇴직연금)": {"1y": "19", "2y": "40", "3y": "61", "5y": "107", "10y": "244"},
+    },
+    "KR5144420020": {
+        "C-P2I(퇴직연금)": {"1y": "22", "2y": "44", "3y": "68", "5y": "120", "10y": "271"},
+    },
+    "KR5185450009": {
+        "C-P2(퇴직연금)": {"1y": "161", "2y": "331", "3y": "509", "5y": "892", "10y": "2031"},
+        "S-P2(퇴직연금)": {"1y": "104", "2y": "212", "3y": "326", "5y": "572", "10y": "1302"},
+    },
+    "KR555202013M": {
+        "S-P": {"1y": "99", "2y": "201", "3y": "308", "5y": "535", "10y": "1185"},
+    },
+}
+
+
+def fill_known_cost_projection_gaps(doc_id, rows):
+    """_KNOWN_COST_PROJECTION_GAPS 정의부 주석 참고."""
+    fixes = _KNOWN_COST_PROJECTION_GAPS.get(doc_id)
+    if not fixes:
+        return 0
+    filled = 0
+    for r in rows:
+        if r.get("cost_projection_per_10m"):
+            continue
+        cand = fixes.get(r.get("class_code"))
+        if not cand:
+            continue
+        r["cost_projection_per_10m"] = dict(cand)
+        filled += 1
+    return filled
+
+
+# KR5147430065의 CG/CW/C-P/C-Pe/C-P2/C-Pe2 여섯 클래스는 "(동종유형
+# 총보수)" 행이 전환 전(34쪽)·전환 후(35쪽) 표 둘 다에서 "-"로 명시돼
+# 있는데(실측), 같은 문서의 AG/CI 등 다른 열블록은 이 값을 정상적으로
+# "-"/"-"까지 잡아 peer_avg_fee_after_conversion을 남기면서 유독 이
+# 여섯만 peer_avg_fee가 null(필드 자체는 있으나 못 채움)이고
+# peer_avg_fee_after_conversion 필드가 아예 없다 - 다른 항목(총보수/
+# 판매보수/총보수·비용, 전환 전후 모두)은 이 여섯도 정상 추출됐으므로
+# 표 자체를 놓친 게 아니라 이 한 행만 놓쳤다. 원인이 된 표 블록이
+# 문서마다 다른 이 파서의 특성상 한 줄로 못박는다.
+_KNOWN_PEER_AVG_FEE_DASH = {
+    "KR5147430065": {"CG", "CW", "C-P", "C-Pe", "C-P2", "C-Pe2"},
+}
+
+
+def fix_known_peer_avg_fee_gaps(doc_id, rows):
+    """_KNOWN_PEER_AVG_FEE_DASH 정의부 주석 참고."""
+    codes = _KNOWN_PEER_AVG_FEE_DASH.get(doc_id)
+    if not codes:
+        return 0
+    fixed = 0
+    for r in rows:
+        if r.get("class_code") not in codes:
+            continue
+        if r.get("peer_avg_fee") is None:
+            r["peer_avg_fee"] = "-"
+            fixed += 1
+        if "total_fee_after_conversion" in r and "peer_avg_fee_after_conversion" not in r:
+            r["peer_avg_fee_after_conversion"] = "-"
+    return fixed
+
+
 def fill_detail_cost_projections(doc_id, rows):
     """상세표에서만 나온 클래스는 요약표에 없어 비용예시가 비어 있다
     (실측 298건). 뒤쪽 부속서류의 "<1,000만원 투자시 ...>" 표에서
@@ -5591,8 +5722,9 @@ def fill_detail_cost_projections(doc_id, rows):
     pdfs = glob.glob(os.path.join(DATA_DIR, doc_id, "*.pdf"))
     if not pdfs:
         return 0
+    known_codes = {r["class_code"] for r in rows if r.get("class_code")}
     with pdfplumber.open(pdfs[0]) as pdf:
-        grids = _detail_cost_grids(pdf)
+        grids = _detail_cost_grids(pdf, known_codes)
     if not grids:
         return 0
     # 같은 코드가 여러 표(부속서류가 여러 군데 있는 문서)에서 나오면,
@@ -5811,6 +5943,10 @@ def main():
         # 다섯 번째 모양: row_table과 표는 같은데 "구분" 대신 다른
         # 표 제목("클래스종류 투자기간별 총비용 예시")을 쓰는 문서.
         cost_filled += fill_detail_cost_row_table2(doc_id, rows)
+        # 위 다섯 폴백을 다 거치고도 못 채운 극소수는 원문 대조로 확인해
+        # 둔 값을 그대로 못박는다.
+        cost_filled += fill_known_cost_projection_gaps(doc_id, rows)
+        fix_known_peer_avg_fee_gaps(doc_id, rows)
         rows = _backfill_from_value_sources(rows)
         rows = _normalize_fee_breakdown(rows)
         # 출처 필드는 모든 행이 갖도록 맞춘다(class_returns.json과 같은

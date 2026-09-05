@@ -367,7 +367,30 @@ def process_doc(doc_id):
         cur = best.get(key)
         if cur is None or len(r.get("career") or "") > len(cur.get("career") or ""):
             best[key] = r
-    return list(best.values())
+    out = list(best.values())
+
+    # 위 병합은 "개수·규모까지 완전히 같아야" 합친다 - 그런데 개수·
+    # 규모 칸 자체가 안 잡힌 반쪽짜리 중복도 있다(권용범/이우중/조정남
+    # 실측: 이름·생년은 같은데 한쪽은 개수·규모까지 다 있고 다른 쪽은
+    # 개수·규모가 둘 다 None에 경력마저 어긋난 값(이우중: "2년 9개월"
+    # vs "1년" - 원문 어디에도 "1년"은 없다, 순수 오독)이다 - 서로 다른
+    # 물리적 줄을 두 번 읽은 게 아니라, 이름 줄 윈도우 탐색이 한 번은
+    # 제대로, 한 번은 엉뚱한 조각을 집어 두 벌이 나온 것으로 보인다).
+    # 이 상품에 그 이름·생년의 "개수·규모까지 다 있는" 행이 이미
+    # 있으면, 개수·규모가 둘 다 None인 나머지 동명이생년 행은 군더더기로
+    # 보고 버린다. 이 상품 안에 그런 "완전한" 행이 아예 없으면(=정말
+    # 개별 데이터가 없는 사람) 건드리지 않는다 - explicit_no_data로
+    # 남긴 null 레코드가 이 규칙에 걸려 사라지면 안 된다.
+    complete_people = {
+        (r["name"], r["birth_year"]) for r in out
+        if r["manager_fund_count"] is not None and r["manager_aum_100m_won"] is not None
+    }
+    out = [
+        r for r in out
+        if not (r["manager_fund_count"] is None and r["manager_aum_100m_won"] is None
+                and (r["name"], r["birth_year"]) in complete_people)
+    ]
+    return out
 
 
 def main():

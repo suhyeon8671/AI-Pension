@@ -64,6 +64,26 @@ COLUMNS = (
     ("switch_fee", ("전환수수료", "전환")),
 )
 
+# 좌표 재구성 파서도, 「종류|가입자격」 2칸 표 폴백도 못 잡는 극소수
+# 케이스를 PDF 원문 대조로 확인해 그대로 못박아 둔다(KR5118420036
+# S-P(퇴직) - 실측: 39쪽 "S-P" 코드 조각과 41쪽 뒤 "(퇴직)" 조각
+# 사이에 가입자격 설명 문장이 여러 줄 끼어 있고, 그 값 칸("- -")이
+# "(퇴직)" 조각이 code로 합쳐지기도 전에 지나가 버려 pending_bare
+# 병합 로직으로도 못 붙잡는다). 선취/후취판매수수료는 원문이 "-"라
+# _clean()의 대시 규칙대로 "없음", 환매수수료는 34쪽 "이 투자신탁은
+# 수익증권을 환매시 환매수수료를 부과하지 않습니다"라는 펀드 전체
+# 문장이 있어 형제 클래스(S, S-P)와 동일하게 "없음"이다.
+_KNOWN_MISSING_ROWS = {
+    ("KR5118420036", "S-P(퇴직)"): {
+        "eligibility": None,
+        "front_load_fee": "없음",
+        "back_load_fee": "없음",
+        "redemption_fee": "없음",
+        "switch_fee": None,
+        "page": 39,
+    },
+}
+
 MAX_HEADER_ROWS = 5
 # 헤더 칸은 이름표라 짧다. 이보다 길면 본문 문장으로 본다.
 MAX_HEADER_CELL = 14
@@ -2257,6 +2277,16 @@ def extract(db_path=DEFAULT_DB_PATH):
             elig_fallback = _eligibility_only_fallback(conn, code, missing_codes)
             for cc in missing_codes & set(elig_fallback):
                 merged[cc] = {"eligibility": elig_fallback[cc]}
+
+        # 위 두 폴백으로도 못 채운 극소수는 PDF 원문 대조로 확인해 둔
+        # 값을 그대로 못박는다(_KNOWN_MISSING_ROWS 정의부 주석 참고).
+        missing_codes = fallback_known - set(merged)
+        for cc in missing_codes:
+            fix = _KNOWN_MISSING_ROWS.get((code, cc))
+            if fix:
+                fix = dict(fix)
+                pages[cc] = fix.pop("page", None)
+                merged[cc] = fix
 
         # 위 두 폴백으로 새로 채운 코드는 class_meaning에만 있고
         # known_codes(class_fees 기준)엔 없을 수 있다 - 그대로 두면 바로

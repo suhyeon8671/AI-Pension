@@ -177,8 +177,8 @@ def _format_fact_line(r):
     line = f"- {label}: {_format_value(r)}"
     if r.get("condition"):
         line += f" ({r['condition']})"
-    if r.get("effective_date"):
-        line += f" [{r['effective_date']} 기준 문서]"
+    if r.get("source_as_of"):
+        line += f" [{r['source_as_of']} 기준 문서]"
     return line
 
 

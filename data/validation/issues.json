@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-05T15:40:17+00:00",
+  "generated_at": "2026-09-05T18:11:22+00:00",
   "db_path": "/home/user/ai-pension/structured_store.db",
   "checks": [
     {
@@ -183,11 +183,13 @@
     },
     {
       "name": "연도별 수익률인데 기간이 모두 같은 날 끝남",
-      "bad": 0,
+      "bad": 1,
       "total": 89,
       "info": false,
       "note": "연평균 표를 연도별로 잘못 읽은 것이다",
-      "samples": []
+      "samples": [
+        "KR5153420318: 기간 2개가 모두 25.09.30에 끝남"
+      ]
     },
     {
       "name": "class_return 행인데 class_code가 없음",

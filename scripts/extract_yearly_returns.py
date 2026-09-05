@@ -1097,6 +1097,67 @@ def _drop_suffix_duplicate_codes(rows):
     return [r for r in rows if id(r) not in drop_ids]
 
 
+# yearly_returns.py 자신의 표 파서가 class_fees.json(보수표 - 이
+# 코퍼스의 정식 표기 출처)과 다른 표기로 클래스 코드를 읽어, 같은
+# 클래스인데 조인이 끊기는 경우가 있다(실측). 대소문자·붙임표만 다른
+# 표기 흔들림이 아니라 진짜 서로 다른 개인연금/퇴직연금 클래스일
+# 위험(class_charges.py의 C-P vs Cp(퇴직연금) 사례 참고)이 있어
+# 전체적으로 자동 정규화하지 않는다 - 옛 표기가 그 상품의
+# yearly_returns 안에 이미 없어(=바꿔도 다른 진짜 클래스와 안 겹침)
+# 안전이 확인된 다섯 상품만 딱 그 표기로 못박는다.
+_KNOWN_CLASS_CODE_RENAMES = {
+    "KR5110501016": {"Ae": "A-e"},
+    "KR5123490013": {"A-e": "Ae", "C-e": "Ce"},
+    "KR5123490016": {"A-e": "Ae", "C-e": "Ce"},
+    "KR5123490017": {"A-e": "Ae", "C-e": "Ce"},
+    "KR5125450070": {"CG": "C-G"},
+}
+
+
+def apply_known_class_code_renames(rows):
+    renamed = 0
+    for r in rows:
+        m = _KNOWN_CLASS_CODE_RENAMES.get(r["product_code"])
+        if not m:
+            continue
+        new = m.get(r.get("class_code"))
+        if new:
+            r["class_code"] = new
+            renamed += 1
+    return renamed
+
+
+# 표·좌표 두 경로 다 못 채우는 극소수 period는 PDF 원문 대조로 확인해
+# 둔 값을 그대로 못박는다.
+#   - KR5119450058 benchmark 1년차: 5쪽 표 헤더("최근1년...2024.02.01
+#     ~2025.01.31")가 같은 문서의 다른 class_return 1년차 행과 전부
+#     동일한 기간이라 그대로 옮긴다.
+#   - KR5153420318 fund/benchmark 2년차: 5쪽 표를 좌표로 다시 짚어보면
+#     "최근2년" 칸의 기간은 "24.08.01~25.09.30"이다(펀드 설정일
+#     2024.08.01부터 작성기준일까지 - 아직 만 2년이 안 된 펀드라 "최근
+#     2년"이 사실상 설정후 전체 기간과 같다). 값 칸 자체는 "-"(계산할
+#     2년치 데이터가 없다는 뜻)라 이 기간을 채워도 없는 수치를 지어내는
+#     게 아니다.
+_KNOWN_PERIOD_FIXES = {
+    ("KR5119450058", "benchmark", None, 1): "2024.02.01~2025.01.31",
+    ("KR5153420318", "fund", None, 2): "24.08.01~25.09.30",
+    ("KR5153420318", "benchmark", None, 2): "24.08.01~25.09.30",
+}
+
+
+def apply_known_period_fixes(rows):
+    fixed = 0
+    for r in rows:
+        if r.get("period") is not None:
+            continue
+        key = (r["product_code"], r["row_kind"], r.get("class_code"), r["year_rank"])
+        period = _KNOWN_PERIOD_FIXES.get(key)
+        if period:
+            r["period"] = period
+            fixed += 1
+    return fixed
+
+
 def report(rows):
     prods = {r["product_code"] for r in rows}
     kinds = {}
@@ -1120,6 +1181,8 @@ def main():
     args = ap.parse_args()
 
     rows = extract(args.db)
+    apply_known_class_code_renames(rows)
+    apply_known_period_fixes(rows)
     report(rows)
     if args.check:
         return
