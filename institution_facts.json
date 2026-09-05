@@ -28,10 +28,10 @@
     "predicate": "contributor",
     "value": "회사",
     "unit": null,
-    "condition": "근로자 추가부담금 없음",
+    "condition": null,
     "source_doc": "doc11",
     "page": 1,
-    "evidence": "#퇴직연금제도 비교 표: 적립금 운용 주체 - DB제도: 회사 / DC제도: 근로자",
+    "evidence": "확정급여형 퇴직연금제도(DB제도)란? : 퇴직급여 재원을 퇴직금 재원을 금융기관에 적립하고 회사가 운용하다가, 정해진 퇴직급여를 일시금이나 연금으로 받는 제도 / #퇴직연금제도 비교 표: 적립금 운용 주체 - DB제도: 회사",
     "confidence": 1.0,
     "source_as_of": null
   },
