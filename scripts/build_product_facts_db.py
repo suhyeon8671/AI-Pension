@@ -139,7 +139,7 @@ CREATE TABLE manager_info (
     name TEXT,
     birth_year INTEGER,
     manager_fund_count INTEGER,
-    manager_aum_billion_won REAL,
+    manager_aum_100m_won INTEGER,
     is_product_aum INTEGER,
     career TEXT,
     page INTEGER,
@@ -505,7 +505,7 @@ def load_manager_info(conn, path):
             """
             INSERT INTO manager_info
                 (product_code, name, birth_year, manager_fund_count,
-                 manager_aum_billion_won, is_product_aum, career, page, confidence)
+                 manager_aum_100m_won, is_product_aum, career, page, confidence)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
@@ -513,7 +513,7 @@ def load_manager_info(conn, path):
                 r["name"],
                 r["birth_year"],
                 r["manager_fund_count"],
-                to_float(r["manager_aum_billion_won"]),
+                r.get("manager_aum_100m_won"),
                 0,
                 r.get("career"),
                 r["page"],

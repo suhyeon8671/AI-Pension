@@ -1181,16 +1181,33 @@ def _redemption_cell_note(conn, code):
 # 바뀌는 단순 OCR/정렬 공백이라 눈에 띄는 것만 정리한다 - 아무 공백이나
 # 지우면 진짜 띄어쓰기(조사 등)까지 붙어버릴 위험이 있어, 실측된 자리만
 # 좁혀서 고친다.
-WORD_SPLIT_FIXES = (("재 산", "재산"), ("부과 된", "부과된"))
+WORD_SPLIT_FIXES = (
+    ("재 산", "재산"), ("부과 된", "부과된"),
+    # "아니합니다"/"아니 합니다" 어미 사이에 공백이 끼는 문서도 있다
+    # (KR5113420069/KR5113450401 실측: "아니합니 다", KR5144420091/
+    # KR5144450095 실측: "아니 합니다"). RE_REDEMPTION_SENTENCE는
+    # 음절 사이 \s*로 매칭 자체는 되지만, 반환값은 원문 공백을 그대로
+    # 담고 있어 여기서 따로 지운다.
+    ("아니합니 다", "아니합니다"), ("아니 합니다", "아니합니다"),
+)
 # "(3) 환매수수료 환매수수료를 부과하지..."처럼 절 제목이 겹쳐 찍힌
 # 채로 그대로 반환된 문장(RE_REDEMPTION_SENTENCE의 절 제목 예외 갈래
 # 참고)은 절 번호까지 노출할 필요가 없다 - 뒤에 남는 "환매수수료..."만
 # 보여준다.
 RE_LEADING_SECTION_DUP = re.compile(r"^\(\d+\)\s*환매수수료\s*(?=환매수수료)")
+# 절 제목 앞이 아니라 문장 "한가운데"(부과하지/징구하지 뒤, 않습니다/
+# 아니합니다 앞)에 "환매수수료"가 통째로 한 번 더 끼는 표도 있다
+# (KR5111420047/KR5111450067 실측: "구분" 칸의 "환매수수료" 라벨이
+# 표 값 문장 "...부과하지"와 "않습니다." 두 줄 사이 y좌표에 끼어
+# 읽혀 "부과하지 환매수수료 않습니다"가 된다 - RE_REDEMPTION_SENTENCE는
+# 이 끼임을 허용해서 문장 자체는 놓치지 않지만, 반환값엔 끼인 낱말이
+# 그대로 남아 있었다). 그 자리에서만 지운다.
+RE_MID_REDEMPTION_DUP = re.compile(r"(하지)\s*환매수수료\s*(않|아니)")
 
 
 def _fix_word_split_spaces(text):
     text = RE_LEADING_SECTION_DUP.sub("", text)
+    text = RE_MID_REDEMPTION_DUP.sub(r"\1 \2", text)
     for bad, good in WORD_SPLIT_FIXES:
         text = text.replace(bad, good)
     return text

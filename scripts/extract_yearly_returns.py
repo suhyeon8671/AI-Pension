@@ -61,6 +61,16 @@ RE_PERIOD = re.compile(
     r"['‘’]?(\d{2,4}[./\-]\d{1,2}[./\-]\d{1,2})\s*[~∼〜～]\s*"
     r"['‘’]?(\d{2,4}[./\-]\d{1,2}[./\-]\d{1,2})")
 RE_NUM = re.compile(r"^-?\d+(?:\.\d+)?$")
+# 날짜 끝자리 숫자 하나가 줄바꿈으로 다음 줄에 떨어지는 표가 있다
+# (KR5129420031 실측: 같은 칸의 4줄이 "2024/11/0" / "7~" / "2025/11/0"
+# / "6"으로 갈라진다 - "07"이 "0"과 "7" 사이에 개행이 들어가 쪼개짐).
+# 이 함수는 그 조각들을 공백으로 이어 붙이는데, 숫자 사이에 남은
+# 공백을 그대로 두면 "2024/11/0 7"이 되어 RE_PERIOD의 "일"자리
+# (\d{1,2})가 "0"에서 멈춰 통째로 매치가 깨진다. 숫자와 숫자 사이의
+# 공백만 지운다 - 그 밖의 공백(물결 앞뒤 등)은 그대로 둬도 RE_PERIOD가
+# 이미 \s*로 허용한다.
+def _squash_split_digits(text):
+    return re.sub(r"(?<=\d)\s+(?=\d)", "", " ".join(text.split()))
 # 날짜로 못 가릴 때(위 참고) "나"인지 최후 보루로 페이지 문구를 보는데,
 # 단순히 "연도별 수익률"이 텍스트에 있는지만 보면 각주 설명문(예:
 # "연평균 수익률은 ...연도별 수익률은 기간별 수익률 변동성을 나타낸
@@ -217,6 +227,15 @@ def _periods(rows, header_row, cols, need=2):
     # 우연히 섞인 다른 날짜에 안 속는다) 왼쪽부터 순서대로 cols 칸에
     # 맞춰 배정한다 - 이게 성공하면 아래 칸 제한 방식보다 항상 더
     # 완전한 결과이므로 먼저 시도한다.
+    # 열마다 실제로 몇 줄에 걸쳐 있는지가 서로 다른 표가 있다
+    # (KR5129420031 실측: 2·3년차는 병합 칸이라 한 줄에 날짜가 통째로
+    # 들어 있는데, 1·4·5년차는 시작일/물결/종료일이 진짜로 네 줄에
+    # 걸쳐 있다). span을 늘려가며 "모든 칸이 채워지는 첫 조합"을 바로
+    # 쓰면, 아직 다 안 이어진 중간 span에서 우연히 칸 수는 맞아도
+    # 일부 칸의 날짜가 끝자리 없이 잘린 채(예: "2025/11/0") 채택될 수
+    # 있다. 칸 수가 맞는 후보를 다 모아 두고, 그중 매치된 날짜 글자
+    # 수 합이 가장 큰(=가장 안 잘린) 조합을 쓴다.
+    best = None
     for span in (1, 2, 3, 4, 5):
         for start in range(len(window) - span + 1):
             joined = {}
@@ -225,14 +244,19 @@ def _periods(rows, header_row, cols, need=2):
                     if (cell or "").strip():
                         joined[j] = joined.get(j, "") + " " + cell
             found = {}
+            match_len = 0
             for j, text in joined.items():
-                candidate = " ".join(text.split())
+                candidate = _squash_split_digits(text)
                 m = RE_PERIOD.search(candidate)
                 if m:
                     found[j] = f"{m.group(1)}~{m.group(2)}"
+                    match_len += len(m.group(0))
             if len(found) == len(cols) and len(cols) > 2:
-                ordered_vals = [v for _, v in sorted(found.items())]
-                return dict(zip(sorted(cols), ordered_vals))
+                if best is None or match_len > best[0]:
+                    best = (match_len, found)
+    if best:
+        ordered_vals = [v for _, v in sorted(best[1].items())]
+        return dict(zip(sorted(cols), ordered_vals))
     for span in (1, 2, 3, 4, 5):
         for start in range(len(window) - span + 1):
             joined = {}
@@ -244,7 +268,7 @@ def _periods(rows, header_row, cols, need=2):
             for j, text in joined.items():
                 if j not in cols:
                     continue
-                candidate = " ".join(text.split())
+                candidate = _squash_split_digits(text)
                 # 날짜 앞자리나 끝자리 숫자 한두 글자가 바로 옆 칸(보통
                 # 빈 칸으로 쓰이는 스페이서)으로 잘못 삐져나온 문서가
                 # 있다(KR516702010M 실측: "최근 2년차" 줄의 시작연도
@@ -870,6 +894,16 @@ def extract(db_path=DEFAULT_DB_PATH):
         # 새 헤더를 찾았을 때만) 이어 가고, 그 외엔 끊어서 무관한 뒤쪽
         # 표까지 잘못 번지지 않게 한다.
         inherited, prev_page, prev_rows = None, None, None
+        # 표(테두리 기반) 쪽에서 페이지별로 확인된 (cols, periods)를
+        # 남겨 둔다 - 아래 좌표 폴백이 자기 나름대로 칸을 다시 나누다
+        # 헤더 병합 칸(예: "최근2년차 최근3년차 최근4년차 최근5년차"가
+        # 좌표상 한 칸으로 뭉침)을 잘못 갈라 특정 연차의 기간(period)만
+        # 못 찾는 사고를 막는다(KR5120420091 실측: 60/61쪽 경계에서
+        # 빠진 "Class C-R(퇴직연금)" 행을 좌표 폴백이 되찾긴 했는데,
+        # 그 폴백 자신의 헤더 인식에서 2~5년차 칸이 뭉쳐 2년차의 기간
+        # 문자열을 못 뽑아 값은 있는데 period만 null로 남았다). 이미
+        # 표 쪽에서 검증된 진짜 칸 구성이 있으면 그걸 최우선으로 쓴다.
+        table_page_state = {}
         for page, dj in conn.execute(
                 "SELECT page, data_json FROM tables WHERE doc_id = ? "
                 "ORDER BY page, table_index",
@@ -906,6 +940,8 @@ def extract(db_path=DEFAULT_DB_PATH):
             got, state = _parse_table(rows, page_texts[page], known_codes, carry)
             prev_page, prev_rows = page, rows
             inherited = state if (got or (state and not carry)) else None
+            if inherited and inherited[2]:
+                table_page_state[page] = inherited
             if not got:
                 continue
             for r in got:
@@ -942,8 +978,15 @@ def extract(db_path=DEFAULT_DB_PATH):
                     if not rows:
                         continue
                     text = page.extract_text() or ""
-                    carry = (inherited2
-                              if prev_page2 in (page_num, page_num - 1) else None)
+                    # 표(테두리) 쪽에서 이 페이지(또는 바로 앞 페이지)
+                    # 것으로 이미 확인된 진짜 칸 구성이 있으면 그걸
+                    # 최우선으로 쓴다 - 좌표 재구성 자신의 헤더 인식이
+                    # 병합 칸을 잘못 갈라 특정 연차만 기간을 놓치는
+                    # 사고를 막는다(위 table_page_state 주석 참고).
+                    carry = (table_page_state.get(page_num)
+                             or table_page_state.get(page_num - 1)
+                             or (inherited2
+                                 if prev_page2 in (page_num, page_num - 1) else None))
                     recovered = _recover_split_row(prev_rows2, rows, known_codes, carry)
                     if recovered:
                         rec_code, rec_vals = recovered
