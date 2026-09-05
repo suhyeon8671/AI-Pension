@@ -30,6 +30,7 @@
 """
 
 import os
+import re
 import sys
 
 from fastapi import FastAPI
@@ -167,16 +168,250 @@ def compose_answer(question: str, context: str, fallback: str):
     return fallback, how
 
 
+# HCX가 없거나 실패했을 때 쓰는 fallback(=조회 결과 원문)이 표지·목차
+# 줄을 답으로 내보내는 사고가 있었다("퇴직연금 장외채권 매수 신청
+# 어떻게 해?" 실측: "퇴직연금 장외채권 매수 모바일 신청 가이드"(23자,
+# 표지)가 유사도 1등(0.941)이고, 진짜 절차가 적힌 페이지("1. 금융상품
+# 매매 메뉴...", 259자)는 0.638로 밀렸다 - 표지·목차처럼 짧고 질문
+# 낱말만 고밀도로 담은 줄이, 낱말이 여러 문장에 흩어진 진짜 본문보다
+# TF-IDF 유사도가 더 높게 나오기 쉽다).
+#
+# 처음엔 "글자 수 40 미만이면 제외"로 막았는데, 이것도 틀렸다 - 짧아도
+# 정답인 문장("가입대상: 만 55세 이상", "위험자산 투자한도 70%")을
+# 같이 버리고, 길어도 무관한 주의문·목차는 못 거른다. 그래서 "확실한
+# 표지/목차 신호"만 하드 제외하고, 나머지는 "검색 관련성 + 정답이
+# 실려 있을 만한 구조"로 점수를 매겨 고른다. 구조 신호 중 일부(번호
+# 단계·메뉴경로 등)는 질문 유형에 따라 가산 여부가 갈린다 - 아래
+# _INTENT_PATTERNS/_intent_bonus 참고.
+_COVER_MARKER_RE = re.compile(r"\((?:섹션\s*)?표지\)|목차|Contents")
+# "1. 퇴직연금 유상청약 신청"처럼 번호 + 명사구 한 줄로 끝나는 목차 줄의
+# 모양(뒤에 콜론·화살표·구체값이 붙어 실제 설명으로 이어지면 아래
+# _excerpt_score에서 목차로 안 본다).
+_TOC_LINE_RE = re.compile(r"^\s*[1-9][.)]\s*[^\n:：>→]{1,30}$")
+_SENTENCE_END_RE = re.compile(r"(다|요|니다|함|음|까)[.?!]\s*$")
+_KEY_VALUE_RE = re.compile(r"[가-힣A-Za-z0-9()·/ ]{1,20}\s*[:：]\s*\S")
+_MENU_PATH_RE = re.compile(r"\S\s*[>→]\s*\S")
+_STEP_MARKER_RE = re.compile(r"(?:^|\n)\s*[1-9][.)]\s*\S{3,}")
+_ACTION_WORD_RE = re.compile(
+    r"선택|이동|검색|클릭|입력|신청|가능|조회|매수|매도|이체|해지|등록|접수")
+_SPECIFIC_VALUE_RE = re.compile(r"\d+\s*(?:%|세|원|만원|억원|년|개월|회|건|등급)")
+_EXCEPTION_MARKER_RE = re.compile(r"다만|단,|예외|제외하고|해당하지\s*않|아니면")
+_RISK_ASSET_RE = re.compile(
+    r"위험등급|\d\s*등급|주식형|채권형|혼합형|파생상품|MMF|자산유형")
+# 비교 질문("DB와 DC 차이")에서, 실제로 비교 대상 둘 다 언급하는 문장에만
+# 가산점을 준다 - 한쪽만 설명하는 문장은 "차이"에 대한 완전한 답이 못 된다.
+_DUAL_SUBJECT_RE = re.compile(r"DB|DC|IRP|연금저축")
+
+# 질문 유형 감지. 하나의 질문에 여러 유형이 동시에 걸릴 수 있다(복합
+# 질문 - 아래 _pick_fallback_hits 참고). "제도 설명" 칸의 "대상·조건"도
+# 여기 definition에 포함한다("가입대상이 뭐야?"는 절차가 아니라 제도
+# 설명 질문이다).
+_INTENT_PATTERNS = {
+    "procedure": re.compile(
+        r"어떻게|방법|절차|하는\s*법|신청|하려면|하는거|하려|해야\s*(?:하|되)"),
+    "definition": re.compile(
+        r"뭐야|무엇|이란|정의|뜻이|대상이|가입\s*대상|가입\s*조건|자격|어떤\s*사람"),
+    "tax_limit": re.compile(r"세액공제|한도|얼마|몇\s*%|몇\s*퍼센트|공제"),
+    "product_info": re.compile(r"위험등급|자산유형|클래스|어떤\s*상품|상품명"),
+    "fee_return": re.compile(r"보수|수수료|수익률|비용"),
+    "comparison": re.compile(r"차이|비교|보다|중\s*어디|어느\s*쪽|둘\s*다"),
+    "recommendation": re.compile(r"추천|골라|뭐가\s*좋"),
+}
+
+
+def _detect_intents(question):
+    q = question or ""
+    return {name for name, pat in _INTENT_PATTERNS.items() if pat.search(q)}
+
+
+def _intent_bonus(t, intent, has, question):
+    """질문 유형별 가산점. has는 _excerpt_score가 이미 계산해 둔 공통
+    신호 dict(문장종결/항목값/메뉴/단계/행동/구체값) - 유형마다 새로
+    정규식을 돌리지 않고 재사용한다."""
+    if intent == "procedure":
+        b = 0.0
+        if has["menu"]:
+            b += 0.3
+        if has["step"] or has["action"]:
+            b += 0.3
+        return b
+    if intent == "definition":
+        # "다만/예외" 같은 단서 절이 붙어 있으면 대상·조건·예외까지
+        # 완전한 설명일 가능성이 높다.
+        return 0.2 if _EXCEPTION_MARKER_RE.search(t) else 0.0
+    if intent in ("tax_limit", "fee_return"):
+        # 값 자체는 공통 점수에서 이미 +0.2를 받는다 - 세제·보수 질문
+        # 에서는 그 값이 핵심이므로 추가로 더 얹는다.
+        return 0.15 if has["value"] else 0.0
+    if intent == "product_info":
+        return 0.2 if _RISK_ASSET_RE.search(t) else 0.0
+    if intent == "comparison":
+        subs = set(_DUAL_SUBJECT_RE.findall((question or "").upper()))
+        if len(subs) < 2:
+            return 0.0
+        present = sum(1 for s in subs if s in t.upper())
+        return 0.3 if present >= 2 else 0.0
+    if intent == "recommendation":
+        # "사용자 조건과 상품 특성이 함께 있는 근거" - 항목:값과 구체
+        # 수치가 같이 있으면 조건·특성이 둘 다 적힌 문장일 가능성이 있다.
+        return 0.2 if (has["kv"] and has["value"]) else 0.0
+    return 0.0
+
+
+# 구조 점수만으로 고르면 검색 관련성을 사실상 무시하게 된다(무관한
+# 수수료표가 항목:값+구체수치로 0.4를 받아, 정답 문장(문장종결 0.1)을
+# 구조 점수만으로 이길 수 있었다). 그래서 검색 유사도(retrieval_score,
+# 0~1대)를 기본값으로 깔고 구조 점수를 그 위에 더하는 보정으로 쓴다 -
+# 관련성이 먼저고, 구조는 "관련성이 비슷한 후보들 중에 표지·목차를
+# 밀어내고 실제 설명을 우선"시키는 재정렬용이다. 이 코퍼스의 검색
+# 유사도는 관련 문서끼리도 0.4~0.9대로 흩어져 있어(실측), 0.4 근처를
+# 문턱으로 잡으면 구조 보정 없이도 상당수가 걸러진다.
+MIN_FALLBACK_SCORE = 0.35
+_BARE_PHRASE_PENALTY = 0.25
+
+
+def _excerpt_score(text, retrieval_score=0.0, page=None, intents=frozenset(), question=""):
+    """이 히트를 fallback 발췌로 쓸 만한지 채점한다(검색 유사도 +
+    공통 구조 보정 + 질문 유형별 가산). 확실히 표지/목차면 None(하드
+    제외).
+
+    "글자 수가 짧으면 표지"가 아니다 - PDF 추출에서 마침표가 곧잘
+    사라져 "확정급여형은 회사가 적립금을 운용하는 제도"처럼 종결어미도
+    콜론도 없는 짧은 정답 문장이 실제로 나온다. 그래서 이런 "벌거벗은
+    명사구"는 감점만 하고 걸러내지는 않는다 - 검색 유사도가 충분히
+    높으면(=질문과 실제로 관련 있으면) 감점을 받고도 살아남을 수
+    있다.
+
+    반면 "번호. 명사구" 목차 줄(예: "1. 퇴직연금 유상청약 신청")은
+    감점이 아니라 그대로 하드 제외한다 - 이 모양은 "정답 문장에서
+    마침표만 빠진 것"과 다르다, 애초에 절 제목을 가리키는 목차
+    항목이라는 게 구조적으로 명확하고, 이 코퍼스에서 목차 줄은 질문
+    낱말과 고밀도로 겹쳐 검색 유사도가 실제 정답 페이지보다도 높게
+    나오기 쉬워서(실측) 감점만으로는 다 못 눌러낸다. 콜론·메뉴경로·
+    구체값이 붙어 실제 설명으로 이어지면(예: "1. 가입대상: 만 55세
+    이상") 이 하드 제외에서 빠진다.
+
+    표지도 마찬가지로 명시적 마커, 그리고 "1쪽 + 벌거벗은 명사구"
+    (문서 1쪽이 정확히 이 모양이면 표지 페이지일 확률이 매우 높다 -
+    실측 "퇴직연금 장외채권 매수 모바일 신청 가이드", 1쪽)는 하드
+    제외한다."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    if _COVER_MARKER_RE.search(t):
+        return None
+    has = {
+        "end": bool(_SENTENCE_END_RE.search(t)),
+        "kv": bool(_KEY_VALUE_RE.search(t)),
+        "menu": bool(_MENU_PATH_RE.search(t)),
+        "step": bool(_STEP_MARKER_RE.search(t)),
+        "action": bool(_ACTION_WORD_RE.search(t)),
+        "value": bool(_SPECIFIC_VALUE_RE.search(t)),
+    }
+
+    single_line = "\n" not in t
+    is_bare_phrase = (single_line and len(t) <= 35
+                       and not (has["end"] or has["kv"] or has["menu"] or has["value"]))
+    is_bare_toc = (single_line and _TOC_LINE_RE.match(t)
+                   and not (has["kv"] or has["menu"] or has["value"]))
+
+    if is_bare_toc:
+        return None  # 목차 줄 - 감점이 아니라 하드 제외
+    if is_bare_phrase and page == 1:
+        return None  # 1쪽짜리 벌거벗은 명사구 - 표지일 확률이 매우 높다
+
+    score = retrieval_score
+    if has["end"]:
+        score += 0.1
+    if has["kv"]:
+        score += 0.2
+    if has["value"]:
+        score += 0.2
+    for intent in intents:
+        score += _intent_bonus(t, intent, has, question)
+    if is_bare_phrase:
+        # 1쪽이 아니라 하드 제외는 피했지만, 그래도 벌거벗은 명사구는
+        # 감점한다 - 검색 유사도가 충분히 높은 진짜 정답만 이 감점을
+        # 견디고 살아남는다.
+        score -= _BARE_PHRASE_PENALTY
+    return score
+
+
+def _best_scored_hit(hits, query, intents, exclude_ids=frozenset()):
+    """intents 기준으로 채점해 최고점 히트 하나를 고른다. 문턱 미달이거나
+    후보가 없으면 None. exclude_ids는 이미 다른 사실에 쓴 히트를
+    복합질문 선택에서 다시 뽑지 않게 뺀다."""
+    scored = []
+    for rank, h in enumerate(hits):
+        if id(h) in exclude_ids:
+            continue
+        s = _excerpt_score(h.get("text"), h.get("score", 0.0) or 0.0,
+                            h.get("page"), intents, query)
+        if s is not None:
+            scored.append((s, -rank, h))
+    if not scored:
+        return None
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    best_score, _, best_hit = scored[0]
+    # 부동소수점 오차(0.7-0.25가 정확히 0.45가 아니라 0.44999...로 나오는
+    # 등)로 문턱 바로 위 점수가 억울하게 탈락하지 않도록 아주 작은
+    # 여유(epsilon)를 둔다.
+    if best_score < MIN_FALLBACK_SCORE - 1e-9:
+        return None
+    return best_hit
+
+
+def _pick_fallback_hits(hits, query="", max_chunks=3):
+    """표지·목차를 하드 제외하고, 남은 것 중 (검색 유사도+구조+질문
+    유형) 점수가 가장 높은 히트를 고른다. 문턱 미달이거나 후보가 아예
+    없으면 빈 리스트 - 관련성 낮은 아무 문장이나 억지로 답인 척 내보내지
+    않는다.
+
+    질문이 서로 다른 사실을 두 개 이상 요구하면("IRP 가입 대상과
+    중도인출 방법을 알려줘" - 가입대상=definition, 중도인출 방법=
+    procedure) 청크 하나로 다 답하려 하지 않는다 - 사실(=감지된 질문
+    유형)마다 제일 잘 맞는 청크를 따로 골라 최대 max_chunks개까지
+    모은다. 한 사실도 문턱을 못 넘으면 그 사실은 건너뛴다."""
+    intents = _detect_intents(query)
+    if len(intents) >= 2:
+        picked, seen = [], set()
+        for intent in sorted(intents):
+            hit = _best_scored_hit(hits, query, {intent}, seen)
+            if hit is not None:
+                picked.append(hit)
+                seen.add(id(hit))
+            if len(picked) >= max_chunks:
+                break
+        if picked:
+            return picked
+        # 사실별로 하나도 못 골랐으면(전부 문턱 미달) 아래 단일 선택
+        # 경로로 넘어간다 - 그래도 감지된 의도는 전부 가산점에 반영한다.
+    hit = _best_scored_hit(hits, query, intents)
+    return [hit] if hit is not None else []
+
+
 def generate_answer(query: str, route_result: dict):
     """검색(rag) 경로의 답변. (답변, 생성 방식 한 줄)"""
     hits = route_result["semantic_hits"]
     if not hits:
         return NO_EVIDENCE, "근거가 없어 정보한계로 답함"
     context = format_retrieved_context(route_result)
-    top = hits[0]
-    excerpt = top["text"][:300]
-    fallback = (f"검색된 근거({top.get('doc_id')} p.{top.get('page')})에 따르면:\n"
-                f"{excerpt}")
+    picked = _pick_fallback_hits(hits, query)
+    if not picked:
+        # 표지가 확실하거나(1쪽 벌거벗은 명사구 등), 남은 후보의 점수가
+        # 다 MIN_FALLBACK_SCORE에 못 미치면(=검색 관련성부터 낮으면)
+        # 그 문장을 억지로 답인 척 내보내지 않는다 - 근거 부족을
+        # 정직하게 말하는 쪽이 낫다.
+        return NO_EVIDENCE, "상위 검색 결과 중 관련성 있는 근거를 찾지 못해 정보한계로 답함"
+    if len(picked) == 1:
+        top = picked[0]
+        fallback = (f"검색된 근거({top.get('doc_id')} p.{top.get('page')})에 따르면:\n"
+                    f"{top['text'][:300]}")
+    else:
+        # 복합 질문 - 사실별로 고른 청크를 각자 출처를 단 채로 이어붙인다.
+        parts = [f"[{h.get('doc_id')} p.{h.get('page')}] {h['text'][:300]}"
+                 for h in picked]
+        fallback = "질문에 필요한 사실을 근거별로 나눠 찾았습니다:\n\n" + "\n\n".join(parts)
     return compose_answer(query, context, fallback)
 
 
