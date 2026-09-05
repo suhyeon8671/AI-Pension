@@ -118,16 +118,31 @@ _PARTICLES = (
 )
 
 
+def _acronym_min_len(remainder):
+    """조사를 뗀 나머지가 영문 대문자 약어(DC/DB/MP 등)면 2글자까지 허용.
+
+    "DC와"는 정확히 3글자라 예전 문턱(3글자 밑으로 못 줄임)에 걸려 조사를
+    아예 못 뗐다 - 검색어가 "DC"가 아니라 원문 어디에도 없는 "DC와" 그대로
+    남아, "DC와 DB, 운용 주체가 어떻게 다른가요?" 같은 질의에서 정답
+    청크(doc10)가 키워드 검색 후보에 통째로 못 들었다(실측). 한글
+    2글자는 여전히 3글자 문턱을 유지한다 - 한글은 조사를 떼도 뜻이
+    불분명한 경우가 많아 함부로 넓히면 엉뚱한 청크가 올라온다
+    (DOMAIN_EXPANSIONS를 검증된 것만 넣는 것과 같은 이유)."""
+    return 2 if remainder.isascii() and remainder.isalpha() and remainder.isupper() else 3
+
+
 def _strip_particles(term):
-    """낱말 뒤에 붙은 조사/어미를 뗀다. 3글자 밑으로 줄면 그만둔다."""
+    """낱말 뒤에 붙은 조사/어미를 뗀다. 3글자(영문 대문자 약어는 2글자) 밑으로 줄면 그만둔다."""
     changed = True
-    while changed and len(term) > 3:
+    while changed and len(term) > 2:
         changed = False
         for p in _PARTICLES:
-            if term.endswith(p) and len(term) - len(p) >= 3:
-                term = term[: -len(p)]
-                changed = True
-                break
+            if term.endswith(p):
+                remainder = term[: -len(p)]
+                if len(remainder) >= _acronym_min_len(remainder):
+                    term = remainder
+                    changed = True
+                    break
     return term
 
 
@@ -139,7 +154,9 @@ def lexical_term_groups(query):
     (5.6) 하나를 압도해서, 정작 위험자산 얘기가 없는 청크가 1등이 됐다.
     한 묶음은 한 낱말로 치고 한 번만 점수를 준다.
 
-    trigram 색인은 3글자 미만을 못 찾으므로 3글자 이상만 남긴다."""
+    trigram 색인은 3글자 미만을 못 찾으므로 3글자 이상만 남긴다(단, 조사를
+    뗀 결과가 DC/DB처럼 영문 대문자 약어면 2글자도 남긴다 - lexical_search
+    가 그런 짧은 말은 LIKE로 찾아서 별도로 처리한다)."""
     groups, seen = [], set()
     expansions = []
     for raw in _TERM_RE.findall(query or ""):
@@ -151,7 +168,8 @@ def lexical_term_groups(query):
             continue
         variants = []
         for t in forms:
-            if len(t) < 3 or t in seen:
+            is_short_acronym = len(t) == 2 and t.isascii() and t.isalpha() and t.isupper()
+            if (len(t) < 3 and not is_short_acronym) or t in seen:
                 continue
             seen.add(t)
             variants.append(t)
@@ -272,29 +290,58 @@ def lexical_search(query, k=5, doc_type=None, product_code=None, db_path=DEFAULT
         for _w, variants in weighted:
             if not any(t in query_terms for t in variants):
                 continue
-            sql = """
-                SELECT c.id, c.chunk_id, c.doc_type, c.doc_id, c.source_doc,
-                       c.product_code, c.page, c.text, bm25(chunks_fts) AS rank
-                FROM chunks_fts
-                JOIN chunks c ON c.id = chunks_fts.rowid
-                WHERE chunks_fts MATCH ?
-            """
-            params = [" OR ".join(f'"{t}"' for t in variants)]
-            if doc_type:
-                sql += " AND c.doc_type = ?"
-                params.append(doc_type)
-            if product_code:
-                sql += " AND c.product_code = ?"
-                params.append(product_code)
-            sql += " ORDER BY rank LIMIT ?"
-            params.append(max(k * 10, 50))
-            try:
-                for r in conn.execute(sql, params):
-                    if r["id"] not in seen_ids:
-                        seen_ids.add(r["id"])
-                        rows.append(r)
-            except sqlite3.OperationalError:
-                continue  # 색인이 없거나 질의 문법이 안 맞으면 조용히 넘어간다
+            # trigram 색인은 3글자 미만을 아예 못 찾는다(MATCH 질의에 넣어도
+            # 조용히 0건) - DC/DB처럼 2글자 약어만 남은 낱말은 MATCH가 아니라
+            # LIKE로 따로 찾는다. 나머지(3글자 이상)는 그대로 MATCH를 쓴다.
+            long_terms = [t for t in variants if len(t) >= 3]
+            short_terms = [t for t in variants if len(t) < 3]
+            if long_terms:
+                sql = """
+                    SELECT c.id, c.chunk_id, c.doc_type, c.doc_id, c.source_doc,
+                           c.product_code, c.page, c.text, bm25(chunks_fts) AS rank
+                    FROM chunks_fts
+                    JOIN chunks c ON c.id = chunks_fts.rowid
+                    WHERE chunks_fts MATCH ?
+                """
+                params = [" OR ".join(f'"{t}"' for t in long_terms)]
+                if doc_type:
+                    sql += " AND c.doc_type = ?"
+                    params.append(doc_type)
+                if product_code:
+                    sql += " AND c.product_code = ?"
+                    params.append(product_code)
+                sql += " ORDER BY rank LIMIT ?"
+                params.append(max(k * 10, 50))
+                try:
+                    for r in conn.execute(sql, params):
+                        if r["id"] not in seen_ids:
+                            seen_ids.add(r["id"])
+                            rows.append(r)
+                except sqlite3.OperationalError:
+                    pass  # 색인이 없거나 질의 문법이 안 맞으면 조용히 넘어간다
+            for t in short_terms:
+                sql = """
+                    SELECT c.id, c.chunk_id, c.doc_type, c.doc_id, c.source_doc,
+                           c.product_code, c.page, c.text, 0 AS rank
+                    FROM chunks c
+                    WHERE c.text LIKE ?
+                """
+                params = [f"%{t}%"]
+                if doc_type:
+                    sql += " AND c.doc_type = ?"
+                    params.append(doc_type)
+                if product_code:
+                    sql += " AND c.product_code = ?"
+                    params.append(product_code)
+                sql += " LIMIT ?"
+                params.append(max(k * 10, 50))
+                try:
+                    for r in conn.execute(sql, params):
+                        if r["id"] not in seen_ids:
+                            seen_ids.add(r["id"])
+                            rows.append(r)
+                except sqlite3.OperationalError:
+                    continue
     finally:
         conn.close()
 

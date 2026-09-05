@@ -41,24 +41,5 @@
     "doc_id": "doc22",
     "doc_type": "institution",
     "source_doc": "doc22.pdf"
-  },
-  {
-    "page": 3,
-    "table_index": 0,
-    "rows": 2,
-    "cols": 2,
-    "data": [
-      [
-        "",
-        ""
-      ],
-      [
-        "",
-        ""
-      ]
-    ],
-    "doc_id": "doc22",
-    "doc_type": "institution",
-    "source_doc": "doc22.pdf"
   }
 ]
