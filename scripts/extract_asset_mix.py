@@ -91,6 +91,28 @@ RE_PCT_ROW_HINT = re.compile(r"^\(?\d+(?:\.\d+)?\)?$")
 # "(기준일 : 2025년 05월 02일" / "[2025.05.02 현재" 둘 다 쓴다.
 RE_AS_OF = re.compile(
     r"(20\d{2})\s*[.년]\s*(\d{1,2})\s*[.월]\s*(\d{1,2})")
+# "단위: 백만원" 같은 캡션에서 금액 단위를 뽑는다. 문서마다 단위이
+# 다르다(실측: KR5127450117은 억원, KR5129420025는 백만원) - 단위 없이
+# amount/total_amount만 내보내면 두 상품을 그대로 비교했을 때 100배
+# 차이가 나는 걸 놓친다.
+#
+# "단위" 바로 뒤에 금액단위가 오지 않는 문서가 많다(실측: "단위 : %,
+# 백만, 2024.12.31 기준" - 퍼센트가 먼저 나온다). 그래서 "단위" 뒤
+# 일정 구간(_UNIT_WINDOW)을 통째로 보고 그 안에서 찾는다. 또 "원"
+# 없이 "백만"/"억"만 쓰는 문서도 있다(실측: "단위 : %, 백만," -
+# "백만원"이 아니라 "백만"만). 이런 짧은 말은 뒤에 다른 한글이 곧장
+# 이어지면 안 받는다 - 안 그러면 캡션과 무관한 데서 "억"/"원" 한
+# 글자가 우연히 걸릴 위험이 있다(쉼표/괄호/퍼센트/숫자/문자열 끝처럼
+# 캡션에서 실제로 단위 뒤에 오는 것들만 받는다).
+_UNIT_WINDOW = 30
+_UNIT_PATTERNS = [
+    (re.compile(r"백만원"), "백만원"),
+    (re.compile(r"억원"), "억원"),
+    (re.compile(r"천원"), "천원"),
+    (re.compile(r"백만(?=[,\)%0-9]|$)"), "백만원"),
+    (re.compile(r"억(?=[,\)%0-9]|$)"), "억원"),
+    (re.compile(r"(?<![가-힣])원(?=[,\)%0-9]|$)"), "원"),
+]
 
 
 def _squash(text):
@@ -262,6 +284,35 @@ def _as_of(rows, page_text=""):
         return None
     y, mo, d = m.groups()
     return f"{y}-{int(mo):02d}-{int(d):02d}"
+
+
+def _unit(rows, page_text=""):
+    flat = _squash(" ".join((c or "") for r in rows for c in r)) + _squash(page_text)
+    # "단위" 글자 자체가 없는 캡션도 있다(실측: "집합투자기구의
+    # 자산구성 현황 (2025.03.31 기준, 억원)" - "단위:" 없이 괄호 안에
+    # 기준일과 같이 바로 적는다). "단위" 근처에서 못 찾으면 "자산구성"
+    # 캡션 근처로 한 번 더 찾는다 - 이 캡션은 _is_shape가 이미
+    # 요구하므로 항상 있다.
+    #
+    # "자산구성" 글자가 한 문서 안에 두 번(표 캡션 + 파이차트 캡션)
+    # 나오는 경우가 있는데, 파이차트 쪽은 퍼센트만 있고 단위가 없다
+    # (실측: KR5153420022 - 진짜 캡션 "(단위 : %, 백만, ...)"은 이전
+    # 쪽 끝에 있고, 표가 있는 이 쪽엔 단위 없는 파이차트 캡션만 있다).
+    # find()로 첫 번째 자리만 보면 그 단위 없는 자리에서 멈춰 버려
+    # 뒤에 이어붙은 이전 쪽 텍스트의 진짜 단위를 못 본다 - 모든 자리를
+    # 훑어 하나라도 단위를 찾으면 그걸 쓴다.
+    for anchor in ("단위", "자산구성"):
+        start = 0
+        while True:
+            idx = flat.find(anchor, start)
+            if idx == -1:
+                break
+            window = flat[idx: idx + _UNIT_WINDOW]
+            for pat, label in _UNIT_PATTERNS:
+                if pat.search(window):
+                    return label
+            start = idx + len(anchor)
+    return None
 
 
 # 잎 이름 -> 답변에 쓸 이름
@@ -444,6 +495,7 @@ def parse_asset_table(rows, page_text=""):
         total_amount = round(sum(amounts), 2) if amounts else None
     return {"items": out, "total_amount": total_amount,
             "pct_derived": derived,
+            "unit": _unit(rows, page_text),
             "as_of": _as_of(rows, page_text)}
 
 
@@ -501,7 +553,8 @@ def _parse_simple_asset_text(text):
         if abs(got - 100) > 1.0:
             continue
         return {"items": out, "total_amount": amounts[-1],
-                "pct_derived": False, "as_of": _as_of([], text)}
+                "pct_derived": False, "unit": _unit([], text),
+                "as_of": _as_of([], text)}
     return None
 
 

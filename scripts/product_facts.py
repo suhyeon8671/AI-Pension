@@ -373,7 +373,20 @@ def product_facts(code, class_code=None, intents=None, db_path=DEFAULT_DB_PATH):
         if "fee" in intents or "cost_projection" in intents:
             fees = _classes_for(conn, code, class_code)
             if not fees:
-                lines.append("  보수: 해당 클래스 정보를 찾지 못했습니다.")
+                # class_meaning(클래스 이름표)엔 있는데 class_fees(보수
+                # 숫자표)엔 없는 클래스가 드물게 있다(실측: KR5194450018
+                # I클래스 - 환매수수료 클래스 목록엔 나오지만 보수
+                # 숫자표에서는 안 보임. 추출 버그인지 원문 자체에 숫자가
+                # 없는지 단정할 근거가 없다). "클래스 자체가 없다"와
+                # "클래스는 있는데 보수 숫자가 없다"는 다른 사실이라
+                # 구분해서 알려준다 - 뭉뚱그리면 후자를 전자로 오해해
+                # "그런 클래스는 없다"고 답하게 된다.
+                if class_code and class_code in meaning:
+                    lines.append(
+                        f"  보수: {class_code} 클래스는 존재하지만 보수 정보를 "
+                        "문서에서 확인하지 못했습니다.")
+                else:
+                    lines.append("  보수: 해당 클래스 정보를 찾지 못했습니다.")
             else:
                 fee_lines, fee_shown = _fee_lines(fees, meaning)
                 lines.extend(fee_lines)

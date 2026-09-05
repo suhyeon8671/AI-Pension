@@ -36,6 +36,14 @@ SUBJECT_ALIASES = {
     "DC": ["dc제도", "dc형", "확정기여형퇴직연금제도", "확정기여형퇴직연금", "확정기여형", "dc"],
     "IRP": ["개인형퇴직연금제도", "개인형퇴직연금", "irp"],
     "연금저축": ["연금저축계좌", "연금저축펀드", "연금저축신탁", "연금저축"],
+    # 일반 "연금저축"과는 subject를 분리한다 - institution_facts.json의
+    # pension_requirement 사실은 2000.12.31 이전에 개설된 (구)개인연금저축
+    # 기준이라, "구형"/"개인연금저축"을 콕 집어 물었을 때만 이 사실이
+    # 나와야 한다("연금저축"만으로는 못 걸리게 이 항목을 SUBJECT_ALIASES
+    # 뒤쪽에 둔다 - "연금저축"도 "개인연금저축" 안에 부분열로 들어 있어
+    # 둘 다 걸릴 수 있지만, facts_for가 실제 있는 predicate만 돌려주므로
+    # 문제 없다).
+    "개인연금저축(구형)": ["개인연금저축", "구형연금저축", "연금저축구형"],
 }
 
 # 질문에 쓰이는 여러 표현 -> 이 파일의 predicate 코드. 길게 겹치는 표현이
@@ -48,6 +56,18 @@ PREDICATE_ALIASES = {
     "mandatory_irp_transfer": ["의무이전", "irp로이전", "irp로의무"],
     "eligibility": ["가입대상", "가입조건", "가입할수있", "누가가입", "가입자격"],
     "early_withdrawal": ["중도인출", "중간정산"],
+    # 일부 인출 가능 여부(전액해지만 되는지)는 중도인출 "사유" 충족
+    # 여부와 다른 사실이라 predicate를 따로 둔다(합쳐서 한 레코드에
+    # 담았더니 "법정사유 있으면 되는데 전액해지만 된다"는 게 앞뒤가
+    # 충돌하는 것처럼 읽혔다 - institution_facts.json 참고).
+    "withdrawal_method": ["일부인출", "전액해지", "전체해지", "일부만인출"],
+    # DB/DC의 "제도전환"(퇴직금제도<->DB<->DC)과 IRP/연금저축의
+    # "계좌이체"는 서로 다른 개념이라 predicate를 분리했다
+    # (plan_conversion/transfer). 같은 낱말("전환"/"이전")을 양쪽에 다
+    # 걸어 둬도 안전하다 - facts_for가 실제 그 subject에 있는
+    # predicate만 돌려주므로, DB 질문엔 plan_conversion만, IRP 질문엔
+    # transfer만 자연히 걸린다.
+    "plan_conversion": ["제도전환", "전환"],
     "transfer": ["이전", "전환", "이체"],
     "risky_asset_limit": ["위험자산", "위험자산한도", "위험자산비중", "위험자산투자"],
     "contribution_limit": ["납입한도", "부담금한도", "얼마까지납입"],
@@ -75,6 +95,8 @@ _PREDICATE_LABELS = {
     "loss_bearer": "운용손실 부담주체",
     "eligibility": "가입대상",
     "early_withdrawal": "중도인출",
+    "withdrawal_method": "인출 방식",
+    "plan_conversion": "제도전환",
     "transfer": "이전·전환",
     "mandatory_irp_transfer": "IRP 의무이전",
     "risky_asset_limit": "위험자산 투자한도",
@@ -155,6 +177,8 @@ def _format_fact_line(r):
     line = f"- {label}: {_format_value(r)}"
     if r.get("condition"):
         line += f" ({r['condition']})"
+    if r.get("effective_date"):
+        line += f" [{r['effective_date']} 기준 문서]"
     return line
 
 

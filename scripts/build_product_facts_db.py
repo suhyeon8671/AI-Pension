@@ -268,7 +268,12 @@ DROP TABLE IF EXISTS asset_mix;
 CREATE TABLE asset_mix (
     product_code TEXT NOT NULL,
     asset TEXT NOT NULL,        -- 주식 / 채권 / 파생상품(장내) / 단기대출및예금 ...
-    amount REAL,                -- 백만원
+    amount REAL,
+    -- amount/total_amount의 단위. 문서마다 다르다(실측: KR5127450117은
+    -- 억원, KR5129420025는 백만원) - unit 없이 숫자만 비교하면 100배
+    -- 차이 나는 걸 놓친다. 단위를 못 찾은 문서는 NULL - 그때는 금액
+    -- 비교에 쓰면 안 되고 pct(비중, 단위 무관)만 써야 한다.
+    unit TEXT,
     pct REAL,
     total_amount REAL,
     -- 문서가 비율을 안 싣고 금액만 적은 경우 자산총액으로 나눠 만든
@@ -383,9 +388,10 @@ def load_asset_mix(conn, path):
         for it in r.get("items") or []:
             conn.execute(
                 "INSERT OR REPLACE INTO asset_mix (product_code, asset, amount,"
-                " pct, total_amount, pct_derived, as_of, page)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                " unit, pct, total_amount, pct_derived, as_of, page)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (r["product_code"], it["asset"], to_float(it.get("amount")),
+                 r.get("unit"),
                  to_float(it.get("pct")), to_float(r.get("total_amount")),
                  1 if r.get("pct_derived") else 0,
                  r.get("as_of"), r.get("page")))
