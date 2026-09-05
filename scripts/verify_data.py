@@ -23,10 +23,19 @@
 실행:
     python3 scripts/verify_data.py
     python3 scripts/verify_data.py --show 20   # 사례를 더 보기
+    python3 scripts/verify_data.py --output data/validation/issues.json
+        # 검사 결과를 파일로 남긴다. 콘솔 출력은 이 스크립트를 실행한
+        # 순간에만 보이고 사라지는데, "지난번엔 어떤 결함이 있었는지"를
+        # 나중에 찾아보거나(예: 이번 결함이 새로 생긴 건지 전부터 있던
+        # 건지) 답변 쪽에서 "이 값은 알려진 이상치다"라고 표시하려면
+        # 남는 기록이 있어야 한다. DB 스키마를 바꾸는 대신(위험도 높고
+        # 지금 규모엔 안 맞음) 검사 결과 스냅샷을 JSON으로 저장하는
+        # 선에서 끝낸다.
 """
 
 import argparse
 import collections
+import datetime
 import json
 import os
 import re
@@ -35,6 +44,7 @@ import sqlite3
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB_PATH = os.path.join(REPO_ROOT, "structured_store.db")
 DEFAULT_CLASS_FEES_JSON = os.path.join(REPO_ROOT, "class_fees.json")
+DEFAULT_ISSUES_JSON = os.path.join(REPO_ROOT, "data", "validation", "issues.json")
 
 # 보수율이 이보다 크면 값을 잘못 읽은 것이다(퍼센트인데 다른 칸을 집었거나).
 MAX_FEE_PCT = 10.0
@@ -65,6 +75,29 @@ class Report:
             if not info:
                 worst = max(worst, bad)
         return worst
+
+    def to_dict(self, db_path):
+        """검사 결과를 그대로 담은 딕셔너리(JSON 저장용).
+
+        show()가 화면에 찍는 것과 같은 정보를 구조만 바꿔 담는다 - 새로
+        판정 로직을 만들지 않고, 이미 검증된 각 check_* 함수의 결과를
+        그대로 옮긴다."""
+        return {
+            "generated_at": datetime.datetime.now(datetime.timezone.utc)
+                             .isoformat(timespec="seconds"),
+            "db_path": db_path,
+            "checks": [
+                {
+                    "name": name,
+                    "bad": bad,
+                    "total": total,
+                    "info": info,
+                    "note": note,
+                    "samples": samples,
+                }
+                for name, bad, total, samples, note, info in self.checks
+            ],
+        }
 
 
 def _rows(conn, sql, params=()):
@@ -549,6 +582,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default=DEFAULT_DB_PATH)
     ap.add_argument("--show", type=int, default=5, help="사례를 몇 개까지 볼지")
+    ap.add_argument("--output", nargs="?", const=DEFAULT_ISSUES_JSON, default=None,
+                     help="검사 결과를 JSON으로도 저장할 경로 "
+                          f"(값 없이 --output만 쓰면 {DEFAULT_ISSUES_JSON})")
     args = ap.parse_args()
 
     conn = sqlite3.connect(args.db)
@@ -568,6 +604,13 @@ def main():
     worst = rep.show(args.show)
     print()
     print("모든 검사 통과" if worst == 0 else "위 항목을 확인할 것")
+
+    if args.output:
+        os.makedirs(os.path.dirname(args.output), exist_ok=True)
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump(rep.to_dict(args.db), f, ensure_ascii=False, indent=2)
+        print(f"\n검사 결과 저장: {args.output}")
+
     return 0
 
 
