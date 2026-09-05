@@ -3331,7 +3331,9 @@ def enrich_with_detail_fee_table(doc_id, existing_rows):
 # 문제는, 아래 by_code 선택에서 "연도 칸을 더 많이 채운 쪽"을 우선하는
 # 것으로 대응한다(수익률 요약표는 보통 10년 칸이 없어 4칸뿐이고, 진짜
 # 비용예시표는 5칸이 다 있다 - KR5113420069 실측).
-COST_AFTER_RE = re.compile(r"^(\d+)년\s*후?$")
+# "차"도 같은 자리에 쓰는 문서가 있다(KR5160420009 실측: "1년차 2년차
+# 3년차 5년차 10년차") - "후"와 같은 선택적 접미사로 취급한다.
+COST_AFTER_RE = re.compile(r"^(\d+)년\s*[후차]?$")
 
 # 클래스명이 여러 줄로 쪼개진 셀 안에서, 그 줄들 "사이"에 캡션
 # ("판매수수료 및 보수·비용", "(모투자신탁의 총보수·비용 포함)")이
@@ -5068,6 +5070,506 @@ def process_doc(doc_id):
     return final_rows
 
 
+# 비용예시표가 _detail_cost_grids와 전혀 다른 모양으로 나오는 문서가
+# 있다(KR5172450019 실측: "구분 1년후 2년후 3년후 5년후 10년후" 한 줄
+# 헤더 + 클래스마다 "라벨(코드) 값1 값2 값3 값4 값5" 딱 한 줄 - 값은
+# 이미 천원 단위). _detail_cost_grids가 다루는 표(칸이 병합돼 여러 줄에
+# 걸치고, 헤더도 "OO년후" 글자가 세로로 쪼개지는 등 훨씬 복잡한 모양)와
+# 근본적으로 다른 레이아웃이라 억지로 한 함수에 같이 넣으면 기존
+# 1,172개 검증된 클래스를 건드릴 위험이 커진다 - 그래서 완전히 별도
+# 함수로 짜고, fill_detail_cost_projections이 이미 채운 뒤에도 여전히
+# 빈 클래스에만 후처리로 적용한다(마감 직전 위험 관리 원칙 - 기존 파서
+# 보존, 누락분만 새 방식으로 보강).
+def _detail_cost_row_table(pdf):
+    """"구분|1년후|2년후|3년후|5년후|10년후" 한 줄 표를 좌표로 읽는다.
+    돌려주는 값: [(page_num, {class_code: {"1y":..,...}}), ...]"""
+    out = []
+    col_x = None  # {"1y": x0, ...} - 이 페이지 또는 앞 페이지에서 확인된 열 위치
+    header_top = None
+    for i, page in enumerate(pdf.pages):
+        page_num = i + 1
+        words = page.extract_words(x_tolerance=2, keep_blank_chars=False)
+        lines = cluster_lines(words, tol=2.5)
+        this_page_header = None
+        for ln in lines:
+            year_cols = {}
+            for w in ln:
+                m = COST_AFTER_RE.match(w["text"].replace(" ", ""))
+                if m and m.group(1) in ("1", "2", "3", "5", "10"):
+                    year_cols[f"{m.group(1)}y"] = w["x0"]
+            if len(year_cols) >= 4 and any(w["text"] == "구분" for w in ln):
+                this_page_header = (ln[0]["top"], year_cols)
+                break
+        if this_page_header:
+            header_top, col_x = this_page_header
+        elif col_x is None:
+            continue  # 이 문서엔 이 표 자체가 없다(대부분의 문서)
+        else:
+            # 이 페이지엔 헤더가 없다 - 앞 페이지에서 이어지는 데이터만
+            # 있는 페이지다(KR5172450019 28쪽 실측). 열 위치를 그대로
+            # 물려 쓴다. 표가 끝나고 완전히 다른 내용(예: 다음 절)으로
+            # 넘어간 페이지까지 잘못 이어 읽지 않도록, 값 5개가 실제로
+            # 이 열 위치에 있는 줄이 하나도 없으면 건너뛴다(아래 루프가
+            # 자연히 그렇게 걸러준다).
+            header_top = -1
+
+        by_code = {}
+        prev_label = None
+        for ln in lines:
+            if ln[0]["top"] <= header_top:
+                continue
+            vals = {}
+            for w in ln:
+                t = w["text"].replace(",", "")
+                if not (t.lstrip("-").isdigit() and t not in ("-",)):
+                    continue
+                near = min(col_x, key=lambda k: abs(col_x[k] - w["x0"]))
+                if abs(col_x[near] - w["x0"]) <= 15:
+                    vals[near] = t
+            if len(vals) >= 4:
+                label = " ".join(w["text"] for w in ln
+                                  if w["text"].replace(",", "") not in vals.values())
+                code = _label_class_code(label)
+                # 라벨이 값 줄과 다음 줄로 쪼개지는 문서가 있다
+                # (KR5172450019 실측: "...개인연금" 값 줄 다음, "(S-P)"
+                # 코드만 있는 줄이 따로 있다) - 못 찾으면 이 값 줄을
+                # prev_label로 남겨 뒀다가, 바로 다음 줄이 값 없이
+                # 코드만 담고 있으면(아래 elif) 그때 이어붙여 다시 찾는다.
+                if code:
+                    by_code.setdefault(code, vals)
+                    prev_label = None
+                else:
+                    prev_label = (label, vals)
+            elif prev_label is not None and not vals:
+                # 코드만 담긴 다음 줄(값 없음)을 직전 값 줄의 라벨에 이어
+                # 붙여 다시 시도한다.
+                label2 = prev_label[0] + " " + " ".join(w["text"] for w in ln)
+                code = _label_class_code(label2)
+                if code:
+                    by_code.setdefault(code, prev_label[1])
+                prev_label = None
+        if by_code:
+            out.append((page_num, by_code))
+    return out
+
+
+def fill_detail_cost_row_table(doc_id, rows):
+    """_detail_cost_row_table로 찾은 값을, fill_detail_cost_projections이
+    이미 채운 뒤에도 여전히 비용예시가 빈 클래스에만 채운다. 요약표에도
+    있는 클래스로 먼저 대조해서 어긋나면(다른 표를 잘못 읽은 것) 이
+    문서는 통째로 건드리지 않는다 - fill_detail_cost_projections과
+    같은 안전장치."""
+    if all(r.get("cost_projection_per_10m") for r in rows):
+        return 0
+    pdfs = glob.glob(os.path.join(DATA_DIR, doc_id, "*.pdf"))
+    if not pdfs:
+        return 0
+    with pdfplumber.open(pdfs[0]) as pdf:
+        grids = _detail_cost_row_table(pdf)
+    if not grids:
+        return 0
+    by_code = {}
+    for _, m in grids:
+        for code, vals in m.items():
+            if code not in by_code or len(vals) > len(by_code[code]):
+                by_code[code] = vals
+
+    for r in rows:
+        cur = r.get("cost_projection_per_10m") or {}
+        cand = by_code.get(r.get("class_code"))
+        if not cur or not cand:
+            continue
+        for y, v in cur.items():
+            if y in cand and str(v).replace(",", "") != cand[y]:
+                return 0
+
+    filled = 0
+    for r in rows:
+        if r.get("cost_projection_per_10m"):
+            continue
+        cand = by_code.get(r.get("class_code"))
+        if not cand:
+            continue
+        r["cost_projection_per_10m"] = dict(cand)
+        r.setdefault("field_source_pages", {})["cost_projection_per_10m"] = next(
+            pn for pn, m in grids if r["class_code"] in m)
+        pages = r.setdefault("source_pages", [r["page"]])
+        pg = r["field_source_pages"]["cost_projection_per_10m"]
+        if pg not in pages:
+            pages.append(pg)
+        filled += 1
+    return filled
+
+
+# _detail_cost_grids가 다루는 표와 사실상 같은 모양(라벨+캡션+값 5개가
+# 한 줄)인데, 연도 머리글만 "1/2/3/5/10"(숫자만)이 한 줄, "년후"가
+# 다음 줄로 갈라진 문서가 있다(KR5144420091 실측). _detail_cost_grids는
+# "숫자 칸이 3개 이상 나오면 본문 시작"으로 판정해서 이 헤더 줄 자체를
+# (연도 낱말이 채 완성되기도 전에) 본문으로 오인해 표 전체를 놓친다.
+# 이 판정 로직을 고치면 이미 검증된 1,172개 클래스 전부가 다시 걸릴
+# 위험이 있으므로 손대지 않고, 셀(테두리) 구조로 별도로 다시 읽는다 -
+# 여기서 이미 다 채워진 문서는 애초에 아무 표도 안 걸리므로(아래
+# 헤더 판정 자체가 이 특정 모양에서만 성립) 다른 문서에 영향이 없다.
+def _detail_cost_grid2(pdf):
+    out = []
+    # 표가 페이지 경계에서 갈리면 이어지는 쪽엔 머리글이 안 찍힌다
+    # (KR5144420091 실측: 35쪽엔 A/A2/Ae/AG만 있고 나머지 클래스는
+    # 헤더 없이 36쪽에 이어진다). 값 칸 개수가 확인된 연도 칸 수와
+    # 정확히 같을 때만 받으므로(아래), 바로 다음 페이지에 한해서만
+    # 직전에 확인된 연도 순서를 그대로 물려 써도 안전하다.
+    carry_years, carry_page = None, None
+    for i, page in enumerate(pdf.pages):
+        page_num = i + 1
+        for t in page.find_tables():
+            if len(t.cells) < 8:
+                continue
+            rows_ = t.extract()
+            if not rows_:
+                continue
+            year_cols = {}
+            if len(rows_) >= 2:
+                for ci in range(len(rows_[0])):
+                    v0 = (rows_[0][ci] or "").strip()
+                    v1 = (rows_[1][ci] or "").strip()
+                    if v0 in ("1", "2", "3", "5", "10") and v1.replace(" ", "") in ("년후", "년"):
+                        year_cols[ci] = f"{v0}y"
+            if len(year_cols) >= 4:
+                year_order = [y for _, y in sorted(year_cols.items())]
+                data_rows = rows_[2:]
+            elif carry_years and carry_page == page_num - 1:
+                year_order = carry_years
+                data_rows = rows_
+            else:
+                continue
+            # 값 칸의 셀 경계가 머리글 칸과 한 칸씩 어긋나는 문서가
+            # 있다(KR5144420091 실측: 머리글 "1"은 3번 칸인데 값
+            # "41"은 2번 칸 - 클래스 라벨 칸이 캡션("판매수수료 및
+            # 보수·비용")까지 포함해 머리글의 "클래스(종류)+투자기간"
+            # 두 칸과 폭이 안 맞는다). 열 번호로 맞추지 않고, 라벨
+            # 다음에 나오는 숫자 칸을 왼쪽부터 순서대로 연도 순서
+            # (1/2/3/5/10년후, 오름차순)에 맞춘다 - 개수가 정확히
+            # 연도 칸 수만큼일 때만 받아들인다(그래야 캡션 등 다른
+            # 칸이 숫자로 오인돼 섞여 들어올 위험이 없다).
+            by_code = {}
+            for row in data_rows:
+                label = (row[0] or "").strip() if row else ""
+                if not label:
+                    continue
+                code = _label_class_code(label)
+                if not code:
+                    continue
+                packed = [(c or "").replace(",", "").strip() for c in row[1:]]
+                packed = [c for c in packed if c.lstrip("-").isdigit()]
+                if len(packed) != len(year_order):
+                    continue
+                by_code.setdefault(code, dict(zip(year_order, packed)))
+            if by_code:
+                out.append((page_num, by_code))
+                carry_years, carry_page = year_order, page_num
+    return out
+
+
+def fill_detail_cost_grid2(doc_id, rows):
+    """_detail_cost_grid2로 찾은 값을, 다른 폴백들이 이미 채운 뒤에도
+    여전히 비용예시가 빈 클래스에만 채운다. 같은 안전장치(요약표와
+    대조, 어긋나면 문서 통째로 안 건드림)."""
+    if all(r.get("cost_projection_per_10m") for r in rows):
+        return 0
+    pdfs = glob.glob(os.path.join(DATA_DIR, doc_id, "*.pdf"))
+    if not pdfs:
+        return 0
+    with pdfplumber.open(pdfs[0]) as pdf:
+        grids = _detail_cost_grid2(pdf)
+    if not grids:
+        return 0
+    by_code = {}
+    for _, m in grids:
+        for code, vals in m.items():
+            if code not in by_code or len(vals) > len(by_code[code]):
+                by_code[code] = vals
+
+    for r in rows:
+        cur = r.get("cost_projection_per_10m") or {}
+        cand = by_code.get(r.get("class_code"))
+        if not cur or not cand:
+            continue
+        for y, v in cur.items():
+            if y in cand and str(v).replace(",", "") != cand[y]:
+                return 0
+
+    filled = 0
+    for r in rows:
+        if r.get("cost_projection_per_10m"):
+            continue
+        cand = by_code.get(r.get("class_code"))
+        if not cand:
+            continue
+        r["cost_projection_per_10m"] = dict(cand)
+        r.setdefault("field_source_pages", {})["cost_projection_per_10m"] = next(
+            pn for pn, m in grids if r["class_code"] in m)
+        pages = r.setdefault("source_pages", [r["page"]])
+        pg = r["field_source_pages"]["cost_projection_per_10m"]
+        if pg not in pages:
+            pages.append(pg)
+        filled += 1
+    return filled
+
+
+# 네 번째 모양: 비용예시 표 제목에 "(단위 : 원)"이라고 그대로 적혀
+# 있어 값이 천원이 아니라 원 단위 그대로 찍히고("25,468"), 클래스
+# 라벨이 표 테두리 밖(find_tables가 못 잡는 자리)에 있으며, 헤더의
+# "1년"조차 "1"과 "년"이 같은 줄의 다른 낱말로 떨어지는 문서가 있다
+# (KR5152420028 실측). 셀이 아니라 낱말 좌표로 직접 읽는다(이미
+# "표(구분/1년후.../클래스 한 줄)" 모양을 좌표로 읽는 _detail_cost_
+# row_table과 원리는 같지만, 그쪽은 "구분" 토큰이 한 낱말로 붙어
+# 있다고 가정해서 이 문서("구"+" "+"분")는 못 잡는다).
+RE_WON_UNIT_TITLE = re.compile(r"단위\s*[:：]?\s*원\)")
+
+
+def _detail_cost_coord_won(pdf):
+    out = []
+    col_x = None
+    for i, page in enumerate(pdf.pages):
+        page_num = i + 1
+        words = page.extract_words(x_tolerance=2, keep_blank_chars=False)
+        lines = cluster_lines(words, tol=2.5)
+        if RE_WON_UNIT_TITLE.search(page.extract_text() or ""):
+            for ln in lines:
+                year_cols = {}
+                for idx, w in enumerate(ln):
+                    if w["text"].isdigit() and idx + 1 < len(ln) and ln[idx + 1]["text"] == "년":
+                        n = w["text"]
+                    elif COST_AFTER_RE.match(w["text"]):
+                        n = COST_AFTER_RE.match(w["text"]).group(1)
+                    else:
+                        continue
+                    if n in ("1", "2", "3", "5", "10"):
+                        year_cols[f"{n}y"] = w["x0"]
+                if len(year_cols) >= 4:
+                    col_x = year_cols
+                    break
+        if not col_x:
+            continue
+
+        min_col_x = min(col_x.values())
+        by_code = {}
+        for li, ln in enumerate(lines):
+            vals = {}
+            for w in ln:
+                t = w["text"].replace(",", "")
+                if not t.isdigit():
+                    continue
+                near = min(col_x, key=lambda k: abs(col_x[k] - w["x0"]))
+                if abs(col_x[near] - w["x0"]) <= 15:
+                    # 원 단위로 찍힌 값을 다른 문서들과 같은 천원
+                    # 단위로 맞춘다(반올림) - 이 함수는 표 제목에
+                    # "(단위 : 원)"이 실제로 있는 문서에서만 켜지므로
+                    # 이미 천원 단위인 문서를 잘못 나눌 위험이 없다.
+                    vals[near] = str(round(int(t) / 1000))
+            if len(vals) < 4:
+                continue
+            # 클래스 라벨은 값 줄과 같은 밴드가 아니라 위/아래로 걸쳐
+            # 있다(실측: "수수료선취-" 위 줄, 값 줄, "오프라인(A)"
+            # 아래 줄 - 세 줄이 한 클래스). 값 칸 왼쪽(라벨 영역)의
+            # 글자만 바로 위/아래 줄까지 모은다.
+            label_words = []
+            for lj in (li - 1, li, li + 1):
+                if 0 <= lj < len(lines):
+                    label_words.extend(
+                        w["text"] for w in lines[lj] if w["x0"] < min_col_x - 10)
+            code = _label_class_code(" ".join(label_words))
+            if code:
+                by_code.setdefault(code, vals)
+        if by_code:
+            out.append((page_num, by_code))
+    return out
+
+
+def fill_detail_cost_coord_won(doc_id, rows):
+    """_detail_cost_coord_won으로 찾은 값을, 다른 폴백들이 이미 채운
+    뒤에도 여전히 비용예시가 빈 클래스에만 채운다. 같은 안전장치."""
+    if all(r.get("cost_projection_per_10m") for r in rows):
+        return 0
+    pdfs = glob.glob(os.path.join(DATA_DIR, doc_id, "*.pdf"))
+    if not pdfs:
+        return 0
+    with pdfplumber.open(pdfs[0]) as pdf:
+        grids = _detail_cost_coord_won(pdf)
+    if not grids:
+        return 0
+    by_code = {}
+    for _, m in grids:
+        for code, vals in m.items():
+            if code not in by_code or len(vals) > len(by_code[code]):
+                by_code[code] = vals
+
+    for r in rows:
+        cur = r.get("cost_projection_per_10m") or {}
+        cand = by_code.get(r.get("class_code"))
+        if not cur or not cand:
+            continue
+        for y, v in cur.items():
+            if y in cand and str(v).replace(",", "") != cand[y]:
+                return 0
+
+    filled = 0
+    for r in rows:
+        if r.get("cost_projection_per_10m"):
+            continue
+        cand = by_code.get(r.get("class_code"))
+        if not cand:
+            continue
+        r["cost_projection_per_10m"] = dict(cand)
+        r.setdefault("field_source_pages", {})["cost_projection_per_10m"] = next(
+            pn for pn, m in grids if r["class_code"] in m)
+        pages = r.setdefault("source_pages", [r["page"]])
+        pg = r["field_source_pages"]["cost_projection_per_10m"]
+        if pg not in pages:
+            pages.append(pg)
+        filled += 1
+    return filled
+
+
+# 다섯 번째 모양: _detail_cost_row_table과 표 자체는 완전히 같은데
+# (헤더 "1년~10년" + 클래스 한 줄에 값 5개), 표 제목이 "구분" 대신
+# "클래스종류 투자기간별 총비용 예시"라 _detail_cost_row_table의
+# "구분" 낱말 요구 조건에 안 걸린다(KR5125450023 실측). 이미 검증된
+# _detail_cost_row_table의 "구분" 요구 조건을 완화하면 그 함수를 쓰는
+# 다른 문서에도 회귀 위험이 생기므로, 게이트만 다르게(표 제목 대신
+# 페이지 안에 "1,000만원" 문구가 있는지로) 잡는 별도 함수로 둔다 -
+# 나머지 파싱 로직은 동일하다.
+def _detail_cost_row_table2(pdf):
+    out = []
+    col_x = None
+    header_top = None
+    for i, page in enumerate(pdf.pages):
+        page_num = i + 1
+        text = page.extract_text() or ""
+        words = page.extract_words(x_tolerance=2, keep_blank_chars=False)
+        lines = cluster_lines(words, tol=2.5)
+        this_page_header = None
+        if "1,000만원" in text:
+            for ln in lines:
+                year_cols = {}
+                for idx, w in enumerate(ln):
+                    m = COST_AFTER_RE.match(w["text"].replace(" ", ""))
+                    if m:
+                        n = m.group(1)
+                    elif (w["text"].isdigit() and idx + 1 < len(ln)
+                          and ln[idx + 1]["text"] == "년"):
+                        # "1"과 "년"이 같은 줄의 다른 낱말로 떨어지는
+                        # 문서가 있다(KR5125450023 실측).
+                        n = w["text"]
+                    else:
+                        continue
+                    if n in ("1", "2", "3", "5", "10"):
+                        year_cols[f"{n}y"] = w["x0"]
+                if len(year_cols) >= 4:
+                    this_page_header = (ln[0]["top"], year_cols)
+                    break
+        if this_page_header:
+            header_top, col_x = this_page_header
+        elif col_x is None:
+            continue
+        else:
+            header_top = -1
+
+        by_code = {}
+        prev_label = None
+        for ln in lines:
+            if ln[0]["top"] <= header_top:
+                continue
+            vals = {}
+            for w in ln:
+                t = w["text"].replace(",", "")
+                if not (t.lstrip("-").isdigit() and t not in ("-",)):
+                    continue
+                near = min(col_x, key=lambda k: abs(col_x[k] - w["x0"]))
+                if abs(col_x[near] - w["x0"]) <= 15:
+                    vals[near] = t
+            if len(vals) >= 4:
+                label = " ".join(w["text"] for w in ln
+                                  if w["text"].replace(",", "") not in vals.values())
+                code = _label_class_code2(label)
+                if code:
+                    by_code.setdefault(code, vals)
+                    prev_label = None
+                else:
+                    prev_label = (label, vals)
+            elif prev_label is not None and not vals:
+                label2 = prev_label[0] + " " + " ".join(w["text"] for w in ln)
+                code = _label_class_code2(label2)
+                if code:
+                    by_code.setdefault(code, prev_label[1])
+                prev_label = None
+        if by_code:
+            out.append((page_num, by_code))
+    return out
+
+
+# _label_class_code의 "코드(설명)" 갈래(CLASS_CODE_PREFIX_RE)는 코드를
+# 순수 알파벳 1~3자로만 본다 - 하이픈이 낀 코드("A-G(...)", "C-P(...)")는
+# 못 뽑는다(KR5125450023 실측). 여기서만 국소적으로 보강한다 - 공용
+# _label_class_code를 고치면 이미 검증된 다른 모든 문서의 판정까지
+# 다시 흔들릴 위험이 있어서 손대지 않는다.
+_RE_CODE_PREFIX_DASH = re.compile(r"^([A-Za-z][A-Za-z0-9\-]{0,7})\(")
+
+
+def _label_class_code2(label):
+    code = _label_class_code(label)
+    if code:
+        return code
+    m = _RE_CODE_PREFIX_DASH.match(label.replace(" ", ""))
+    if m and not _is_bad_code(m.group(1)):
+        return m.group(1)
+    return None
+
+
+def fill_detail_cost_row_table2(doc_id, rows):
+    """_detail_cost_row_table2로 찾은 값을, 다른 폴백들이 이미 채운
+    뒤에도 여전히 비용예시가 빈 클래스에만 채운다. 같은 안전장치."""
+    if all(r.get("cost_projection_per_10m") for r in rows):
+        return 0
+    pdfs = glob.glob(os.path.join(DATA_DIR, doc_id, "*.pdf"))
+    if not pdfs:
+        return 0
+    with pdfplumber.open(pdfs[0]) as pdf:
+        grids = _detail_cost_row_table2(pdf)
+    if not grids:
+        return 0
+    by_code = {}
+    for _, m in grids:
+        for code, vals in m.items():
+            if code not in by_code or len(vals) > len(by_code[code]):
+                by_code[code] = vals
+
+    for r in rows:
+        cur = r.get("cost_projection_per_10m") or {}
+        cand = by_code.get(r.get("class_code"))
+        if not cur or not cand:
+            continue
+        for y, v in cur.items():
+            if y in cand and str(v).replace(",", "") != cand[y]:
+                return 0
+
+    filled = 0
+    for r in rows:
+        if r.get("cost_projection_per_10m"):
+            continue
+        cand = by_code.get(r.get("class_code"))
+        if not cand:
+            continue
+        r["cost_projection_per_10m"] = dict(cand)
+        r.setdefault("field_source_pages", {})["cost_projection_per_10m"] = next(
+            pn for pn, m in grids if r["class_code"] in m)
+        pages = r.setdefault("source_pages", [r["page"]])
+        pg = r["field_source_pages"]["cost_projection_per_10m"]
+        if pg not in pages:
+            pages.append(pg)
+        filled += 1
+    return filled
+
+
 def fill_detail_cost_projections(doc_id, rows):
     """상세표에서만 나온 클래스는 요약표에 없어 비용예시가 비어 있다
     (실측 298건). 뒤쪽 부속서류의 "<1,000만원 투자시 ...>" 표에서
@@ -5283,6 +5785,21 @@ def main():
         # 있다 - 뒤쪽 부속서류의 "<1,000만원 투자시 ...>" 표에서 채운다.
         # 요약표에도 있는 클래스로 먼저 대조해서 어긋나면 안 채운다.
         cost_filled += fill_detail_cost_projections(doc_id, rows)
+        # 위 표와 아예 다른 모양(칸이 안 병합되고 클래스당 한 줄)의
+        # 비용예시표를 쓰는 문서가 있다 - 기존 파서(_detail_cost_grids)는
+        # 그대로 두고, 그걸로도 여전히 못 채운 클래스에만 별도 방식을
+        # 적용한다.
+        cost_filled += fill_detail_cost_row_table(doc_id, rows)
+        # 세 번째 모양: _detail_cost_grids가 다루는 표와 같은 셀
+        # 구조인데, 연도 머리글이 "1/2/3/5/10"(숫자만) 한 줄 + "년후"
+        # 다음 줄로 갈라져 기존 파서의 헤더 인식이 실패하는 문서.
+        cost_filled += fill_detail_cost_grid2(doc_id, rows)
+        # 네 번째 모양: 값이 원 단위 그대로 찍히고 라벨이 표 테두리
+        # 밖에 있는 문서.
+        cost_filled += fill_detail_cost_coord_won(doc_id, rows)
+        # 다섯 번째 모양: row_table과 표는 같은데 "구분" 대신 다른
+        # 표 제목("클래스종류 투자기간별 총비용 예시")을 쓰는 문서.
+        cost_filled += fill_detail_cost_row_table2(doc_id, rows)
         rows = _backfill_from_value_sources(rows)
         rows = _normalize_fee_breakdown(rows)
         # 출처 필드는 모든 행이 갖도록 맞춘다(class_returns.json과 같은
