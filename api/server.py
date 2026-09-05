@@ -392,7 +392,16 @@ def _pick_fallback_hits(hits, query="", max_chunks=3):
 
 def generate_answer(query: str, route_result: dict):
     """검색(rag) 경로의 답변. (답변, 생성 방식 한 줄)"""
-    hits = route_result["semantic_hits"]
+    # route_search(k=10)는 후보를 10개까지 주지만, retrieved_context는
+    # 채점자·사용자에게 상위 MAX_CONTEXT_CHUNKS(6)개만 근거로 보여준다.
+    # 폴백 선택 후보를 10개 전체로 두면, 화면엔 안 보이는 7~10등 후보가
+    # 답으로 뽑히는 사고가 난다("매수취소 어떻게해?" 실측: 정답인 doc7
+    # p.19/20은 상위 6등 안에 있는데, 검색 유사도가 우연히 높게 잡힌
+    # 무관한 doc9 p.6(주식 예약주문 취소 FAQ, 8등)가 구조 점수까지
+    # 겹쳐 1등으로 뽑혔다 - "매수"/"취소" 낱말은 겹치지만 완전히 다른
+    # 절차를 답한 것). 근거로 보여주는 것과 답으로 쓰는 것을 같은
+    # 후보군으로 맞춘다 - 화면에 없는 근거로 답하면 안 된다.
+    hits = route_result["semantic_hits"][:MAX_CONTEXT_CHUNKS]
     if not hits:
         return NO_EVIDENCE, "근거가 없어 정보한계로 답함"
     context = format_retrieved_context(route_result)
