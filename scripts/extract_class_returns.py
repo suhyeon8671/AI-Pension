@@ -2026,6 +2026,61 @@ def _return_cells_lose_anything(coord_rows, cell_rows):
     return False
 
 
+# "종류별 가입자격에 관한 사항"(구분/최초설정일/가입자격) 표 - 클래스별
+# 개별 설정일이 수익률표 자체엔 없는 문서가 있다(KR510902511M 실측: 3부
+# 운용실적표는 상품 전체 기준일만 있고, 신설된 지 얼마 안 돼 값이 전부
+# "-"인 클래스는 요약표에도 대표 클래스만 실려 개별 설정일이 아예 안
+# 나온다). "6.집합투자기구의 구조 - 종류형 구조" 절의 이 표엔 모든
+# 클래스의 최초설정일이 다 있어서, 다른 데서 못 찾은 클래스만 여기서
+# 채운다.
+def _inception_dates_from_eligibility_table(pdf, known_classes):
+    # 표가 페이지 경계에서 이어지면(클래스가 많은 문서) 헤더("최초설정일"/
+    # "가입자격")는 첫 페이지에만 있고, 이어지는 페이지는 칸 구성마저
+    # 다르다(KR510902511M 실측: 13쪽은 [구분,최초설정일,가입자격] 3칸인데
+    # 14쪽 이어지는 표는 맨 앞에 빈 칸이 하나 더 낀 4칸 - 헤더도 없어
+    # header_idx를 못 잡으면 A 하나만 건지고 A-e부터 끝까지 다 놓친다).
+    # 헤더 위치에 기대지 않고, "라벨 칸에 아는 클래스 코드가 있고 바로
+    # 다음 칸이 날짜꼴"이라는 모양 자체로 판정한다 - 페이지 종류나 칸
+    # 밀림과 무관하게 항상 같은 모양이라 안전하다.
+    #
+    # 헤더가 있는 페이지를 찾는 데 page.extract_text()를 썼다가 100개
+    # 문서 전체 재실행이 5분 안팎에서 1시간 가까이로 늘어났다(실측:
+    # 이 상품 하나(62쪽)만 해도 extract_text()가 9초, find_tables()는
+    # 0.8초 - 10배 이상 차이. pdf_words.py의 전역 패치 때문에 이
+    # 문서군에서 extract_text()가 유독 무겁다). 이미 각 페이지의 표를
+    # 훑어야 하니, 헤더 판별도 find_tables()가 돌려준 셀 텍스트만으로
+    # 한다 - extract_text() 호출 자체를 없앤다.
+    out = {}
+    prev_had_header = False
+    found_any = False
+    for page in pdf.pages:
+        tables = page.find_tables()
+        rows_by_table = [t.extract() for t in tables]
+        page_has_header = any(
+            "최초설정일" in [(c or "").strip() for c in row]
+            and "가입자격" in [(c or "").strip() for c in row]
+            for rows in rows_by_table for row in rows)
+        if not (page_has_header or prev_had_header):
+            prev_had_header = False
+            continue
+        found_any = found_any or page_has_header
+        prev_had_header = page_has_header
+        for rows in rows_by_table:
+            for row in rows:
+                cells = [(c or "").strip() for c in row]
+                label_idx = next((k for k, c in enumerate(cells) if c), None)
+                if label_idx is None or label_idx + 1 >= len(cells):
+                    continue
+                label = cells[label_idx]
+                m = CLASS_CODE_JONGRYU_KO_RE.search(label)
+                if not m or m.group(1) not in known_classes:
+                    continue
+                date_m = INCEPTION_DATE_RE.search(cells[label_idx + 1])
+                if date_m:
+                    out.setdefault(m.group(1), _normalize_date(date_m.group()))
+    return out if found_any else {}
+
+
 def process_doc(doc_id):
     pdf_candidates = glob.glob(os.path.join(DATA_DIR, doc_id, "*.pdf"))
     if not pdf_candidates:
@@ -2106,6 +2161,18 @@ def process_doc(doc_id):
         for r in final:
             r.setdefault("source_pages", [r["page"]])
             r.setdefault("field_source_pages", {})
+
+        # 수익률표 자체엔 개별 설정일이 없어 inception_date가 빈 class_return
+        # 행을, "종류별 가입자격에 관한 사항" 표(있으면)로 채운다 - 이미 값이
+        # 있는 행은 절대 안 건드린다.
+        if any(r["row_kind"] == "class_return" and not r.get("inception_date")
+               for r in final):
+            elig_dates = _inception_dates_from_eligibility_table(pdf, known_classes)
+            if elig_dates:
+                for r in final:
+                    if (r["row_kind"] == "class_return" and not r.get("inception_date")
+                            and r.get("class_code") in elig_dates):
+                        r["inception_date"] = elig_dates[r["class_code"]]
         return final
 
 

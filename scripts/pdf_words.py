@@ -120,8 +120,21 @@ def patch_pdfplumber():
     if _PATCHED:
         return
 
+    # 원래 pdfplumber의 Page.chars는 캐싱된 property인데, 이 자리를
+    # 그냥 property로 통째로 덮어쓰면서 캐싱이 사라졌다 - .chars에
+    # 접근할 때마다(문서 전체 페이지를 훑는 보강 로직 등에서) 매번
+    # 처음부터 회전각을 다시 계산해, 문서 하나(60여 쪽)를 여러 번
+    # 순회하면 수 초~수십 초가 쌓인다(실측: class_returns.py에 새
+    # 보강을 하나 추가했더니 전체 재실행이 5분 안팎에서 1시간 가까이로
+    # 늘어났다 - 원인이 이 캐싱 부재였다). 페이지 인스턴스 자신에게
+    # 결과를 한 번만 저장해 두는 것으로 충분하다 - 입력(원본 글자
+    # 목록)이 페이지 생명주기 동안 안 바뀌므로 순수하게 안전하다.
     def patched_chars(self):
-        return _fixed_chars(self.objects.get("char", []))
+        cached = self.__dict__.get("_pdf_words_fixed_chars")
+        if cached is None:
+            cached = _fixed_chars(self.objects.get("char", []))
+            self.__dict__["_pdf_words_fixed_chars"] = cached
+        return cached
 
     pdfplumber.page.Page.chars = property(patched_chars)
     _PATCHED = True
