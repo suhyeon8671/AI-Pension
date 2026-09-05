@@ -53,9 +53,8 @@ CREATE TABLE product_master (
 
 DROP TABLE IF EXISTS class_fees;
 CREATE TABLE class_fees (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    product_code TEXT,
-    class_code TEXT,
+    product_code TEXT NOT NULL,
+    class_code TEXT NOT NULL,
     sales_commission_desc TEXT,
     total_fee REAL,
     distribution_fee REAL,
@@ -75,7 +74,9 @@ CREATE TABLE class_fees (
     total_fee_after_conversion REAL,
     conversion_trigger_nav_price INTEGER,
     page INTEGER,
-    confidence REAL
+    confidence REAL,
+    PRIMARY KEY (product_code, class_code),
+    FOREIGN KEY (product_code) REFERENCES product_master(product_code)
 );
 CREATE INDEX idx_class_fees_product ON class_fees(product_code);
 
@@ -106,11 +107,20 @@ CREATE TABLE class_fee_sources (
     source TEXT NOT NULL,       -- 요약표 / 상세표
     value TEXT,
     page INTEGER,
-    PRIMARY KEY (product_code, class_code, field, source)
+    PRIMARY KEY (product_code, class_code, field, source),
+    FOREIGN KEY (product_code) REFERENCES product_master(product_code)
 );
 CREATE INDEX IF NOT EXISTS idx_class_fee_sources_product
     ON class_fee_sources(product_code);
 
+-- id를 그대로 둔다(복합키로 못 바꾼다) - row_kind가 fund/benchmark/
+-- volatility인 행은 클래스 그룹(개인연금/퇴직연금 등)별로 여러 개가
+-- 나올 수 있어 class_code가 NULL인 채로 같은 (product_code, row_kind)
+-- 조합이 여러 번 나온다(실측: KR5114420027이 benchmark 3건, fund
+-- 3건 - 클래스 그룹마다 하나씩). 그래서 아래 부분 유니크 인덱스는
+-- class_code가 실제로 있는(row_kind='class_return') 행에만 건다 -
+-- 이 행들만 확인해 보니 중복이 0건이었다(build_product_facts_db.py
+-- 작성 시점 실측, structured_store.db에 대해 직접 조회로 확인).
 DROP TABLE IF EXISTS class_returns;
 CREATE TABLE class_returns (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,9 +134,13 @@ CREATE TABLE class_returns (
     return_5y REAL,
     return_since_inception REAL,
     page INTEGER,
-    confidence REAL
+    confidence REAL,
+    FOREIGN KEY (product_code) REFERENCES product_master(product_code)
 );
 CREATE INDEX idx_class_returns_product ON class_returns(product_code);
+CREATE UNIQUE INDEX idx_class_returns_unique_class
+    ON class_returns(product_code, class_code, row_kind)
+    WHERE class_code IS NOT NULL;
 
 -- 참고용: 운용전문인력 표의 "운용규모"는 이 상품 하나의 AUM이 아니라
 -- 해당 운용역/운용사가 운용하는 전체 펀드 합산 규모다(is_product_aum=0
@@ -143,7 +157,8 @@ CREATE TABLE manager_info (
     is_product_aum INTEGER,
     career TEXT,
     page INTEGER,
-    confidence REAL
+    confidence REAL,
+    FOREIGN KEY (product_code) REFERENCES product_master(product_code)
 );
 CREATE INDEX idx_manager_info_product ON manager_info(product_code);
 
@@ -157,7 +172,8 @@ CREATE TABLE fund_aum (
     net_asset_latest REAL,
     net_asset_won REAL,
     page INTEGER,
-    confidence REAL
+    confidence REAL,
+    FOREIGN KEY (product_code) REFERENCES product_master(product_code)
 );
 
 -- 클래스 코드가 무슨 뜻인지 (extract_class_meaning.py).
@@ -176,7 +192,8 @@ CREATE TABLE class_meaning (
     description TEXT,       -- 고객에게 보여 줄 말 ("연금저축 · 온라인")
     raw_label TEXT,         -- 문서 원문 이름표
     page INTEGER,
-    PRIMARY KEY (product_code, class_code)
+    PRIMARY KEY (product_code, class_code),
+    FOREIGN KEY (product_code) REFERENCES product_master(product_code)
 );
 CREATE INDEX IF NOT EXISTS idx_class_meaning_product ON class_meaning(product_code);
 
@@ -195,7 +212,8 @@ CREATE TABLE class_charges (
     redemption_fee TEXT,    -- 환매수수료
     switch_fee TEXT,        -- 전환수수료
     page INTEGER,
-    PRIMARY KEY (product_code, class_code)
+    PRIMARY KEY (product_code, class_code),
+    FOREIGN KEY (product_code) REFERENCES product_master(product_code)
 );
 CREATE INDEX IF NOT EXISTS idx_class_charges_product ON class_charges(product_code);
 
@@ -220,9 +238,17 @@ CREATE TABLE yearly_returns (
     year_rank INTEGER NOT NULL, -- 최근 N년차
     period TEXT,
     return_pct REAL,
-    page INTEGER
+    page INTEGER,
+    FOREIGN KEY (product_code) REFERENCES product_master(product_code)
 );
 CREATE INDEX IF NOT EXISTS idx_yearly_returns_product ON yearly_returns(product_code);
+-- class_returns와 달리 이 표는 (product_code, row_kind, class_code,
+-- year_rank) 조합이 class_code가 NULL인 fund/benchmark 행까지 포함해도
+-- 실측 결과 중복이 0건이었다(연도별 표는 클래스 그룹별로도 항상
+-- year_rank가 갈리기 때문으로 보인다) - 그래서 부분 인덱스 없이 그대로
+-- 유니크로 건다.
+CREATE UNIQUE INDEX idx_yearly_returns_unique
+    ON yearly_returns(product_code, row_kind, class_code, year_rank);
 
 DROP TABLE IF EXISTS trade_rules;
 CREATE TABLE trade_rules (
@@ -230,7 +256,8 @@ CREATE TABLE trade_rules (
     kind TEXT NOT NULL,     -- 매입기준가 / 환매기준가
     text TEXT NOT NULL,
     page INTEGER,
-    PRIMARY KEY (product_code, kind)
+    PRIMARY KEY (product_code, kind),
+    FOREIGN KEY (product_code) REFERENCES product_master(product_code)
 );
 
 -- 이 펀드가 무엇에 얼마나 투자하고 있는지 (extract_asset_mix.py).
@@ -249,14 +276,16 @@ CREATE TABLE asset_mix (
     pct_derived INTEGER,
     as_of TEXT,
     page INTEGER,
-    PRIMARY KEY (product_code, asset)
+    PRIMARY KEY (product_code, asset),
+    FOREIGN KEY (product_code) REFERENCES product_master(product_code)
 );
 CREATE INDEX IF NOT EXISTS idx_asset_mix_product ON asset_mix(product_code);
 
 DROP TABLE IF EXISTS product_charges;
 CREATE TABLE product_charges (
     product_code TEXT PRIMARY KEY,
-    redemption_note TEXT
+    redemption_note TEXT,
+    FOREIGN KEY (product_code) REFERENCES product_master(product_code)
 );
 """
 
@@ -672,7 +701,16 @@ def main():
     args = parser.parse_args()
 
     conn = sqlite3.connect(args.db)
+    # 이 스크립트는 매번 표를 전부 지우고 새로 만든다. FK를 켠 채로
+    # DROP TABLE product_master를 실행하면, 이전 실행에서 이미 만들어진
+    # class_fees 등이 그 표를 참조하고 있어서 재실행 시(=이 표들이 이미
+    # 있는 두 번째 실행부터) "FOREIGN KEY constraint failed"로 죽는다
+    # (실측: 처음 한 번은 통과하고 다시 돌리면 바로 죽었다). DROP/CREATE
+    # 하는 동안은 꺼 두고, 실제 데이터를 넣기 시작하기 전에 켠다 - SQLite
+    # 공식 문서가 스키마를 바꿀 때 권하는 순서 그대로다.
+    conn.execute("PRAGMA foreign_keys = OFF")
     conn.executescript(SCHEMA)
+    conn.execute("PRAGMA foreign_keys = ON")
 
     n1 = load_product_master(conn, args.product_master)
     n2 = load_class_fees(conn, args.class_fees)
