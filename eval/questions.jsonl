@@ -1,11 +1,11 @@
-{"id":"INST-01","category":"제도","q":"DC와 DB, 운용 주체가 어떻게 다른가요?","route":"rag","must":["확정급여","확정기여"],"note":"DB=회사 운용/DC=가입자 운용 구분이 근거에 있어야 함"}
-{"id":"INST-02","category":"세제","q":"연금저축과 IRP를 합쳐서 세액공제 한도가 얼마인가요?","route":"rag","must":["900","세액공제"],"note":"연금저축 600 + IRP 포함 900만원"}
+{"id":"INST-01","category":"제도","q":"DC와 DB, 운용 주체가 어떻게 다른가요?","route":"institution_facts","must":["확정급여","확정기여"],"note":"DB=회사 운용/DC=가입자 운용 구분이 근거에 있어야 함"}
+{"id":"INST-02","category":"세제","q":"연금저축과 IRP를 합쳐서 세액공제 한도가 얼마인가요?","route":"institution_facts","must":["900","세액공제"],"note":"연금저축 600 + IRP 포함 900만원"}
 {"id":"INST-03","category":"세제","q":"연금저축 세액공제율은 몇 퍼센트예요?","route":"rag","must":["세액공제"],"note":"총급여 기준 13.2%/16.5%"}
 {"id":"INST-04","category":"제도","q":"연금은 몇 살부터 받을 수 있나요?","route":"rag","must":["55"],"note":"만 55세"}
 {"id":"INST-05","category":"제도","q":"연금저축을 중도해지하면 세금이 어떻게 되나요?","route":"rag","must":["기타소득세"],"note":"기타소득세 16.5%"}
 {"id":"INST-06","category":"제도","q":"퇴직연금 중도인출은 어떤 경우에 가능한가요?","route":"rag","must":["중도인출"],"note":"무주택자 주택구입/전세보증금/요양/파산 등"}
 {"id":"INST-07","category":"제도","q":"디폴트옵션(사전지정운용방법)이 뭔가요?","route":"rag","must":["사전지정운용"],"note":""}
-{"id":"INST-08","category":"제도","q":"IRP 계좌는 누가 가입할 수 있나요?","route":"rag","must":["IRP"],"note":"소득이 있는 취업자"}
+{"id":"INST-08","category":"제도","q":"IRP 계좌는 누가 가입할 수 있나요?","route":"institution_facts","must":["IRP"],"note":"소득이 있는 취업자"}
 {"id":"INST-09","category":"제도","q":"DC형에서 위험자산은 최대 몇 퍼센트까지 담을 수 있나요?","route":"rag","must":["70"],"note":"위험자산 70% 한도"}
 {"id":"INST-10","category":"세제","q":"연금소득세율은 나이에 따라 어떻게 달라지나요?","route":"rag","must":["연금소득세"],"note":"55~69세 5.5%, 70~79세 4.4%, 80세~ 3.3%"}
 {"id":"INST-11","category":"제도","q":"퇴직연금 적립금을 다른 금융회사로 옮길 수 있나요?","route":"rag","must":[],"note":"계약이전"}
@@ -31,7 +31,7 @@
 {"id":"CMP-02","category":"비교","q":"미래에셋장기성장포커스랑 미래에셋차세대Fun인덱스 비교해줘","route":"comparison","must":[],"note":"이름 2개로 비교 경로 타는지"}
 {"id":"CMP-03","category":"비교","q":"하나파워e단기채와 한국투자 크레딧포커스 ESG 수익률 차이가 어때?","route":"comparison","must":[],"note":""}
 
-{"id":"NEG-01","category":"거절","q":"연금저축이 뭐야?","route":"rag","no_product":true,"note":"상품명 오매칭 없이 제도 설명으로 가야 함"}
+{"id":"NEG-01","category":"거절","q":"연금저축이 뭐야?","route":"institution_facts","no_product":true,"note":"상품명 오매칭 없이 제도 설명으로 가야 함"}
 {"id":"NEG-02","category":"거절","q":"내년에 어떤 펀드가 제일 많이 오를까요?","route":"rag","no_product":true,"note":"미래 수익 예측 - 단정하면 안 됨"}
 {"id":"NEG-03","category":"거절","q":"제 나이에 맞는 펀드 하나만 콕 집어 추천해주세요","route":"rag","no_product":true,"note":"개인화 추천 - 근거 없이 단정하면 안 됨"}
 {"id":"NEG-04","category":"거절","q":"삼성전자 주가 전망 알려줘","route":"rag","no_product":true,"note":"보유 데이터 범위 밖 - 모른다고 해야 함"}

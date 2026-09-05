@@ -47,6 +47,7 @@ import input_guard  # noqa: E402
 import query_analyzer  # noqa: E402
 import tax_calculator  # noqa: E402
 import product_ranking  # noqa: E402
+import institution_facts  # noqa: E402
 
 app = FastAPI(title="연금 Agent 평가용 API")
 
@@ -236,6 +237,39 @@ def answer_payload(question_id: str, question: str) -> dict:
                     if code not in product_codes:
                         product_codes.append(code)
                         hits.append((code, name, n))
+
+    # 제도 비교/사실 질의(DB·DC·IRP·연금저축의 운용주체/부담금/손실부담/
+    # 가입대상/중도인출/이전전환/세액공제/위험자산한도 등)는 상품과
+    # 무관하고 원자적 사실 하나로 답이 정해지므로 상품 조회 다음(상품이
+    # 하나도 안 걸렸을 때)에 본다. product_codes가 이미 있으면 건너뛴다 -
+    # "연금저축용 클래스는 뭐야?"처럼 상품 질문에 "연금저축"이 섞여
+    # 있으면 subject 인식만으로 이 경로를 먼저 타서 상품 질문을 통째로
+    # 가로챈 적이 있다(실측, PROD-22 회귀).
+    #
+    # RAG는 TF-IDF 코퍼스가 바뀔 때마다 순위가 재계산돼 같은 질문의
+    # 답이 흔들릴 수 있는데(실측: institution 문서 2개를 추가했더니
+    # "DC와 DB 운용주체 차이"의 1등 근거가 통째로 바뀌었다), 이 경로는
+    # 문서에서 직접 확인해 둔 값만 그대로 꺼내 쓰므로 그 위험이 없다.
+    # subject(DB/DC/IRP/연금저축)나 predicate를 하나도 못 알아보면
+    # None이라 아래 경로로 그대로 이어진다.
+    if not product_codes:
+        inst_summary, inst_evidence = institution_facts.institution_facts_answer(question)
+        if inst_summary is not None:
+            answer, how = compose_answer(question, inst_summary, inst_summary)
+            return {
+                "question_id": question_id,
+                "question": question,
+                "retrieved_context": inst_summary,
+                "think_trace": (
+                    "1. 질의 분류: 제도 비교/사실 질의 "
+                    f"(인식된 제도: {institution_facts.detect_subjects(question)})\n"
+                    "2. semantic_search 대신 institution_facts.json(원자적 사실) 직접 조회\n"
+                    f"   - 조회 근거: {inst_evidence[:6]}\n"
+                    f"3. 답변 생성: {how}"
+                ),
+                "answer": answer,
+                "route": "institution_facts",
+            }
 
     # 여러 상품을 조건으로 걸러 정렬하는 질의("총보수가 가장 낮은 상품
     # 5개", "위험등급 4 이하이고 총보수가 낮은 상품", "솔로몬 셋 중
