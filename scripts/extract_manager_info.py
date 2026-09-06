@@ -393,6 +393,26 @@ def process_doc(doc_id):
     return out
 
 
+# KR5113420069 15쪽 홍다정: "운용경력"(6년 5개월)과 "운용사경력"
+# (4년 9개월) 두 칸이 세로로 겹쳐 배치돼 있어, 좌표기반 파서가 두 칸의
+# "개월" 숫자를 이어붙여 "6년 45개월"이라는 있을 수 없는 값(45개월은
+# 3년 9개월과 같아 "6년"과 안 맞음)을 만들어냈다. 원문 재대조로 확인한
+# "운용경력" 칸의 실제 값(6년 5개월)으로 못박는다.
+_KNOWN_CAREER_FIXES = {
+    ("KR5113420069", "홍다정"): "6년 5개월",
+}
+
+
+def apply_known_career_fixes(rows):
+    fixed = 0
+    for r in rows:
+        career = _KNOWN_CAREER_FIXES.get((r["product_code"], r.get("name")))
+        if career and r.get("career") != career:
+            r["career"] = career
+            fixed += 1
+    return fixed
+
+
 def main():
     parser = argparse.ArgumentParser(description="운용전문인력 정보 추출 (참고용)")
     parser.add_argument("--output", default=DEFAULT_OUTPUT)
@@ -410,6 +430,8 @@ def main():
         if rows:
             docs_with_hits += 1
         all_rows.extend(rows)
+
+    apply_known_career_fixes(all_rows)
 
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(all_rows, f, ensure_ascii=False, indent=2)
