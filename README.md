@@ -12,6 +12,9 @@ AI-Pension/
 ├── extracted/
 │   ├── institution/    # institution 문서 추출 결과 (표 JSON, 텍스트 JSON, 청크 JSON)
 │   └── products/       # products 문서 추출 결과 (상품코드가 doc_id)
+├── structured/         # 구조화 추출 JSON 12종 (product_master/class_fees/institution_facts 등, git 커밋 대상 — 클론 직후 재추출 없이 바로 DB 재구축 가능하도록)
+├── validation/
+│   └── issues.json     # verify_data.py 산출물 (데이터 정합성 검사 스냅샷)
 ├── structured_store.db  # 표 데이터 SQLite(FTS5) — build_structured_store.py 산출물 (git 미포함, 로컬 생성)
 ├── vector_store/chroma/  # 청크 임베딩 Chroma persistent store — build_vector_store.py 산출물 (git 미포함, 로컬 생성)
 ├── scripts/
@@ -1720,10 +1723,10 @@ python scripts/search.py --query "세액공제" --mode table
 
 ```bash
 python scripts/build_product_master.py
-python scripts/extract_class_fees.py        # → class_fees.json
-python scripts/extract_class_returns.py     # (charges/yearly/trade_rules/asset_mix 등도 각각)
+python scripts/extract_class_fees.py        # → structured/class_fees.json
+python scripts/extract_class_returns.py     # (charges/yearly/trade_rules/asset_mix 등도 각각 structured/ 아래)
 python scripts/build_product_facts_db.py    # 1차 적재 - class_fees 표가 있어야 다음이 돈다
-python scripts/extract_class_meaning.py     # → class_meaning.json (보수표의 클래스 목록 참고)
+python scripts/extract_class_meaning.py     # → structured/class_meaning.json (보수표의 클래스 목록 참고)
 python scripts/merge_class_spelling.py      # 이름표를 근거로 class_fees.json의 표기를 통일
 python scripts/build_product_facts_db.py    # 2차 적재 - 최종
 
