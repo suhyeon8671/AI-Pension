@@ -41,7 +41,7 @@ from extract_class_meaning import _parse_row, _squash
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB_PATH = os.path.join(REPO_ROOT, "structured_store.db")
-OUTPUT_JSON = os.path.join(REPO_ROOT, "data", "structured", "yearly_returns.json")
+OUTPUT_JSON = os.path.join(REPO_ROOT, "structured", "yearly_returns.json")
 DATA_DIR = os.path.join(REPO_ROOT, "data", "products")
 
 # "년차"가 아니라 "년"으로만 쓰는 문서도 있다(연평균 표와 글자가 같다) -

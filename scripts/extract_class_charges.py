@@ -49,8 +49,8 @@ from extract_class_returns import cluster_lines
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB_PATH = os.path.join(REPO_ROOT, "structured_store.db")
-OUTPUT_JSON = os.path.join(REPO_ROOT, "data", "structured", "class_charges.json")
-OUTPUT_PRODUCT_JSON = os.path.join(REPO_ROOT, "data", "structured", "product_charges.json")
+OUTPUT_JSON = os.path.join(REPO_ROOT, "structured", "class_charges.json")
+OUTPUT_PRODUCT_JSON = os.path.join(REPO_ROOT, "structured", "product_charges.json")
 DATA_DIR = os.path.join(REPO_ROOT, "data", "products")
 
 # 열 이름 -> 우리가 쓸 이름. 헤더가 두 줄로 쪼개져 있어서(구분/가입자격/수수료율

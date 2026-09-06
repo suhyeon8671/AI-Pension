@@ -50,8 +50,8 @@ import os
 import re
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CLASS_FEES_JSON = os.path.join(REPO_ROOT, "data", "structured", "class_fees.json")
-CLASS_MEANING_JSON = os.path.join(REPO_ROOT, "data", "structured", "class_meaning.json")
+CLASS_FEES_JSON = os.path.join(REPO_ROOT, "structured", "class_fees.json")
+CLASS_MEANING_JSON = os.path.join(REPO_ROOT, "structured", "class_meaning.json")
 
 # 값으로 가를 때 보는 항목. 문서가 "-"(없음)로 적은 칸은 숫자가 아니라서
 # 저절로 빠진다 - 없음끼리 같다고 보고 합치면 근거가 너무 얇다.

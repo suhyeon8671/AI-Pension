@@ -41,7 +41,7 @@ import pdf_words  # noqa: E402  (import만으로 Page.chars 전역 패치가 걸
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(REPO_ROOT, "data", "products")
 EXTRACTED_DIR = os.path.join(REPO_ROOT, "extracted", "products")
-DEFAULT_OUTPUT = os.path.join(REPO_ROOT, "data", "structured", "class_fees.json")
+DEFAULT_OUTPUT = os.path.join(REPO_ROOT, "structured", "class_fees.json")
 
 NUM_RE = re.compile(r"^\d[\d,]*\.?\d*$")
 # 일부 운용사 서식(신영자산운용 등)은 총보수 % 값을 "1.18%"처럼 %가 붙은 한
@@ -1902,7 +1902,7 @@ def _class_labels_for_doc(doc_id):
     global _CLASS_LABELS_BY_DOC
     if _CLASS_LABELS_BY_DOC is None:
         _CLASS_LABELS_BY_DOC = {}
-        fp = os.path.join(REPO_ROOT, "data", "structured", "class_meaning.json")
+        fp = os.path.join(REPO_ROOT, "structured", "class_meaning.json")
         if os.path.exists(fp):
             with open(fp, "r", encoding="utf-8") as f:
                 for r in json.load(f):

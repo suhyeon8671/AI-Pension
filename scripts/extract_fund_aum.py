@@ -42,7 +42,7 @@ import pdf_words  # noqa: E402  (import만으로 Page.chars 전역 패치가 걸
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(REPO_ROOT, "data", "products")
 EXTRACTED_DIR = os.path.join(REPO_ROOT, "extracted", "products")
-DEFAULT_OUTPUT = os.path.join(REPO_ROOT, "data", "structured", "fund_aum.json")
+DEFAULT_OUTPUT = os.path.join(REPO_ROOT, "structured", "fund_aum.json")
 
 NUM_OR_DASH = r"(?:-|[\d,]+)"
 ASSET_TOTAL_RE = re.compile(rf"자산총계\s*({NUM_OR_DASH}(?:\s+{NUM_OR_DASH}){{0,2}})")

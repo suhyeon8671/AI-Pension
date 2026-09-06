@@ -46,7 +46,7 @@ import sqlite3
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB_PATH = os.path.join(REPO_ROOT, "structured_store.db")
-OUTPUT_JSON = os.path.join(REPO_ROOT, "data", "structured", "asset_mix.json")
+OUTPUT_JSON = os.path.join(REPO_ROOT, "structured", "asset_mix.json")
 DATA_DIR = os.path.join(REPO_ROOT, "data", "products")
 
 # 이 표를 다른 표와 가르는 낱말들. 다 있어야 한다. "자산총액"은 한

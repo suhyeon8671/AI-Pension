@@ -18,7 +18,7 @@ import sqlite3
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB_PATH = os.path.join(REPO_ROOT, "structured_store.db")
-CLASS_FEES_JSON_PATH = os.path.join(REPO_ROOT, "data", "structured", "class_fees.json")
+CLASS_FEES_JSON_PATH = os.path.join(REPO_ROOT, "structured", "class_fees.json")
 
 # 보수 세부 내역(운용보수/신탁보수/일반사무관리회사보수 등)은 상세표
 # 보강으로만 채워지고, build_product_facts_db.load_class_fees의 결정에
