@@ -28,7 +28,7 @@ import json
 import os
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-FACTS_JSON_PATH = os.path.join(REPO_ROOT, "institution_facts.json")
+FACTS_JSON_PATH = os.path.join(REPO_ROOT, "data", "structured", "institution_facts.json")
 
 # 질문에 쓰이는 여러 표현 -> 이 파일의 subject 코드.
 SUBJECT_ALIASES = {

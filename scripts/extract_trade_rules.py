@@ -36,7 +36,7 @@ import sqlite3
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB_PATH = os.path.join(REPO_ROOT, "structured_store.db")
-OUTPUT_JSON = os.path.join(REPO_ROOT, "trade_rules.json")
+OUTPUT_JSON = os.path.join(REPO_ROOT, "data", "structured", "trade_rules.json")
 
 # 뽑을 절과 그 절을 여는 말. 문서마다 표현이 조금씩 다르다 - "청구"가
 # 아예 없는 문서도 있고("환매 시 적용되는 기준가격" - KR555202013M 20쪽

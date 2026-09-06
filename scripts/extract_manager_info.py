@@ -47,7 +47,7 @@ import pdf_words  # noqa: E402  (import만으로 Page.chars 전역 패치가 걸
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(REPO_ROOT, "data", "products")
 EXTRACTED_DIR = os.path.join(REPO_ROOT, "extracted", "products")
-DEFAULT_OUTPUT = os.path.join(REPO_ROOT, "manager_info.json")
+DEFAULT_OUTPUT = os.path.join(REPO_ROOT, "data", "structured", "manager_info.json")
 
 # 이름(2~5자 한글) 바로 뒤에 4자리 생년(19xx/20xx)이 오는 자리를 이 사람의
 # "닻"으로 쓴다 - 표 칸이 몇 줄로 쪼개지든 이름+생년만은 늘 붙어 있었다

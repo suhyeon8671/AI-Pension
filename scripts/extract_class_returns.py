@@ -38,7 +38,7 @@ from pdf_words import extract_words as _safe_words
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(REPO_ROOT, "data", "products")
 EXTRACTED_DIR = os.path.join(REPO_ROOT, "extracted", "products")
-DEFAULT_OUTPUT = os.path.join(REPO_ROOT, "class_returns.json")
+DEFAULT_OUTPUT = os.path.join(REPO_ROOT, "data", "structured", "class_returns.json")
 
 NUM_RE = re.compile(r"^-?\d[\d,]*\.?\d*$")
 DECIMAL_RE = re.compile(r"^-?\d+\.\d+$")
@@ -1645,7 +1645,7 @@ def _known_classes_for_doc(doc_id):
     global _KNOWN_CLASSES_BY_DOC
     if _KNOWN_CLASSES_BY_DOC is None:
         _KNOWN_CLASSES_BY_DOC = defaultdict(set)
-        fp = os.path.join(REPO_ROOT, "class_fees.json")
+        fp = os.path.join(REPO_ROOT, "data", "structured", "class_fees.json")
         if os.path.exists(fp):
             with open(fp, "r", encoding="utf-8") as f:
                 for r in json.load(f):

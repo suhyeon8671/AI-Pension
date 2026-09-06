@@ -23,7 +23,7 @@ import re
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PRODUCTS_DIR = os.path.join(REPO_ROOT, "extracted", "products")
-DEFAULT_OUTPUT = os.path.join(REPO_ROOT, "product_master.json")
+DEFAULT_OUTPUT = os.path.join(REPO_ROOT, "data", "structured", "product_master.json")
 
 CANONICAL_LABELS = ["매우높은위험", "높은위험", "다소높은위험", "보통위험", "낮은위험", "매우낮은위험"]
 

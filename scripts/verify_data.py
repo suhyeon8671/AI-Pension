@@ -43,7 +43,7 @@ import sqlite3
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB_PATH = os.path.join(REPO_ROOT, "structured_store.db")
-DEFAULT_CLASS_FEES_JSON = os.path.join(REPO_ROOT, "class_fees.json")
+DEFAULT_CLASS_FEES_JSON = os.path.join(REPO_ROOT, "data", "structured", "class_fees.json")
 DEFAULT_ISSUES_JSON = os.path.join(REPO_ROOT, "data", "validation", "issues.json")
 
 # 보수율이 이보다 크면 값을 잘못 읽은 것이다(퍼센트인데 다른 칸을 집었거나).

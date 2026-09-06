@@ -687,23 +687,23 @@ def load_yearly_returns(conn, path):
 def main():
     parser = argparse.ArgumentParser(description="상품 팩트 3종을 SQLite로 적재")
     parser.add_argument("--db", default=DEFAULT_DB_PATH)
-    parser.add_argument("--product-master", default=os.path.join(REPO_ROOT, "product_master.json"))
-    parser.add_argument("--class-fees", default=os.path.join(REPO_ROOT, "class_fees.json"))
-    parser.add_argument("--class-returns", default=os.path.join(REPO_ROOT, "class_returns.json"))
-    parser.add_argument("--manager-info", default=os.path.join(REPO_ROOT, "manager_info.json"))
-    parser.add_argument("--fund-aum", default=os.path.join(REPO_ROOT, "fund_aum.json"))
+    parser.add_argument("--product-master", default=os.path.join(REPO_ROOT, "data", "structured", "product_master.json"))
+    parser.add_argument("--class-fees", default=os.path.join(REPO_ROOT, "data", "structured", "class_fees.json"))
+    parser.add_argument("--class-returns", default=os.path.join(REPO_ROOT, "data", "structured", "class_returns.json"))
+    parser.add_argument("--manager-info", default=os.path.join(REPO_ROOT, "data", "structured", "manager_info.json"))
+    parser.add_argument("--fund-aum", default=os.path.join(REPO_ROOT, "data", "structured", "fund_aum.json"))
     parser.add_argument("--class-meaning",
-                        default=os.path.join(REPO_ROOT, "class_meaning.json"))
+                        default=os.path.join(REPO_ROOT, "data", "structured", "class_meaning.json"))
     parser.add_argument("--class-charges",
-                        default=os.path.join(REPO_ROOT, "class_charges.json"))
+                        default=os.path.join(REPO_ROOT, "data", "structured", "class_charges.json"))
     parser.add_argument("--yearly-returns",
-                        default=os.path.join(REPO_ROOT, "yearly_returns.json"))
+                        default=os.path.join(REPO_ROOT, "data", "structured", "yearly_returns.json"))
     parser.add_argument("--trade-rules",
-                        default=os.path.join(REPO_ROOT, "trade_rules.json"))
+                        default=os.path.join(REPO_ROOT, "data", "structured", "trade_rules.json"))
     parser.add_argument("--product-charges",
-                        default=os.path.join(REPO_ROOT, "product_charges.json"))
+                        default=os.path.join(REPO_ROOT, "data", "structured", "product_charges.json"))
     parser.add_argument("--asset-mix",
-                        default=os.path.join(REPO_ROOT, "asset_mix.json"))
+                        default=os.path.join(REPO_ROOT, "data", "structured", "asset_mix.json"))
     args = parser.parse_args()
 
     conn = sqlite3.connect(args.db)

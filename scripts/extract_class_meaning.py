@@ -50,7 +50,7 @@ import sqlite3
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB_PATH = os.path.join(REPO_ROOT, "structured_store.db")
-OUTPUT_JSON = os.path.join(REPO_ROOT, "class_meaning.json")
+OUTPUT_JSON = os.path.join(REPO_ROOT, "data", "structured", "class_meaning.json")
 
 FEE_TYPES = ("선취", "미징구", "후취")
 
