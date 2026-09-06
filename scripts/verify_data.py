@@ -23,7 +23,7 @@
 실행:
     python3 scripts/verify_data.py
     python3 scripts/verify_data.py --show 20   # 사례를 더 보기
-    python3 scripts/verify_data.py --output data/validation/issues.json
+    python3 scripts/verify_data.py --output validation/issues.json
         # 검사 결과를 파일로 남긴다. 콘솔 출력은 이 스크립트를 실행한
         # 순간에만 보이고 사라지는데, "지난번엔 어떤 결함이 있었는지"를
         # 나중에 찾아보거나(예: 이번 결함이 새로 생긴 건지 전부터 있던
@@ -44,7 +44,7 @@ import sqlite3
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB_PATH = os.path.join(REPO_ROOT, "structured_store.db")
 DEFAULT_CLASS_FEES_JSON = os.path.join(REPO_ROOT, "structured", "class_fees.json")
-DEFAULT_ISSUES_JSON = os.path.join(REPO_ROOT, "data", "validation", "issues.json")
+DEFAULT_ISSUES_JSON = os.path.join(REPO_ROOT, "validation", "issues.json")
 
 # 보수율이 이보다 크면 값을 잘못 읽은 것이다(퍼센트인데 다른 칸을 집었거나).
 MAX_FEE_PCT = 10.0
