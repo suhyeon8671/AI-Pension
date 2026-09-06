@@ -7337,9 +7337,9 @@
     "attributes": [
       "기타"
     ],
-    "retail": true,
+    "retail": false,
     "aka": [],
-    "description": "창구 · 기타",
+    "description": "사원복지연기금 수령자 전용 · 창구",
     "raw_label": "수수료미징구-오프라인-기타",
     "page": 9
   },

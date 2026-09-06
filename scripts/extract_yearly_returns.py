@@ -1132,17 +1132,33 @@ def apply_known_class_code_renames(rows):
 #   - KR5119450058 benchmark 1년차: 5쪽 표 헤더("최근1년...2024.02.01
 #     ~2025.01.31")가 같은 문서의 다른 class_return 1년차 행과 전부
 #     동일한 기간이라 그대로 옮긴다.
-#   - KR5153420318 fund/benchmark 2년차: 5쪽 표를 좌표로 다시 짚어보면
-#     "최근2년" 칸의 기간은 "24.08.01~25.09.30"이다(펀드 설정일
-#     2024.08.01부터 작성기준일까지 - 아직 만 2년이 안 된 펀드라 "최근
-#     2년"이 사실상 설정후 전체 기간과 같다). 값 칸 자체는 "-"(계산할
-#     2년치 데이터가 없다는 뜻)라 이 기간을 채워도 없는 수치를 지어내는
-#     게 아니다.
 _KNOWN_PERIOD_FIXES = {
     ("KR5119450058", "benchmark", None, 1): "2024.02.01~2025.01.31",
-    ("KR5153420318", "fund", None, 2): "24.08.01~25.09.30",
-    ("KR5153420318", "benchmark", None, 2): "24.08.01~25.09.30",
 }
+
+# 표·좌표 파서가 서로 다른 두 표(연평균수익률표 vs 연도별 수익률
+# 추이표)의 칸을 혼동해 만들어낸 가짜 행. KR5153420318 49쪽 원문 재대조
+# 결과: 연도별 수익률 추이표의 "최근2년차" 칸은 fund/benchmark 둘 다
+# "-"(계산할 2년치 데이터가 없다는 뜻)인데, 파서가 옆에 있는 연평균
+# 수익률표의 "설정이후" 칸 값(fund 3.89 / benchmark 4.64, 둘 다 양수)을
+# 그 "-"와 붙여 "-3.89"/"-4.64"라는 실재하지 않는 음수로 잘못 만들어냈다
+# (한때 이 값을 진짜로 오해해 기간만 못박았던 적이 있는데, 그 기간
+# 자체도 이 잘못 이어붙은 값을 정당화하려 든 것이었다 - 값이 없는
+# 자리는 다른 class_return 행들처럼 아예 행을 만들지 않는 게 맞다).
+_KNOWN_FAKE_ROWS = {
+    ("KR5153420318", "fund", None, 2),
+    ("KR5153420318", "benchmark", None, 2),
+}
+
+
+def remove_known_fake_rows(rows):
+    before = len(rows)
+    rows[:] = [
+        r for r in rows
+        if (r["product_code"], r["row_kind"], r.get("class_code"),
+            r["year_rank"]) not in _KNOWN_FAKE_ROWS
+    ]
+    return before - len(rows)
 
 
 def apply_known_period_fixes(rows):
@@ -1183,6 +1199,7 @@ def main():
     rows = extract(args.db)
     apply_known_class_code_renames(rows)
     apply_known_period_fixes(rows)
+    remove_known_fake_rows(rows)
     report(rows)
     if args.check:
         return

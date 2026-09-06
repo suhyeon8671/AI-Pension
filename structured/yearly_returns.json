@@ -32139,24 +32139,6 @@
     "page": 50
   },
   {
-    "row_kind": "fund",
-    "class_code": null,
-    "year_rank": 2,
-    "period": "24.08.01~25.09.30",
-    "return_pct": -3.89,
-    "product_code": "KR5153420318",
-    "page": 49
-  },
-  {
-    "row_kind": "benchmark",
-    "class_code": null,
-    "year_rank": 2,
-    "period": "24.08.01~25.09.30",
-    "return_pct": -4.64,
-    "product_code": "KR5153420318",
-    "page": 49
-  },
-  {
     "row_kind": "class_return",
     "class_code": "C",
     "year_rank": 1,

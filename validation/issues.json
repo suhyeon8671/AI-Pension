@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-06T00:40:52+00:00",
+  "generated_at": "2026-09-06T01:24:47+00:00",
   "db_path": "/home/user/ai-pension/structured_store.db",
   "checks": [
     {
@@ -49,13 +49,11 @@
     },
     {
       "name": "일반 가입 가능으로 봤는데 가입자격에 제한이 적힘",
-      "bad": 1,
+      "bad": 0,
       "total": 653,
       "info": false,
       "note": "제한 클래스를 답변에 내보내게 되는 오류다",
-      "samples": [
-        "KR5125450023 Cy: 이름표는 '창구 · 기타'인데 가입자격은 '사원복지연기금(근로자의 복리후생을 위해 현직 임직원에 한하여 매월 지급되...'"
-      ]
+      "samples": []
     },
     {
       "name": "뜻을 모르는 클래스",
@@ -183,13 +181,11 @@
     },
     {
       "name": "연도별 수익률인데 기간이 모두 같은 날 끝남",
-      "bad": 1,
+      "bad": 0,
       "total": 89,
       "info": false,
       "note": "연평균 표를 연도별로 잘못 읽은 것이다",
-      "samples": [
-        "KR5153420318: 기간 2개가 모두 25.09.30에 끝남"
-      ]
+      "samples": []
     },
     {
       "name": "class_return 행인데 class_code가 없음",
@@ -202,7 +198,7 @@
     {
       "name": "수익률이 -100% ~ 500% 밖",
       "bad": 1,
-      "total": 9549,
+      "total": 9547,
       "info": false,
       "note": "",
       "samples": [

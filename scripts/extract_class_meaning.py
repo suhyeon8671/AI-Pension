@@ -81,6 +81,20 @@ RESTRICTED = ("기관", "고액", "랩", "펀드", "금전신탁", "임직원", 
               # 목록에 없어서 일반 클래스로 잘못 잡히고 있었다.
               "고유재산", "집합투자업자")
 
+# raw_label이 "기타"처럼 뜻 없는 낱말이라 RESTRICTED 키워드로는 못 잡는
+# 제한 클래스. 실제 제한 근거는 class_charges.json의 가입자격 원문에만
+# 있다(이 스크립트는 그 필드를 안 읽는다) - KR5125450023/Cy 실측:
+# raw_label "수수료미징구-오프라인-기타"라 retail:true로 잘못 잡혔지만,
+# 가입자격 원문은 "사원복지연기금(근로자의 복리후생을 위해 현직
+# 임직원에 한하여 매월 지급되는 일정액) 수령자"로 일반 고객이 못 사는
+# 클래스다. 전체 코퍼스에서 이 1건만 해당(다른 "기타" 클래스는 문제 없음).
+_KNOWN_RETAIL_OVERRIDES = {
+    ("KR5125450023", "Cy"): {
+        "retail": False,
+        "description": "사원복지연기금 수령자 전용 · 창구",
+    },
+}
+
 # 같은 말이 "기관/기관형/기관등", "개인연금/개인연금형"처럼 조금씩 다르게
 # 적혀 있어서 정확히 같은지로 보면 17개쯤을 놓친다. 놓치면 기관 전용
 # 클래스가 "일반 가입 가능"으로 표시되므로 부분 일치로 본다.
@@ -1070,6 +1084,12 @@ def extract(db_path=DEFAULT_DB_PATH):
                     account_type = inferred
                     attrs = attrs + [inferred]
             rec = dict(rec, attributes=attrs)
+            override = _KNOWN_RETAIL_OVERRIDES.get((code, cc))
+            retail = not any(_match_any(a, RESTRICTED) for a in attrs)
+            description = _describe(rec)
+            if override:
+                retail = override.get("retail", retail)
+                description = override.get("description", description)
             out.append({
                 "product_code": code,
                 "class_code": cc,
@@ -1077,12 +1097,11 @@ def extract(db_path=DEFAULT_DB_PATH):
                 "channel": rec["channel"],
                 "account_type": account_type,
                 "attributes": attrs,
-                "retail": not any(_match_any(a, RESTRICTED)
-                                  for a in attrs),
+                "retail": retail,
                 # 같은 클래스를 문서가 달리 적은 표기(뜻이 같을 때만).
                 # 버리지 않고 남겨 둬야 그 표기로 물었을 때도 찾을 수 있다.
                 "aka": aka.get(cc, []),
-                "description": _describe(rec),
+                "description": description,
                 "raw_label": rec["raw_label"],
                 "page": pages.get(cc),
             })
